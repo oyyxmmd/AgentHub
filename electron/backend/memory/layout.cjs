@@ -51,6 +51,7 @@ function normalizeGitRemote(raw) {
 
 function sanitizeSlug(s) {
   return String(s || "")
+    .toLowerCase() // NTFS 不区分大小写：不折叠的话 MyApp 与 myapp 两个 slug 落到同一目录互混
     .replace(/[<>:"/\\|?*]/g, "-")
     .replace(/\s+/g, "-")
     .replace(/-{3,}/g, "--")
@@ -146,10 +147,12 @@ function reverseClaudeDirName(name) {
 
 // 会话目录名反解成工作目录：workbuddy 这类工具把 cwd 编码进目录名（首段是盘符、其余按 "-" 分段），
 // 例如 "e-公司项目-商丘水闸前端" → E:\公司项目\商丘水闸前端。
-// 段本身可能带连字符（"deepseek-harness" 是一层目录还是两层，名字上看不出来），因此按
-// 「目录层级从少到多」穷举所有切分，取第一个真实存在的路径：真实路径层级通常不多，
-// 且层级越多、恰好存在同名路径的概率越低。解不出来就返回空串、由调用方归 general——
-// 猜错的代价（记忆挂到别的项目下）远大于不猜
+// 段本身可能带连字符（"deepseek-harness" 是一层目录还是两层，名字上看不出来），所以必须消歧。
+// 做法：按「目录层级从少到多」迭代加深，但每一层先用 statSync 剪枝——前缀不是真实目录的分支
+// 根本走不到底，搜索量随真实目录结构收敛。既保住「层级越少越优先」的老偏好（层级越多、
+// 恰好存在同名路径的概率越低），又不像穷举 2^(n-1) 那样必须设段数上限
+// （旧实现超过 8 段直接放弃，深层 cwd 一律归 general）。
+// 解不出来就返回空串、由调用方归 general——猜错的代价（记忆挂到别的项目下）远大于不猜
 function reverseSessionDirName(name) {
   const m = /^([a-zA-Z])-(.+)$/.exec(String(name == null ? "" : name).trim());
   if (!m) return "";
@@ -157,34 +160,33 @@ function reverseSessionDirName(name) {
   const segs = m[2].split("-").filter(Boolean);
   const n = segs.length;
   if (!n) return "";
-  // 极端长命名保护（防 2^(n-1) 指数爆炸卡死主进程）：段数超过 8 时直接按整词或单层尝试
-  if (n > 8) {
-    const full = drive + segs.join(path.sep);
-    try { if (fs.existsSync(full)) return full; } catch {}
-    const single = drive + segs.join("-");
-    try { if (fs.existsSync(single)) return single; } catch {}
-    return "";
-  }
-  const bits = (x) => { let c = 0; while (x) { c += x & 1; x >>= 1; } return c; };
-  let attempts = 0;
-  const MAX_ATTEMPTS = 64; // 最多尝试 64 种切分，防 IO 密集阻塞
-  // mask 的第 i 位 = 在第 i 段后切一刀；切成 cuts 段就恰好有 cuts-1 个切点
-  for (let cuts = 1; cuts <= n; cuts++) {
-    for (let mask = 0; mask < (1 << (n - 1)); mask++) {
-      if (bits(mask) !== cuts - 1) continue;
-      if (++attempts > MAX_ATTEMPTS) return "";
-      const parts = [];
-      let cur = segs[0];
-      for (let i = 1; i < n; i++) {
-        if (mask & (1 << (i - 1))) { parts.push(cur); cur = segs[i]; }
-        else cur += "-" + segs[i];
-      }
-      parts.push(cur);
-      const candidate = drive + parts.join(path.sep);
-      try {
-        if (fs.existsSync(candidate)) return candidate;
-      } catch { /* 坏路径/权限：换下一个切分 */ }
+  const isDir = (p) => {
+    try { return fs.statSync(p).isDirectory(); } catch { return false; }
+  };
+  if (!isDir(drive)) return "";
+  // 搜索预算：只在「前缀确实是真实目录」的分支上消耗，正常路径几十次 stat 内命中；
+  // 留上限是防病态目录名把主进程拖住
+  let budget = 512;
+  // 用恰好 depthLeft 个目录名覆盖 segs[i..n-1]，最后一个目录名吃满剩余段
+  const build = (i, depthLeft, parent) => {
+    if (--budget < 0) return "";
+    if (depthLeft === 1) {
+      const candidate = parent + segs.slice(i).join("-");
+      return isDir(candidate) ? candidate : "";
     }
+    // 当前目录名最多吃到第 n-depthLeft 段：后面每层至少还要吃掉一段
+    for (let j = i; j <= n - depthLeft; j++) {
+      const here = parent + segs.slice(i, j + 1).join("-");
+      if (!isDir(here)) continue;
+      const found = build(j + 1, depthLeft - 1, here + path.sep);
+      if (found) return found;
+    }
+    return "";
+  };
+  for (let depth = 1; depth <= n; depth++) {
+    const found = build(0, depth, drive);
+    if (found) return found;
+    if (budget < 0) return "";
   }
   return "";
 }
@@ -230,18 +232,28 @@ class ProjectRegistry {
     return this._load().projects;
   }
 
+  /**
+   * 按 slug 取条目：大小写不敏感。
+   * slug 自 v1.41.0 起一律折小写（NTFS 目录大小写不敏感，不折会让 MyApp/myapp 混住同一目录），
+   * 但台账里可能还留着迁移前的大写条目（AgentHub / China_Cities）。精确匹配会让新写入的
+   * 小写 slug 找不到既有卡片、于是又新建一张 —— UI 上同一个项目裂成两张同名卡。
+   */
   get(slug) {
-    return this._load().projects.find((p) => p.slug === slug) || null;
+    const want = String(slug || "").toLowerCase();
+    return this._load().projects.find((p) => String(p.slug).toLowerCase() === want) || null;
   }
 
   upsert(entry) {
     const data = this._load();
     const prevJson = JSON.stringify(data);
-    const idx = data.projects.findIndex((p) => p.slug === entry.slug);
+    const want = String(entry.slug || "").toLowerCase();
+    const idx = data.projects.findIndex((p) => String(p.slug).toLowerCase() === want);
     const now = Date.now();
     if (idx >= 0) {
       const cur = data.projects[idx];
-      const merged = { ...cur, ...entry, updated: now };
+      // 命中旧的大写条目时把 slug 归一到小写：否则本次写入会带着小写 slug 落到索引，
+      // 而卡片还叫大写，projects() 的 slug 精确关联随即对不上（卡片条数显示 0）
+      const merged = { ...cur, ...entry, slug: sanitizeSlug(entry.slug || cur.slug), updated: now };
       merged.remotes = Array.from(new Set([...(cur.remotes || []), ...(entry.remotes || [])]));
       merged.localPaths = Array.from(new Set([...(cur.localPaths || []), ...(entry.localPaths || [])]));
       merged.aliases = Array.from(new Set([...(cur.aliases || []), ...(entry.aliases || [])]));
@@ -272,6 +284,55 @@ class ProjectRegistry {
     const data = this._load();
     data.projects = data.projects.filter((p) => p.slug !== slug);
     this._save();
+  }
+
+  /**
+   * 台账自愈：slug 折小写 + 合并「折小写后撞车」的重复条目。
+   * v1.42.1 之前写入路径按小写 slug 找台账、watcher 按目录真名建卡，同一个项目在台账里
+   * 留下两条（AgentHub / agenthub）：projects() 逐条出卡就是「同一项目两张卡」，其中一张
+   * 条数还是 0（索引行的 project 值对不上）。这里是存量数据的收口——只折大小写，
+   * 不动 sanitizeSlug 的其它变换（去非法字符/截断会改名，反而让卡片与索引行对不上）。
+   *
+   * 注意「折」与「并」是两件事：没有孪生条目的单条大写 slug 也必须折（索引侧 reindexFile
+   * 会把 project 折成小写，台账不折就永远对不上 → 卡片 0 条），所以改动计数要覆盖改名。
+   * 幂等：折完没有条目被改名/合并就不落盘。
+   * @returns {number} 被改名或合并掉的条目数（0 表示台账本来就没有大写 slug）
+   */
+  normalize() {
+    const data = this._load();
+    const prevJson = JSON.stringify(data);
+    const out = [];
+    const bySlug = new Map();
+    let changed = 0;
+    for (const p of data.projects) {
+      const slug = String(p.slug || "").toLowerCase();
+      const hit = bySlug.get(slug);
+      if (!hit) {
+        if (slug === p.slug) { bySlug.set(slug, p); out.push(p); continue; }
+        const entry = { ...p, slug };
+        bySlug.set(slug, entry);
+        out.push(entry);
+        changed++;
+        continue;
+      }
+      changed++;
+      const union = (a, b) => Array.from(new Set([...(a || []), ...(b || [])]));
+      hit.remotes = union(hit.remotes, p.remotes);
+      hit.localPaths = union(hit.localPaths, p.localPaths);
+      hit.aliases = union(hit.aliases, p.aliases);
+      hit.agents = union(hit.agents, p.agents);
+      const created = [hit.created, p.created].filter((x) => Number.isFinite(x));
+      const updated = [hit.updated, p.updated].filter((x) => Number.isFinite(x));
+      if (created.length) hit.created = Math.min(...created);
+      if (updated.length) hit.updated = Math.max(...updated);
+      // 名字留着给人看：先出现的条目名若只是 slug（机器名），让后面的真名顶上来
+      const slugLike = (n) => !n || String(n).toLowerCase() === slug;
+      if (slugLike(hit.name) && p.name && !slugLike(p.name)) hit.name = p.name;
+    }
+    if (!changed) return 0;
+    data.projects = out;
+    this._save(prevJson);
+    return changed;
   }
 
   // 名称模糊匹配：返回最相似的已登记项目（不自动合并，只给建议）
@@ -312,6 +373,11 @@ function classify(input, registry, cfg) {
     (input && input.project) || "",
     (input && input.cwd) || "",
     (input && input.agent) || "",
+    // 归类配置参与 key：fuzzyThreshold/gitPreferred 等改动后旧结论不能继续命中
+    // （general/general-suggest 结果不落 registry 台账，台账作废清不到它们）
+    (cfg && cfg.fuzzyThreshold) ?? "",
+    (cfg && cfg.autoCreateProject) ?? "",
+    (cfg && cfg.gitPreferred) ?? "",
   ].join("\u0000");
   const hit = classifyCache.get(key);
   if (hit) return hit;
@@ -382,9 +448,9 @@ function memoryRelPath({ slug, layer, agent, type, dateStr, id }) {
   if (layer === "l2") {
     const sub = type === "decision" ? "decisions" : type === "knowledge" ? "knowledge" : type === "insight" ? "insight" : "summary";
     const base = slug ? `projects/${slug}/l2/${sub}` : `general/l2/${sub}`;
-    return type === "decision" || type === "knowledge" || type === "insight" || type === "summary"
-      ? `${base}/${id || date}.md`
-      : `${base}.md`;
+    // l2 一律每条一个文件。白名单外的 type（如 profile）原先落到共享的 l2/summary.md：
+    // 后写覆盖先写，索引里两条指向同一路径，删一条会把另一条变成 bodyMissing
+    return `${base}/${id || date}.md`;
   }
   const base = slug ? `projects/${slug}/l1/${agent || "manual"}` : `general/l1/${agent || "manual"}`;
   if (type === "daily") return `${base}/${date}.md`;

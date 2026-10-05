@@ -3,6 +3,47 @@
 "use strict";
 const path = require("node:path");
 const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain, nativeTheme, Notification } = require("electron");
+
+// ===== 闪退取证（本地补丁 __agenthubCrashTrace）=====
+// 1.42.0 出现静默退出：Windows 无 Application Error 事件、无 minidump、应用自身零日志，
+// 只能靠重启时间戳反推。这里把 JS 异常 / 子进程死亡 / 退出原因全部落到 userData/logs/crash.log，
+// 并启用本地 crashpad（只落盘不上传）——原生崩溃会留下 minidump，debug.log 的 "not connected" 噪音随之消失。
+const __fs = require("node:fs");
+const __os = require("node:os");
+const { crashReporter } = require("electron");
+let __crashCount = 0;
+function __crashLog(kind, detail) {
+  if (__crashCount > 50) return;
+  __crashCount++;
+  try {
+    let dir;
+    try { dir = path.join(app.getPath("userData"), "logs"); }
+    catch { dir = path.join(process.env.APPDATA || __os.homedir(), "AgentHub", "logs"); }
+    __fs.mkdirSync(dir, { recursive: true });
+    const text = String(detail == null ? "" : detail).replace(/\s+/g, " ").trim().slice(0, 3000);
+    __fs.appendFileSync(path.join(dir, "crash.log"), `[${new Date().toISOString()}] [pid=${process.pid}] ${kind}${text ? " " + text : ""}\n`);
+  } catch { /* 留痕失败不得反噬主流程 */ }
+}
+function __describe(e) {
+  if (e instanceof Error) return `${e.name}: ${e.message} :: ${String(e.stack || "").replace(/\s+/g, " ").slice(0, 1200)}`;
+  try { return JSON.stringify(e); } catch { return String(e); }
+}
+try { crashReporter.start({ uploadToServer: false, submitURL: "" }); } catch { /* 无 crashReporter 则仅失去 dump 能力 */ }
+// 启动留痕：放在 whenReady 里，确保 app.setName 之后再取 userData（否则会落到错误目录）
+app.whenReady().then(() => {
+  try { __crashLog("boot", `v${app.getVersion()} electron=${process.versions.electron} node=${process.versions.node}`); } catch { /* 忽略 */ }
+});
+// 捕获而非退出：托盘常驻的反代网关被别的工具依赖，宁可降级活着也要把根因留痕（每次运行最多记 50 条）
+process.on("uncaughtException", (e) => __crashLog("uncaughtException", __describe(e)));
+process.on("unhandledRejection", (r) => __crashLog("unhandledRejection", __describe(r)));
+process.on("exit", (code) => __crashLog("exit", `code=${code} uptime=${Math.round(process.uptime())}s`));
+app.on("child-process-gone", (_e, d) => __crashLog("child-process-gone", __describe(d)));
+app.on("render-process-gone", (_e, _wc, d) => __crashLog("render-process-gone", __describe(d)));
+app.on("gpu-process-gone", (_e, d) => __crashLog("gpu-process-gone", __describe(d)));
+app.on("before-quit", () => { let p = "n/a"; try { p = String(updater.pendingInstall()); } catch { /* updater 尚未就绪 */ } __crashLog("before-quit", `pendingInstall=${p}`); });
+app.on("quit", (_e, code) => __crashLog("quit", `exitCode=${code}`));
+// ===== 闪退取证结束 =====
+
 const config = require("./backend/config.cjs");
 const ipc = require("./backend/ipc.cjs");
 const updater = require("./backend/updater.cjs");
@@ -322,11 +363,21 @@ watch.setOnEvent(({ kind, summary, count }) => {
 });
 
 // ===== 单实例锁 =====
-const gotLock = app.requestSingleInstanceLock();
+// 开发旁路：AGENTHUB_ALLOW_MULTI=1 时跳过单实例锁，并隔离 userData，
+// 使 `npm run dev` 能在安装版 AgentHub 仍在运行时并存（否则新实例拿不到锁会干净退出，
+// concurrently -k 随即把 vite 一起关掉——表现为"npm run dev 一闪而过"）。
+// 仅用于本地开发调试，生产不设该变量，行为与原来完全一致。
+const ALLOW_MULTI = process.env.AGENTHUB_ALLOW_MULTI === "1";
+if (ALLOW_MULTI) {
+  // userData 隔离：避免与安装版争抢同一个库/日志/缓存
+  app.setPath("userData", path.join(app.getPath("appData"), "AgentHub-dev"));
+}
+const gotLock = ALLOW_MULTI ? true : app.requestSingleInstanceLock();
 if (!gotLock) {
+  __crashLog("single-instance-lock-lost", "已有实例持有单实例锁，本次启动即退出（第二次启动的正常行为，不是崩溃）");
   app.quit();
 } else {
-  app.on("second-instance", () => showWindow());
+  if (!ALLOW_MULTI) app.on("second-instance", () => showWindow());
 
   app.whenReady().then(() => {
     // 建窗前先应用主题，避免深色配置下标题栏先白后黑闪烁
@@ -342,7 +393,10 @@ if (!gotLock) {
     remotesync.setOnFinish(notifySync);
     usagesync.setOnFinish(notifyUsageSync);
     // 反代网关：规则热加载 + 额度定时刷新 + 按配置自启网关服务（服务独立于窗口存续）
-    proxy.boot();
+    // boot() 是 async：rules.init() / store.open() / credits.startScheduler() / startCheckinAuto()
+    // 都是裸调用，抛错会变成 rejected promise。原先这里没有任何 catch，
+    // 未处理的 rejection 会让主进程直接退出——症状是「窗口凭空消失、无崩溃事件、无 dump、无日志」。
+    proxy.boot().catch((e) => __crashLog("proxy-boot-failed", __describe(e)));
     // 记忆中枢：仓库初始化 + 本地 HTTP API（供 MCP 桥转发）+ 目录监听；失败只影响本模块
     memory.boot().catch(() => {});
     createWindow();
@@ -360,6 +414,10 @@ if (!gotLock) {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
       else showWindow();
     });
+  }).catch((e) => {
+    // 初始化链（建库 / 注册 IPC / 建窗建托盘 / 起各调度器）任何一步抛错都记下来；
+    // 原先这里没有 catch，抛错 = unhandledRejection = 主进程静默退出
+    __crashLog("whenReady-failed", __describe(e));
   });
 
   app.on("before-quit", (e) => {

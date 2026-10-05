@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS usage_requests (
   model TEXT NOT NULL DEFAULT '',
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
   ttft_ms INTEGER NOT NULL DEFAULT 0,
   latency_ms INTEGER NOT NULL DEFAULT 0,
   status INTEGER NOT NULL DEFAULT 0,
@@ -113,12 +115,24 @@ CREATE INDEX IF NOT EXISTS idx_usage_channel ON usage_requests(channel, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model, ts);
 `;
 
+/**
+ * 渠道注册表（UI 列表 / 健康检查 / 池同步校验 / key 路由校验的单一事实源）。
+ * Qoder 双区：CN 与 INTL 各自独立接入（账号与额度池互不相通）。
+ * INTL 免费额度不含 DeepSeek-Flash / GLM-5.3-Flash 等（需充值/额度覆盖才有可用模型），
+ * 界面提示已注明；其签名器依赖本机安装的国际版客户端。
+ */
+const QODER_INTL_ENABLED = true;
+
 const CHANNELS = [
   { id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn" },
   { id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com" },
   { id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai" },
   { id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com" },
   { id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai" },
+  // Qoder CN：账号与额度池与 INTL 互不相通，各自独立接入。
+  // 注意：该渠道签名依赖本机安装的客户端（wasm 提取），凭据可导入但未装客户端时不可调用。
+  { id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn" },
+  ...(QODER_INTL_ENABLED ? [{ id: "qoder_intl", display: "Qoder International", domain: "api2.qoder.sh" }] : []),
 ];
 
 /** 打开数据库（幂等）；建表 + WAL + 三渠道种子 + 90 天流水 GC */
@@ -141,6 +155,13 @@ function open() {
   // 在线迁移：keys.key_enc（完整 Key 的 DPAPI 加密信封，供列表随时查看 / 复制）
   try {
     db.exec("ALTER TABLE keys ADD COLUMN key_enc TEXT NOT NULL DEFAULT ''");
+  } catch { /* 已存在 */ }
+  // 在线迁移：usage_requests 缓存 token（命中率统计；Anthropic 协议上游如 zcode 会回 cache_read/creation）
+  try {
+    db.exec("ALTER TABLE usage_requests ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0");
+  } catch { /* 已存在 */ }
+  try {
+    db.exec("ALTER TABLE usage_requests ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0");
   } catch { /* 已存在 */ }
   const ins = db.prepare("INSERT OR IGNORE INTO agents (id, display, domain, pool_strategy, updated_at) VALUES (?,?,?,?,?)");
   const updDisplay = db.prepare("UPDATE agents SET display = ? WHERE id = ?");
@@ -303,19 +324,39 @@ function tokenUsable(r) {
 
 function accountView(r) {
   const meta = parseMeta(r.meta);
+  // 冷却到期在**读时**派生回 online 并落库。不能只在 poolAccounts 被调用时复活：
+  // 调度只挑 online 账号，若"复活"依赖该渠道被访问，就会出现
+  // 「冷却 → 不被任何请求选中 → 永不复活」的死结（实测 workbuddy_ai 因一次 54 万 token
+  // 请求顶穿首字节预算被熔断 30 分钟，之后 12.5 小时没有任何调用方唤醒它，
+  // 渠道一直显示报错、模型目录也不再刷新）。
+  // 顺带清掉过期的"最近错误"：它属于那次冷却，冷却结束就不再是当前状态
+  // （完整历史仍保留在 usage_requests，不会丢）。
+  let status = r.status;
+  let coolUntil = r.cool_until;
+  let coolReason = r.cool_reason || "";
+  let lastError = meta.lastError || null;
+  if (status === "cooling" && coolUntil && coolUntil <= Date.now()) {
+    status = "online";
+    coolUntil = 0;
+    coolReason = "";
+    lastError = null;
+    const nextMeta = { ...meta };
+    delete nextMeta.lastError;
+    updateAccount(r.id, { status, coolUntil, coolReason, meta: nextMeta });
+  }
   return {
     id: r.id,
     channel: r.channel,
     uid: r.uid,
     name: r.name,
-    status: r.status,
+    status,
     credits: r.credits,
     creditsAt: r.credits_at,
     expiresAt: r.expires_at,
-    coolUntil: r.cool_until,
-    coolReason: r.cool_reason || "",
+    coolUntil,
+    coolReason,
     /** 最近一次上游错误（气泡展示用；只留最新一条） */
-    lastError: meta.lastError || null,
+    lastError,
     source: r.source,
     lastUsed: r.last_used,
     todayReq: r.today_day === dayStr() ? r.today_req : 0,
@@ -393,8 +434,10 @@ function updateAccount(id, patch) {
   const put = (col, val) => { sets.push(`${col}=?`); vals.push(val); };
   if (patch.name != null) put("name", String(patch.name).slice(0, 64));
   if (patch.status != null) put("status", String(patch.status));
-  // credits 允许 -1（企业版无限额度哨兵）；其余负值一律归 0
-  if (patch.credits != null) put("credits", Number(patch.credits) < -1 ? 0 : Math.round(Number(patch.credits) || 0));
+  // credits 允许 -1（企业版无限额度哨兵）；其余负值一律归 0。
+  // 保留两位小数：Qoder 的 Credits 是浮点计量（实测 0.0066 级），取整会抹掉小额消耗；
+  // 既有渠道传整数，不受影响（浮点列在 SQLite 中按 REAL 存）
+  if (patch.credits != null) put("credits", Number(patch.credits) < -1 ? 0 : Math.round((Number(patch.credits) || 0) * 100) / 100);
   if (patch.creditsAt != null) put("credits_at", Number(patch.creditsAt) || 0);
   if (patch.expiresAt != null) put("expires_at", Math.max(0, Number(patch.expiresAt) || 0));
   if (patch.coolUntil != null) put("cool_until", Math.max(0, Number(patch.coolUntil) || 0));
@@ -465,7 +508,8 @@ function snapshotCredits(channel, accountId, credits, expiresAt) {
   db.prepare(
     `INSERT INTO credits_history (channel, account_id, day, credits, expires_at) VALUES (?,?,?,?,?)
      ON CONFLICT(channel, account_id, day) DO UPDATE SET credits=excluded.credits, expires_at=excluded.expires_at`
-  ).run(String(channel), String(accountId), dayStr(), Math.max(0, Math.round(credits || 0)), Math.max(0, Number(expiresAt) || 0));
+    // 两位小数口径与 updateAccount 一致（Qoder 浮点 Credits；整数渠道不受影响）
+  ).run(String(channel), String(accountId), dayStr(), Math.max(0, Math.round((Number(credits) || 0) * 100) / 100), Math.max(0, Number(expiresAt) || 0));
 }
 
 // ===== 请求流水与统计 =====
@@ -473,8 +517,8 @@ function snapshotCredits(channel, accountId, credits, expiresAt) {
 function insertUsage(row) {
   open();
   db.prepare(
-    `INSERT INTO usage_requests (ts, req_id, key_id, key_name, channel, account_id, account_name, model, prompt_tokens, completion_tokens, ttft_ms, latency_ms, status, error)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO usage_requests (ts, req_id, key_id, key_name, channel, account_id, account_name, model, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens, ttft_ms, latency_ms, status, error)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.ts || Date.now(),
     row.reqId || "",
@@ -486,6 +530,8 @@ function insertUsage(row) {
     row.model || "",
     row.promptTokens || 0,
     row.completionTokens || 0,
+    row.cacheReadTokens || 0,
+    row.cacheCreationTokens || 0,
     row.ttftMs || 0,
     row.latencyMs || 0,
     row.status || 0,
@@ -573,6 +619,7 @@ function usageView(r) {
     id: r.id, ts: r.ts, reqId: r.req_id, keyId: r.key_id, keyName: r.key_name,
     channel: r.channel, accountId: r.account_id, accountName: r.account_name, model: r.model,
     promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens,
+    cacheReadTokens: r.cache_read_tokens || 0, cacheCreationTokens: r.cache_creation_tokens || 0,
     ttftMs: r.ttft_ms, latencyMs: r.latency_ms, status: r.status, error: r.error,
   };
 }
@@ -610,6 +657,7 @@ module.exports = {
   open, close, proxyDir, dayStr, dayStartMs,
   driver: () => driver,
   CHANNELS,
+  QODER_INTL_ENABLED,
   channelDisplay: (id) => (CHANNELS.find((c) => c.id === id) || {}).display || String(id),
   createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
   listAgents, setPoolStrategy,

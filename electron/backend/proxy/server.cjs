@@ -140,11 +140,16 @@ function classifyUpstream(e, planLimit) {
   }
   if (/\b11101\b/.test(msg)) return { kind: "bad_params", switchable: true, status: 400 };
   if (e && e.status === 429) {
-    return { kind: "rate", switchable: true, status: 429, resetMs: parseRateResetMs(msg) || (e.retryAfterMs || 0) };
+    // resetMs 统一为绝对时刻：parseRateResetMs 本就返回墙钟；retryAfterMs 是剩余时长，必须换算。
+    // 二者混装会让 coolAccountMs 把时长当时刻，Retry-After: 7200 被 Math.max(now+1s) 兜成 1s 冷却（墙钟对齐失效）
+    return { kind: "rate", switchable: true, status: 429, resetMs: parseRateResetMs(msg) || (e.retryAfterMs ? Date.now() + e.retryAfterMs : 0) };
   }
   if (e && e.status === 401) return { kind: "relogin", switchable: true, status: 401 };
   if (e && e.status === 404) return { kind: "not_found", switchable: true, status: 404 }; // 短冷却不累计，防雪崩
   if (e && e.status === 400) return { kind: "fatal", switchable: false, status: 400 };
+  // 首字节超时（上游迟迟不吐第一个 token）：多为"这次 prompt 太大 / 上游这一刻忙"，
+  // 不是账号故障——单独分类，只换号不冷却、也不计入 5xx/网络熔断
+  if (e && e.firstByteTimeout) return { kind: "slow", switchable: true, status: 504 };
   return { kind: "server", switchable: true, status: 502 }; // 5xx / 网络 / 超时
 }
 
@@ -236,13 +241,16 @@ function channelHealthSnapshot() {
 function applyCool(accId, model, cls, message) {
   if (!accId) return;
   // 参数/模型配置类错误与账号无关，不罚号也不记错；其余落冷却的错误都记入账号最近错误（号池气泡展示）
-  if (cls.kind !== "model_config" && cls.kind !== "bad_params" && cls.kind !== "prompt_too_long" && message) {
+  // slow（首字节超时）同样不记错：它是"这次请求太大/上游这一刻慢"，记在账号上只会留下误导性的
+  // 长期错误气泡（实测一次 54 万 token 请求超时，账号卡片挂了两天的"上游首字节超时"）
+  if (cls.kind !== "model_config" && cls.kind !== "bad_params" && cls.kind !== "prompt_too_long" && cls.kind !== "slow" && message) {
     store.noteError(accId, message);
   }
   switch (cls.kind) {
     case "model_config": // 4001 模型配置为空：模型问题不是账号问题，不罚号
     case "bad_params": // 11101：参数问题不罚号（换号仍会发生，由外层轮转决定）
     case "prompt_too_long": // 11115：同一 body 换任何号都超限，零动作
+    case "slow": // 首字节超时：请求/上游侧的慢，账号本身没问题，零冷却（外层仍会换号重试）
       return;
     case "model_rate":
       pool.coolAccountModel(accId, model, cls.resetMs || Date.now() + 600000, message); // 6004：对齐墙钟优先，缺省 10min
@@ -321,6 +329,10 @@ async function handleChat(req, res, settings) {
     record({ status: 400, error: bad });
     return sendError(res, 400, bad, "invalid_request_error", "invalid_params");
   }
+  // 角色归一（issue #47）：各渠道上游 role 白名单互相冲突（workbuddy 拒 developer、
+  // raccoon 拒 function），而 400 会触发渠道回退，导致同一条请求能否成功取决于命中
+  // 哪个渠道。入口处统一收敛到所有渠道都接受的交集角色，避免逐渠道维护白名单表。
+  util.normalizeRoles(body.messages);
   // 上游并发上限（默认 8）
   if (runtime.active >= settings.concurrency) {
     record({ status: 429, error: "concurrency limit" });
@@ -351,7 +363,7 @@ async function handleChat(req, res, settings) {
   }
 
   if (!resolveChannel(key, actualModel, settings).channel && !fallback) {
-    const hint = adapters.mergedModels(settings).map((m) => m.id).join(", ");
+    const hint = adapters.listableModels(settings).map((m) => m.id).join(", ");
     record({ status: 400, error: "unknown model" });
     return sendError(res, 400, `模型 "${actualModel}" 不在任何渠道目录中。可用模型：${hint}`, "invalid_request_error", "model_not_found");
   }
@@ -753,6 +765,9 @@ async function handleChat(req, res, settings) {
       else if (usedTargetModel !== actualModel) errParts.push("rev→" + usedTargetModel);
       record({
         status: 200, ttftMs, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens,
+        // 缓存 token：OpenAI 语义取 prompt_tokens_details.cached_tokens，Anthropic 上游取 cache_read_input_tokens
+        cacheReadTokens: (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) ?? usage.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: usage.cache_creation_input_tokens ?? usage.cache_creation_tokens ?? 0,
         error: errParts.join(" "),
       });
       return;
@@ -809,9 +824,9 @@ function buildApp(settings) {
     if (!res.headersSent) sendError(res, 500, String((e && e.message) || e), "server_error");
   }));
 
-  // 模型目录：三渠道合并视图，鉴权可选（方案 §6.1）
+  // 模型目录：三渠道合并视图，鉴权可选（方案 §6.1）；停用模型不对外列出（调不通就不给看，省下游翻找）
   app.get("/v1/models", (_req, res) => {
-    res.json({ object: "list", data: adapters.mergedModels(settings()) });
+    res.json({ object: "list", data: adapters.listableModels(settings()) });
   });
 
   // 探活：无健康渠道时 503
@@ -900,4 +915,4 @@ function status() {
   };
 }
 
-module.exports = { start, stop, stopAsync, status, channelHealthSnapshot };
+module.exports = { start, stop, stopAsync, status, channelHealthSnapshot, classifyUpstream };

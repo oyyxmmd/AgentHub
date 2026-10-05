@@ -22,7 +22,7 @@ async function main() {
   // 1. 数据库 + 种子
   store.open();
   console.log("db driver:", store.driver());
-  assert(store.listAgents().length === store.CHANNELS.length, "渠道种子数 = CHANNELS 数（5：trae/workbuddy/workbuddy_ai/raccoon/zcode）");
+  assert(store.listAgents().length === store.CHANNELS.length, `渠道种子数 = CHANNELS 数（${store.CHANNELS.length}：${store.CHANNELS.map((c) => c.id).join("/")}）`);
 
   // 2. Key 全链路
   const k = store.createKey({ name: "自测", route: "auto", dailyQuota: 10, rateLimit: 0 });
@@ -135,6 +135,77 @@ async function main() {
   });
   assert(wPack.messages[0].role === "assistant" && wPack.messages[1].role === "tool" && wPack.messages[2].role === "user" && wPack.messages[2].content.includes("夹在中间"), "工具组重排：tool 在非 tool 消息前");
 
+  // ===== 角色归一（issue #47）=====
+  // 入口 util.normalizeRoles 负责把 role 收敛到各渠道上游白名单的交集，
+  // 否则「workbuddy 拒 developer / raccoon 拒 function」在 400 渠道回退下表现为
+  // 「trace 一用就断、且复现不稳定」。这里锁住映射规则本身。
+  const nrOut = util.normalizeRoles([
+    { role: "developer", content: "sys" },
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+    { role: "function", content: "legacy result", name: "f" },                 // 无 tool_call_id → user
+    { role: "function", content: "typed result", tool_call_id: "c1" },          // 有 tool_call_id → tool
+  ]);
+  assert(nrOut[0].role === "system", "developer → system");
+  assert(nrOut[1].role === "user", "user 原样保留");
+  assert(nrOut[3].role === "user" && nrOut[3].content === "legacy result", "legacy function（无 tool_call_id）→ user，content 不丢");
+  assert(nrOut[4].role === "tool" && nrOut[4].tool_call_id === "c1", "function（带 tool_call_id）→ tool");
+  // 幂等 + 非法输入不抛：归一后重复调用不得二次改写
+  const nrTwice = util.normalizeRoles(nrOut);
+  assert(nrTwice === nrOut && nrTwice.every((m) => ["system", "user", "assistant", "tool"].includes(m.role)), "归一后 role 全在交集内且幂等");
+  assert(util.normalizeRoles(null) === null, "normalizeRoles 对非数组原样返回");
+  assert(util.normalizeRoles([null, "x", { noRole: 1 }]) !== undefined, "非法消息项不抛（不因此拒绝请求）");
+  // 未知 role：保持原样不猜语义，但必须留下 warning，不再无声丢弃
+  const nrWarn = [];
+  const nrRealWarn = console.warn;
+  console.warn = (...a) => { nrWarn.push(a.join(" ")); };
+  let nrUnknown;
+  try {
+    nrUnknown = util.normalizeRoles([
+      { role: "tool_result", content: "a" },
+      { role: "user", content: "hi" },
+      { role: "tool_result", content: "b" },   // 同 role 重复 → 应合并计数
+      { role: "__bogus__", content: "c" },
+    ]);
+  } finally {
+    console.warn = nrRealWarn;
+  }
+  assert(nrUnknown[0].role === "tool_result" && nrUnknown[3].role === "__bogus__", "未知 role 保持原样（不猜语义、不改写）");
+  assert(nrWarn.length === 1 && nrWarn[0].includes("tool_result") && nrWarn[0].includes("__bogus__") && nrWarn[0].includes("×2"), "未知 role 记 warning 且同 role 合并计数（长会话不刷屏）");
+  const nrWarnClean = [];
+  console.warn = (...a) => { nrWarnClean.push(a.join(" ")); };
+  try { util.normalizeRoles([{ role: "system", content: "s" }, { role: "user", content: "u" }]); } finally { console.warn = nrRealWarn; }
+  assert(nrWarnClean.length === 0, "全部已知 role 时不产生 warning 噪音");
+  // 交集角色的大小写/首尾空白变体无损归一为小写（上游枚举校验区分大小写）
+  const nrCase = util.normalizeRoles([{ role: "User", content: "a" }, { role: " ASSISTANT ", content: "b" }, { role: "System", content: "c" }]);
+  assert(nrCase[0].role === "user" && nrCase[1].role === "assistant" && nrCase[2].role === "system", "大小写/空白变体（User/ASSISTANT/System）归一为小写");
+  // 归一后各渠道的 rewriteBody 都不再收到白名单外角色（trae / raccoon 均不做 developer 归一）
+  const nrBody = util.normalizeRoles([
+    { role: "developer", content: "sys" },
+    { role: "user", content: "hi" },
+  ]);
+  const nrTrae = adapters.get("trae").rewriteBody("Doubao-Seed-2.1-Pro", { model: "Doubao-Seed-2.1-Pro", messages: nrBody.map((m) => ({ ...m })) }, { id: "acc1", uid: "u1" });
+  const nrRaccoon = adapters.get("raccoon").rewriteBody("raccoon-chat-ml-5-5", { model: "raccoon-chat-ml-5-5", messages: nrBody.map((m) => ({ ...m })) });
+  const nrOk = (out) => out.messages.every((m) => ["system", "user", "assistant", "tool"].includes(m.role));
+  assert(nrOk(nrTrae) && nrOk(nrRaccoon), "归一后 trae / raccoon 均只收到交集角色");
+  // 静默丢消息的两条路径也一并被堵住：qoderAdapter.toQoderMessages 对交集外 role
+  // 直接 continue（无报错、消息消失），zcodeAnthropic 把 developer 并进 system、
+  // 但 legacy function 会被静默丢弃。归一后两者都拿得到完整内容。
+  const qoderAdapter = require("../electron/backend/proxy/qoderAdapter.cjs");
+  const zcodeAnthropic = require("../electron/backend/proxy/zcodeAnthropic.cjs");
+  const nrLegacy = util.normalizeRoles([
+    { role: "developer", content: "sys-directive" },
+    { role: "user", content: "hi" },
+    { role: "function", content: "legacy-result", name: "f" },
+  ]);
+  const qMsgs = qoderAdapter.toQoderMessages(nrLegacy);
+  const qText = JSON.stringify(qMsgs);
+  assert(qMsgs.length === 3 && qText.includes("sys-directive") && qText.includes("legacy-result"), "qoder：归一后 developer/function 不再被 toQoderMessages 静默丢弃");
+  const zOut = zcodeAnthropic.toAnthropic("glm-5.3-flash", { model: "glm-5.3-flash", messages: nrLegacy.map((m) => ({ ...m })) });
+  const zText = JSON.stringify(zOut);
+  assert(zText.includes("sys-directive") && zText.includes("legacy-result"), "zcode：归一后 developer 并入 system、legacy function 不再被丢弃");
+  console.log("role layer ok（developer→system / function→tool|user / 幂等 / 非法输入不抛 / qoder+zcode 静默丢弃已堵）");
+
   assert(adapters.mergedModels().length > 5, "合并模型目录");
   assert(adapters.modelOwners("gpt-5").length === 1 && adapters.modelOwners("gpt-5")[0] === "workbuddy", "gpt-5 归属 CN workbuddy（AI 区目录已无此型号）");
   assert(adapters.modelOwners("deepseek-v4.1-flash").length === 1 && adapters.modelOwners("deepseek-v4.1-flash")[0] === "workbuddy_ai", "deepseek-v4.1-flash 归属国际版 workbuddy_ai");
@@ -145,6 +216,47 @@ async function main() {
   assert(rc && rc.id === "raccoon", "raccoon 适配器注册");
   assert(store.CHANNELS.some((c) => c.id === "raccoon"), "store.CHANNELS 含 raccoon");
   assert(adapters.modelOwners("raccoon-chat-ml-5-5")[0] === "raccoon", "raccoon-chat-ml-5-5 归属 raccoon");
+
+  // ===== Qoder 注册 =====
+  // 与既有渠道的关键差异：签名是每请求的（wasm 驱动），headers() 只返回非签名基础头。
+  // qoder_intl 暂停启用（store.QODER_INTL_ENABLED）——断言按开关实际状态校验，
+  // 防止「隐藏渠道仍参与路由」的静默回归（ADAPTERS 参与 modelOwners）。
+  const qd = adapters.get("qoder");
+  assert(qd && qd.id === "qoder", "qoder 适配器注册");
+  assert(store.CHANNELS.some((c) => c.id === "qoder"), "store.CHANNELS 含 qoder");
+  const intlOn = !!store.QODER_INTL_ENABLED;
+  assert(!!adapters.get("qoder_intl") === intlOn, `qoder_intl 适配器注册状态与开关(${intlOn}) 一致`);
+  assert(store.CHANNELS.some((c) => c.id === "qoder_intl") === intlOn, `CHANNELS 中 qoder_intl 与开关一致`);
+  const qoderList = [["qoder", qd, "https://gateway.qoder.com.cn"]];
+  if (intlOn) qoderList.push(["qoder_intl", adapters.get("qoder_intl"), "https://api2.qoder.sh"]);
+  for (const [id, ad, gw] of qoderList) {
+    const need = ["cfg", "models", "fetchModels", "headers", "rewriteBody", "chat", "queryCredits", "refreshToken"];
+    assert(need.every((k) => typeof ad[k] === "function"), `${id} 适配器十件套齐备`);
+    assert(ad.cfg().gateway === gw, `${id} cfg.gateway 指向 ${gw}`);
+    assert(ad.models().length >= 14, `${id} 静态模型表 ≥14`);
+    // headers() 必须**不含** Authorization：签名由 chat() 内 wasm 现场产出，
+    // 静态头里出现 Authorization 即为「照抄 WB 静态头组」的错误实现
+    const h = ad.headers();
+    assert(!("authorization" in h) && !("Authorization" in h), `${id} headers() 不含 Authorization（签名下沉 chat()）`);
+    assert(typeof h["user-agent"] === "string" && h.accept === "text/event-stream", `${id} headers() 基础头正确`);
+  }
+  // 模型归属：INTL 关闭时 dfmodel 必须只归 qoder（残留双归属会路由到无账号渠道）
+  const dfOwners = adapters.modelOwners("dfmodel");
+  if (intlOn) {
+    assert(dfOwners.length === 2 && dfOwners.includes("qoder_intl"), "dfmodel 归属 Qoder 双区（多归属→打分路由）");
+  } else {
+    assert(dfOwners.length === 1 && dfOwners[0] === "qoder", "dfmodel 仅归 qoder（INTL 关闭时无幽灵归属）");
+  }
+  const qModels = qd.models();
+  for (const other of ["trae", "workbuddy", "workbuddy_ai", "raccoon", "zcode"]) {
+    const om = adapters.get(other).models();
+    const clash = qModels.filter((m) => om.includes(m));
+    assert(clash.length === 0, `qoder 模型与 ${other} 零重名（无路由歧义）`);
+  }
+  const qBody = qd.rewriteBody("dfmodel", { messages: [{ role: "user", content: "hi" }], temperature: 0.2 }, { uid: "u" }, {});
+  assert(qBody.model_config && qBody.model_config.key === "dfmodel" && qBody.model_config.format === "openai", "qoder rewriteBody 产出 QoderInferRequest");
+  assert(qBody.request_id === qBody.request_set_id && Array.isArray(qBody.messages) && Array.isArray(qBody.tools), "qoder rewriteBody 结构正确");
+  assert(qBody.messages[0].content[0].type === "text" && qBody.temperature === 0.2, "qoder rewriteBody 消息归一 + 采样参数透传");
   assert(rc.mapModel("raccoon-chat") === "raccoon-chat-ml-5-5" && rc.mapModel("raccoon-chat-ml") === "raccoon-chat-ml-5-5", "raccoon 模型别名归一");
   const rbody = rc.rewriteBody("raccoon-chat", { model: "raccoon-chat", conversation_id: "x", prompt_cache_key: "y", messages: [{ role: "user", content: "hi" }], temperature: 0.7 });
   assert(rbody.model === "raccoon-chat-ml-5-5" && rbody.stream === true && rbody.stream_options.include_usage === true, "raccoon rewriteBody 强制流式+include_usage");
@@ -492,7 +604,16 @@ async function main() {
   });
   const disBody = await rr.json();
   assert(rr.status === 400 && disBody.error.code === "model_disabled", "禁用模型 400: " + rr.status);
+  // 10.9a 停用模型不对外列出：/v1/models 减去 disabledModels，恢复启用后回归
+  const probe = adapters.mergedModels(e2eSettings())[0].id;
+  e2eDisabledFlag.push(probe);
+  let modelsBody = await (await fetch(base2 + "/v1/models")).json();
+  assert(!modelsBody.data.some((m) => m.id.toLowerCase() === probe.toLowerCase()), "停用模型不出现在 /v1/models: " + probe);
+  assert(modelsBody.data.length > 0, "未停用模型仍在 /v1/models（剩余 " + modelsBody.data.length + " 条）");
+  assert(adapters.mergedModels(e2eSettings()).some((m) => m.id.toLowerCase() === probe.toLowerCase()), "管理视图 mergedModels 仍含停用模型（过滤只发生在对外出口）");
   e2eDisabledFlag.length = 0;
+  modelsBody = await (await fetch(base2 + "/v1/models")).json();
+  assert(modelsBody.data.some((m) => m.id.toLowerCase() === probe.toLowerCase()), "恢复启用后 /v1/models 回归: " + probe);
 
   // 10.10 本地 IDE 快捷切换（确认协议 + WB auth 文件合并写回 + 备份 + Trae 诚实降级）
   process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), "ah-lappdata-"));

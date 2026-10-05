@@ -85,14 +85,17 @@ async function probeGateway() {
   // fallbackModel（反代网关设置里的全局统一回退模型）必须带出去：模型池没配时 LlmClient 靠它
   // 回退到网关号池当前模型——此前探测结果漏了这个字段，「什么都不配回退号池」实际永不生效
   const value = { available: false, baseUrl, port, fallbackModel: String((framework.proxy && framework.proxy.fallbackModel) || "") };
+  let timer = null;
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1200);
+    timer = setTimeout(() => controller.abort(), 1200);
     const res = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: controller.signal });
-    clearTimeout(timer);
     value.available = res.ok;
   } catch {
     value.available = false;
+  } finally {
+    // fetch 在超时前就失败（如连接被拒）时也要清掉定时器，否则句柄会存活到 1.2s 后才自解
+    if (timer) clearTimeout(timer);
   }
   gatewayCache = { at: now, value };
   return value;
@@ -196,6 +199,8 @@ function init() {
   syncer = new MemorySync({
     service,
     deviceName: require("os").hostname(),
+    // 设备登记文件名取自它：不传的话 state.deviceId 恒空、多台设备都写成 devices/local.json 互相覆盖
+    deviceId: deviceId(),
     getConfig: () => service.flat(),
     moduleWebdav: (key) => configMod.moduleWebdav(key),
     emit,
@@ -424,6 +429,13 @@ function register(ipcMain) {
     if (invalid.length) return fail(invalid.join("；"));
     memCfg.set(entries, { local: !!local });
     emit({ type: "config-changed", keys: Object.keys(entries) });
+    // 预算闸门相关改动立即重算一次到期任务：否则要等下一个 60s tick，
+    // 用户「把预算调高」后会觉得没生效（尤其按天/按周任务本来就要等到点）
+    if (Object.keys(entries).some((k) => k === "auto.dailyTokenLimit" || k === "auto.overBudgetAction" || k === "auto.enabled")) {
+      // _tick 会 reject（调度器自己的定时器回调也一律带 catch）：漏接会变成未处理拒绝，
+      // 由全局兜底记进 crash.log。调度器未启用时 scheduler 为 null，同步抛错由 catch 吃掉
+      try { void scheduler._tick().catch(() => {}); } catch { /* 调度器未启用时忽略 */ }
+    }
     return ok({});
   }));
   ipcMain.handle("memory_config_reset", handle(({ keys }) => {
@@ -432,10 +444,12 @@ function register(ipcMain) {
     return ok({});
   }));
   ipcMain.handle("memory_config_export", handle(() => {
-    // 导出不带 Key：apiKeyRef 自 v1.23.0 起是明文，随 JSON 外发即泄密
-    const tree = settings();
+    // 导出不带 Key：apiKeyRef 自 v1.23.0 起是明文，随 JSON 外发即泄密。
+    // settings() 返回的是 MemoryConfig 的内存缓存对象（all() 直接返回 _cache），必须深拷贝后再抹 Key——
+    // 原地改会把运行中配置的 apiKeyRef 清空，此后所有 LLM 调用取不到 Key，直到配置文件被重新读取。
+    const tree = JSON.parse(JSON.stringify(settings() || {}));
     if (tree && tree.models && Array.isArray(tree.models.providers)) {
-      tree.models = { ...tree.models, providers: tree.models.providers.map((p) => ({ ...p, apiKeyRef: "" })) };
+      tree.models.providers = tree.models.providers.map((p) => ({ ...p, apiKeyRef: "" }));
     }
     return {
       ok: true,
@@ -467,16 +481,20 @@ function register(ipcMain) {
     const target = expandHome(dir);
     fs.mkdirSync(target, { recursive: true });
     const old = rootDir;
-    if (migrate && old && fs.existsSync(old) && path.resolve(old) !== path.resolve(target)) {
-      copyTree(old, target, new Set(["index"]));
-    }
+    // 仓库配置先写（shutdown 会清掉 memCfg）：storage.root 随 config/ 一起复制到新根，
+    // 否则新根的 config.json 里残留指向旧根的指针
     memCfg.set({ "storage.root": target }, { local: true });
     try {
       const framework = configMod.loadConfig();
       framework.memory = { ...(framework.memory || {}), rootDir: target };
       configMod.saveConfig(framework);
     } catch { /* 框架配置写失败不影响仓库自身 */ }
+    // 先关停再迁移：shutdown 会等在途任务/写入收尾并停掉监听，
+    // 复制窗口内旧根不再有增量写入漏搬（迁移放在 shutdown 之后是刻意的）
     await shutdown();
+    if (migrate && old && fs.existsSync(old) && path.resolve(old) !== path.resolve(target)) {
+      copyTree(old, target, new Set(["index"]));
+    }
     // 必须走 boot()：init() 只重建对象，不会重启 HTTP 桥/目录监听/调度器（换根后模块半瘫）
     await boot();
     emit({ type: "root-changed", root: target });
@@ -543,18 +561,28 @@ function register(ipcMain) {
     // 批越小每段阻塞越短（低配电脑更平滑），代价是总时长略增——可接受
     const BATCH = 20;
     let done = 0;
+    // 单文件异常不能中止整轮：中止会让 pruneOrphans 与 lastScanAt 都不执行。
+    // failed 口径与 rebuildIndex 一致（rel + 截断后的消息）
+    const failed = [];
     for (const rel of files) {
-      need().reindexFile(rel);
+      try {
+        need().reindexFile(rel);
+      } catch (e) {
+        failed.push({ rel, message: String(e.message || e).slice(0, 160) });
+      }
       done++;
       if (done % 200 === 0) emit({ type: "index", running: true, done, total: files.length });
       if (done % BATCH === 0) await yieldUi();
     }
     const pruned = need().pruneOrphans(new Set(files));
+    // 存量大小写脏数据收口：同 id 双 path（写入折小写 slug、watcher 取目录真名留下的）在这里合并成一行，
+    // project 列与项目台账一并折小写。不做的话用户升级后仍是「显示两遍 + 两张卡」，要等下一次自愈扫描
+    const caseFixed = need().normalizeCase(new Set(files));
     need().index.setMeta("lastScanAt", String(Date.now()));
     const diagnose = diagnoseSnapshot();
     emit({ type: "index", running: false, done, total: files.length, diagnose });
     // 返回值直接带诊断快照：前端不必再发一次 memory_index_diagnose（又一次全量扫描）
-    return ok({ files: files.length, pruned, diagnose });
+    return ok({ files: files.length, pruned, caseFixed, failed, diagnose });
   })));
   ipcMain.handle("memory_index_rebuild", handle(() => need().withWrite(async () => {
     emit({ type: "index", running: true, done: 0, total: need().store.walkMemoryFiles().length });
@@ -684,7 +712,8 @@ function register(ipcMain) {
     if (rel) {
       const candidate = path.resolve(rootDir, String(rel));
       const relToRoot = path.relative(path.resolve(rootDir), candidate);
-      if (relToRoot.startsWith("..") || path.isAbsolute(relToRoot)) return fail("路径越界：只能打开仓库目录内的路径");
+      // 只拦真正的越界段：startsWith("..") 会误伤仓库内名为 "..foo" 的合法条目
+      if (relToRoot === ".." || relToRoot.startsWith(".." + path.sep) || path.isAbsolute(relToRoot)) return fail("路径越界：只能打开仓库目录内的路径");
       target = candidate;
     }
     if (!electron || !electron.shell) return fail("当前环境不支持打开目录");
@@ -783,8 +812,10 @@ function register(ipcMain) {
   ipcMain.handle("memory_profile_generate", handle(() => tasksRunner.runProfile({})));
   ipcMain.handle("memory_profile_get", handle(() => {
     // 读取前自愈兜底：若本地文件因版本更新或仓库重置缺失，自动从全局持久缓存恢复
+    // （need() 返回的就是 MemoryService 本身，没有 .service 属性——写成 need().service
+    // 会在回调里 TypeError 且被外层空 catch 吞掉，自愈重索引从未生效）
     try {
-      profileCache.restoreIfMissing(need().store, configMod.dataDir(), (rel) => need().service.reindexFile(rel));
+      profileCache.restoreIfMissing(need().store, configMod.dataDir(), (rel) => need().reindexFile(rel));
     } catch {}
 
     const names = ["persona", "preferences", "tech", "habits"];

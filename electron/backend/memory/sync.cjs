@@ -156,6 +156,15 @@ class MemorySync {
     this.stateFile = path.join(opts.dataDir, "memory-sync-state.json");
     this.conflictsFile = path.join(opts.dataDir, "memory-sync-conflicts.json");
     this.state = this._loadState();
+    // 设备 id 必须每机唯一：index.cjs 的 deviceId() 目前没有传进构造参数，
+    // 退回 service 持有的同源 id；再不行才留空（留空时所有设备的登记文件都叫 local.json 互相覆盖）
+    if (!this.state.deviceId) {
+      const fallback = (opts.service && opts.service.deviceId) || opts.deviceId || "";
+      if (fallback) {
+        this.state.deviceId = fallback;
+        this._saveState();
+      }
+    }
     // 冲突队列（含每条冲突的双侧全文）单独落盘：state 文件随每次日志重写，
     // 塞在一起意味着每条日志都重写数 MB（2 万条规模实测）
     this.state.conflicts = this._loadConflicts();
@@ -248,7 +257,10 @@ class MemorySync {
       const files = (items || []).filter((x) => /\.json$/i.test(x.name || x.href || ""));
       const out = [];
       for (const f of files.slice(0, 20)) {
-        const url = webdav.joinUrl(c.endpoint, c.root, `devices/${String(f.name).split("/").pop()}`);
+        // 有些 WebDAV 服务端只回 href 不带 name：从 href 里取文件名，否则拼出 devices/undefined 永远读不到
+        const base = String(f.name || f.href || "").replace(/\\/g, "/").split("/").filter(Boolean).pop() || "";
+        if (!base) continue;
+        const url = webdav.joinUrl(c.endpoint, c.root, `devices/${base}`);
         try {
           const text = await webdav.getText(url, c);
           if (text) out.push(JSON.parse(text));
@@ -303,13 +315,24 @@ class MemorySync {
       const t = await webdav.test(c);
       if (!t.ok) throw new Error(t.message || "连接失败");
 
+      // 远端根目录必须先建出来：webdav.test 把 404 当作「目录尚未创建」放行（连接仍算成功），
+      // 但若不去建，接下来对 <root>/memory-latest.tar.gz 的 GET/PUT 在多数 WebDAV 服务器上
+      // 返回的是 409 Conflict（父集合不存在）而不是 404 —— 于是「首次上传永远 409、之后每轮
+      // GET 也 409」，同步被永久卡死且报错文案误导（409 看起来像冲突，其实目录根本不存在）。
+      // 放在 connect 之后、任何读写之前；ensureDir 对「已存在」返回 405/409 视为成功，幂等。
+      this._log("connect", `确保远端目录 ${c.root || "/"}`);
+      await webdav.ensureDir(webdav.joinUrl(c.endpoint, c.root, ""), c);
+
       const remoteUrl = webdav.joinUrl(c.endpoint, c.root, PACK_NAME);
       this._log("pull", `探测远端 ${PACK_NAME}`);
       let remoteBuf = null;
       try {
         remoteBuf = await webdav.get(remoteUrl, c);
-      } catch {
-        remoteBuf = null;
+      } catch (e) {
+        // 拉取失败（网络中断/超时/5xx）绝不能当「远端没有包」：那会跳过合并直接整包上传，
+        // 把其他设备已同步的改动覆盖掉，且本地无备份不可逆。404 由 webdav.get 以 null 区分，
+        // 只有 null 才走「首次上传」——异常一律中止本轮，宁可不同步也不覆盖远端
+        throw new Error(`拉取远端包失败，本轮中止（为防覆盖远端未上传）：${String((e && e.message) || e)}`);
       }
       const remoteManifest = await this._readRemoteManifest(c);
 
@@ -498,13 +521,22 @@ class MemorySync {
         const same = l && r && l.hash === r.hash;
         if (same) continue;
         if (!l && r) {
-          // 本地没有（可能是本地删了）→ 冲突
-          conflictList.push({ kind: "memory", path: rel, local: null, remote: r, detectedAt: Date.now(), note: "远端新增 / 本地不存在" });
+          // 本地没有（可能是本地删了）→ 冲突。remoteText 必须带上：keepRemote 裁决靠它落地，
+          // 缺了会让 resolve 两个分支都不命中，「已裁决」变成静默空操作
+          conflictList.push({
+            kind: "memory", path: rel, local: null, remote: r,
+            localText: "", remoteText: capText(readText(remoteFile)),
+            detectedAt: Date.now(), note: "远端新增 / 本地不存在",
+          });
           conflicts++;
           continue;
         }
         if (l && !r) {
-          conflictList.push({ kind: "memory", path: rel, local: l, remote: null, detectedAt: Date.now(), note: "本地有 / 远端已删" });
+          conflictList.push({
+            kind: "memory", path: rel, local: l, remote: null,
+            localText: capText(readText(localFile)), remoteText: "",
+            detectedAt: Date.now(), note: "本地有 / 远端已删",
+          });
           conflicts++;
           continue;
         }
@@ -568,23 +600,34 @@ class MemorySync {
         // 保持本地：把远端内容丢弃（但把远端文本留档到 reports）
         archiveConflict(c, this.rootDir);
       } else if (decision === "keepRemote") {
-        if (c.remoteText != null) {
-          await this.service.withWrite(() => {
-            this.service.store.writeAtomic(c.path, c.remoteText, { backup: true });
-            this.service.reindexFile(c.path);
-          });
-        } else if (c.remote === null) {
-          // 远端已删：本地进回收站（走写队列，避免与 Agent 写入打架）
+        // 必须先判 remote === null（远端已删）：远端删除时 remoteText 是空串而不是 null，
+        // 若先判 remoteText != null，会把「删除」走成「把空串写回本地」，静默清空文件
+        if (c.remote === null) {
           await this.service.withWrite(async () => {
             this.service.store.moveToTrash(c.path);
             this.service.index.removeByPath(c.path);
           });
+        } else {
+          const remoteText = typeof c.remoteText === "string" ? c.remoteText : "";
+          // 远端有内容却没有可写文本（读取失败/截断丢失）：宁可让用户重新同步，也不能写空覆盖
+          if (!remoteText && c.remote && Number(c.remote.size) > 0) {
+            return { ok: false, message: "远端内容缺失，无法保留远端版本；请重新同步后再裁决" };
+          }
+          await this.service.withWrite(() => {
+            this.service.store.writeAtomic(c.path, remoteText, { backup: true });
+            this.service.index.removeByPath(c.path);
+            this.service.reindexFile(c.path);
+          });
         }
       } else if (decision === "keepBoth") {
-        if (c.remoteText != null) {
+        if (c.remote) {
           const alt = c.path.replace(/\.md$/, `.remote-${Date.now()}.md`);
+          const remoteText = typeof c.remoteText === "string" ? c.remoteText : "";
+          if (!remoteText && c.remote && Number(c.remote.size) > 0) {
+            return { ok: false, message: "远端内容缺失，无法保留远端版本；请重新同步后再裁决" };
+          }
           await this.service.withWrite(() => {
-            this.service.store.writeAtomic(alt, c.remoteText);
+            this.service.store.writeAtomic(alt, remoteText);
             this.service.reindexFile(alt);
           });
         }

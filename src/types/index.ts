@@ -305,7 +305,7 @@ export interface ProxyConfig {
 
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
 
-export type ProxyChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "zcode";
+export type ProxyChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "zcode" | "qoder" | "qoder_intl";
 /** Key 路由：auto 或任一渠道 id（渠道后续扩充即为普通字符串，保留字面量仅为补全提示） */
 export type ProxyRoute = "auto" | ProxyChannelId | (string & {});
 export type ProxyAccountStatus = "online" | "cooling" | "exhausted" | "relogin" | "disabled";
@@ -439,6 +439,8 @@ export interface ProxyUsageRow {
   model: string;
   promptTokens: number;
   completionTokens: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
   ttftMs: number;
   latencyMs: number;
   status: number;
@@ -716,6 +718,8 @@ export type MemoryRow = {
   summary: string;
   tags: string[];
   project: string | null;
+  /** 项目显示名（后端按台账解析；slug 是机器标识，界面展示用这个） */
+  projectName?: string | null;
   agent: string;
   device?: string | null;
   session?: string | null;

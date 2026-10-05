@@ -41,7 +41,9 @@ const DEFAULTS = {
         "custom_model_doubao_1M", "custom_model_doubao_256k", "custom_model_kimi", "custom_model_claude",
         "custom_model_gpt-5", "custom_model_no-fc", "custom_model_deepseek_chat", "custom_model_deepseek_reasoner",
         "custom_model_deepseek_v4", "file_search_agent", "explore_sub_agent_v2", "summary",
-      ].map((id) => ({ id, name: id, rate: null, capabilities: {}, contextLength: 131072, maxOutputTokens: 0 })),
+      // 上限未知时写 0：目录刷新会用官方条目里的 context_window_tokens / max_tokens 覆盖。
+      // 原先写死 contextLength: 131072 会让下游客户端把 30 万 token 的正常回答误判为上下文溢出
+      ].map((id) => ({ id, name: id, rate: null, capabilities: {}, contextLength: 0, maxOutputTokens: 0 })),
     },
     workbuddy: {
       syncedAt: 0,
@@ -74,14 +76,15 @@ const DEFAULTS = {
     zcode: {
       syncedAt: 0,
       models: [
-        { id: "GLM-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
-        { id: "GLM-5.3-Flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
-        { id: "GLM-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
-        { id: "GLM-5.1", name: "GLM-5.1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
-        { id: "GLM-5-Turbo", name: "GLM-5-Turbo", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
-        { id: "GLM-4.7", name: "GLM-4.7", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
-        { id: "GLM-4.6", name: "GLM-4.6", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
-        { id: "GLM-4.5-Air", name: "GLM-4.5-Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 8192 },
+        { id: "GLM-5.3", name: "GLM-5.3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        // 客户端自带能力表实测：.*glm-5\.3(?:-flash)? 为 false，但其后的 .*glm-5\.3-flash 专用规则为 true
+        { id: "GLM-5.3-Flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        { id: "GLM-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 128000 },
+        { id: "GLM-5.1", name: "GLM-5.1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
+        { id: "GLM-5-Turbo", name: "GLM-5-Turbo", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 64000 },
+        { id: "GLM-4.7", name: "GLM-4.7", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+        { id: "GLM-4.6", name: "GLM-4.6", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 131072 },
+        { id: "GLM-4.5-Air", name: "GLM-4.5-Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 98304 },
       ],
     },
   },
@@ -234,6 +237,33 @@ const DEFAULTS = {
       oauthProvider: "zai",
       // 平台标识（billing/claim 查询参数 platform 的值）
       platform: "win32-x64",
+    },
+    // ===== Qoder 双区 =====
+    // 端点与版本常量放配置（热加载）：客户端升级后只需改 cosyVersion，无需改代码。
+    // 实测签名对版本串宽容（0.4.2 ~ 9.9.9 均通过），此值仅用于对齐客户端指纹。
+    // 账号与额度池两区互不相通（CN/INTL 各一套账号体系），故各自独立配置。
+    qoder: {
+      gateway: "https://gateway.qoder.com.cn",
+      openApi: "https://openapi.qoder.com.cn",
+      // 额度查询域（实测两区不同：CN 走 gateway 亦可，INTL 只在 openapi）
+      quotaBase: "https://gateway.qoder.com.cn",
+      // 推理端点基址（wasm 会补 ?FetchKeys=…&AgentId=…&Encode=1）
+      inferPath: "/algo/api/v2/service/pro/sse/agent_chat_generation",
+      quotaPath: "/api/v2/quota/usage",
+      refreshPath: "/api/v1/deviceToken/refresh",
+      userAgent: "qoder/0.4.3",
+      cosyVersion: "0.4.3",
+    },
+    qoder_intl: {
+      gateway: "https://api2.qoder.sh",
+      openApi: "https://openapi.qoder.sh",
+      // ⚠ INTL 的额度端点在 openapi（gateway 返回 404，实测）
+      quotaBase: "https://openapi.qoder.sh",
+      inferPath: "/algo/api/v2/service/pro/sse/agent_chat_generation",
+      quotaPath: "/api/v2/quota/usage",
+      refreshPath: "/api/v1/deviceToken/refresh",
+      userAgent: "qoder/0.4.3",
+      cosyVersion: "0.4.3",
     },
   },
 };

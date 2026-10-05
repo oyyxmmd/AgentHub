@@ -46,6 +46,7 @@ class MemoryScheduler {
     this.pausedUntil = 0;
     this._lastTickAt = 0;
     this._draining = false;
+    this._ticking = false;
   }
 
   // ---------- 状态 ----------
@@ -247,7 +248,22 @@ class MemoryScheduler {
 
   // ---------- tick ----------
 
+  /**
+   * 定时器回调入口。setInterval 不等待上一轮，若某轮 tick 超过 60s（如自动同步慢），
+   * 会与下一轮并发进入：两轮都判定「到期」并把同一任务压进队列，导致重复执行。
+   * 用 _ticking 串行化，重叠的那轮直接放弃（下一轮自然补上）。
+   */
   async _tick() {
+    if (this._ticking) return;
+    this._ticking = true;
+    try {
+      return await this._tickInner();
+    } finally {
+      this._ticking = false;
+    }
+  }
+
+  async _tickInner() {
     const cfg = this.getConfig();
     if (cfg["auto.enabled"] === false) return;
     const now = Date.now();
@@ -279,9 +295,15 @@ class MemoryScheduler {
     const budget = this._budgetGate(due);
     for (const id of budget.allowed) this.queue.push({ id, at: now });
     if (budget.blocked.length) {
-      this.emit({ type: "auto-paused", detail: `已达单日 token 上限，跳过：${budget.blocked.map(taskName).join("、")}` });
-      // 达上限时推进记账，避免每 tick 都尝试
-      for (const id of budget.blocked) this.service.index.setMeta(`mem_sched_${id}`, String(now));
+      // 达上限时不能推进记账（mem_sched_<id>）：_isDue 把「last 落在本周期」读成「本周期已经跑过」，
+      // 而按天/按周任务判重看的是日期——写一次就让 L2 蒸馏/失效判定整天、去重合并/画像整周不再执行，
+      // 用户把预算调回 0 也救不回来（只能等下一个周期）。排期槽位原样保留，
+      // 另用一个独立键做提示节流：否则每 60 秒 tick 都会重复广播同一条提示刷屏。
+      const lastNotice = Number(this.service.index.getMeta("mem_sched_budget_notice") || 0);
+      if (now - lastNotice >= 30 * 60000) {
+        this.service.index.setMeta("mem_sched_budget_notice", String(now));
+        this.emit({ type: "auto-paused", detail: `已达单日 token 上限，跳过：${budget.blocked.map(taskName).join("、")}（预算调高后自动恢复，排期不受影响）` });
+      }
     }
     await this._drain();
   }
@@ -466,8 +488,11 @@ class MemoryScheduler {
     // 反向自愈：索引有、磁盘无（应用关闭期间文件被外部移动/删除，watcher 没看到，
     // 或历史误索引的范围外文件）→ 清掉失效行，否则搜索结果永远指向不存在的文件
     const pruned = this.service.pruneOrphans(onDisk);
+    // 存量大小写脏数据收口：同一文件的行 path 统一成磁盘真名（历史「同 id 双 path」显示两遍），
+    // project 列与项目台账一并折小写（项目卡条数不再裂成两半）
+    const caseFixed = this.service.normalizeCase(onDisk);
     const stat = this.service.index.selfCheck();
-    return { processed: files.length, updated: fixed, tokens: 0, detail: `扫描 ${files.length} 个文件，补索引 ${fixed} 条，清失效 ${pruned} 条${stat.rebuilt ? "，并重建了 FTS" : ""}` };
+    return { processed: files.length, updated: fixed, tokens: 0, detail: `扫描 ${files.length} 个文件，补索引 ${fixed} 条，清失效 ${pruned} 条，大小写归一 ${caseFixed} 条${stat.rebuilt ? "，并重建了 FTS" : ""}` };
   }
 
   /** 自动定时同步：sync.auto + sync.intervalMin（此前只有手动按钮，配置项是"假旋钮"） */
@@ -482,7 +507,14 @@ class MemoryScheduler {
     if (last && now - last < interval) return;
     this.service.index.setMeta("mem_last_sync_at", String(now));
     this.emit({ type: "sync", stage: "connect", detail: "定时同步启动", running: true, percent: 1 });
-    const r = await this.syncer.run();
+    // run() 抛错时也要走到收尾 emit：否则 _tick 里的 .catch(()=>{}) 会把它吞掉，
+    // 界面永远停在「定时同步启动 / running:true」，用户完全看不到同步失败
+    let r;
+    try {
+      r = await this.syncer.run();
+    } catch (e) {
+      r = { ok: false, message: String((e && e.message) || e) };
+    }
     this.emit({ type: "sync", stage: r && r.ok ? "done" : "error", detail: r && r.ok ? "定时同步完成" : `定时同步失败：${(r && r.message) || ""}`, running: false, percent: 100 });
   }
 

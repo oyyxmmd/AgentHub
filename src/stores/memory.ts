@@ -15,7 +15,7 @@ import type {
 } from "../types";
 import * as api from "../api/ipc";
 import { useAppStore } from "./app";
-import { type ReviewCounts, pickReviewTab, resolveMemNav } from "./memory-nav";
+import { type ReviewCounts, pickReviewTab } from "./memory-nav";
 
 type MemoryConfigTree = Record<string, any>;
 
@@ -63,6 +63,9 @@ export const useMemoryStore = defineStore("memory", {
     pending: {} as Record<string, number>,
     /** refreshPending 的上次执行时刻（节流用，纯记账不需要响应式） */
     pendingAt: 0,
+    /** 项目台账（slug → 显示名）：slug 是机器标识（小写目录名），界面展示一律走 name。
+        单一来源，浏览/详情/仪表盘共用，避免各处自行查名导致口径不一 */
+    projects: [] as { slug: string; name: string }[],
   }),
 
   getters: {
@@ -118,8 +121,19 @@ export const useMemoryStore = defineStore("memory", {
         this.loadError = (e as Error).message || "读取配置失败";
       }
       await Promise.all([this.loadStats(), this.loadIndex(), this.loadStatus()]);
+      void this.loadProjects();
       void this.refreshPending(true);
       void this.refreshDiagnose();
+    },
+
+    /** 拉项目台账（slug → 显示名）。失败保留旧值：显示名缺失时界面退回显示 slug，不至于空白 */
+    async loadProjects() {
+      try {
+        const p = await api.memoryProjects();
+        this.projects = (p.projects || []).map((x) => ({ slug: x.slug, name: x.name }));
+      } catch {
+        /* 保留旧值 */
+      }
     },
 
     async loadStats() {
@@ -160,7 +174,8 @@ export const useMemoryStore = defineStore("memory", {
       const now = Date.now();
       if (!force && now - this.pendingAt < 2000) return;
       this.pendingAt = now;
-      const out: Record<string, number> = {};
+      // 以旧值为底：某一维度请求失败时保留上一次的已知计数，而不是把红点静默清零
+      const out: Record<string, number> = { ...this.pending };
       try {
         const [supRes, clsRes, dedRes] = await Promise.allSettled([
           api.memoryReviewList("supersede"),
@@ -276,14 +291,16 @@ export const useMemoryStore = defineStore("memory", {
       try {
         const r = await api.memoryIndexBuild();
         const swept = r.pruned ? `、清掉 ${r.pruned} 条失效索引行` : "";
+        // 存量大小写脏行（同 id 双 path / 项目卡裂开）在这一步合并，用户看得见「修了什么」
+        const cased = r.caseFixed ? `、大小写归一 ${r.caseFixed} 条` : "";
         // 修复返回值自带诊断快照时直接落 store：省一次 memory_index_diagnose 全量扫描（低配电脑上诊断也不便宜）
         if (r.diagnose) this.diagnose = { ...r.diagnose };
         else await this.refreshDiagnose();
-        await Promise.all([this.loadStats(), this.loadIndex()]);
+        await Promise.all([this.loadStats(), this.loadIndex(), this.loadProjects()]);
         const d = this.diagnose;
-        if (!d) return { ok: false, message: `已重算 ${r.files} 个文件${swept}，但复核诊断失败，请稍后手动刷新确认` };
-        if (this.indexHealthy) return { ok: true, message: `已修复：重算 ${r.files} 个文件${swept}，索引已收敛` };
-        return { ok: false, message: `已重算 ${r.files} 个文件${swept}，仍有差异：孤儿行 ${d.orphan} · 未索引 ${d.unindexed} · 断链 ${d.broken}` };
+        if (!d) return { ok: false, message: `已重算 ${r.files} 个文件${swept}${cased}，但复核诊断失败，请稍后手动刷新确认` };
+        if (this.indexHealthy) return { ok: true, message: `已修复：重算 ${r.files} 个文件${swept}${cased}，索引已收敛` };
+        return { ok: false, message: `已重算 ${r.files} 个文件${swept}${cased}，仍有差异：孤儿行 ${d.orphan} · 未索引 ${d.unindexed} · 断链 ${d.broken}` };
       } catch (e) {
         return { ok: false, message: (e as Error).message || "修复失败" };
       }

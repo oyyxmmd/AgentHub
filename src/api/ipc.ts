@@ -301,7 +301,7 @@ export interface IdeSwitchProbe {
  *  预检判定「切不了」时直接回 ok:false，不弹框。确认后关客户端等退出时长不可控，故关闭看门狗） */
 export const proxyIdeSwitch = (accountId: string, confirmAck?: boolean) =>
   call<{ ok: boolean; channel?: string; file?: string; backup?: string; needConfirm?: boolean; probe?: IdeSwitchProbe; relaunched?: boolean; message?: string }>("proxy_ide_switch", { accountId, confirmAck }, 0);
-export const proxyIdeStatus = () => call<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; zcodeInstalled?: boolean; currentUid: string }>("proxy_ide_status");
+export const proxyIdeStatus = () => call<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; zcodeInstalled?: boolean; qoderInstalled?: boolean; qoderIntlInstalled?: boolean; currentUid: string }>("proxy_ide_status");
 /** zcode 切号回滚（切出问题 / 远程连接异常时一键还原最近一次切前状态） */
 export const proxyZcodeSwitchRollback = () =>
   call<{ ok: boolean; message?: string }>("proxy_zcode_switch_rollback");
@@ -399,13 +399,14 @@ export const memoryProjectConfirm = (id: string, slug: string | null) =>
 // ===== 记忆中枢：索引 / 检索 =====
 export const memoryIndexStatus = () => call<MemoryIndexStatus>("memory_index_status");
 export const memoryIndexBuild = () =>
-  call<{ ok: boolean; files: number; pruned: number; diagnose?: { consistent: boolean; broken: number; orphan: number; unindexed: number } }>("memory_index_build");
+  call<{ ok: boolean; files: number; pruned: number; caseFixed?: number; diagnose?: { consistent: boolean; broken: number; orphan: number; unindexed: number } }>("memory_index_build");
 export const memoryIndexRebuild = () => call<{ ok: boolean; files: number; tookMs: number }>("memory_index_rebuild");
 export const memoryIndexDiagnose = () =>
   call<{ diagnose: { orphanRows: string[]; unindexed: string[]; fts: { rebuilt: boolean } }; graph: { nodes: number; edges: number; broken: number; isolated: number } }>("memory_index_diagnose");
 export const memoryIndexVacuum = () => call<{ ok: boolean; before: number; after: number }>("memory_index_vacuum");
 export const memorySearch = (query: string, opts?: {
   project?: string; agent?: string; layer?: string; limit?: number; offset?: number; includeSuperseded?: boolean;
+  type?: string; tag?: string; starred?: boolean; pinned?: boolean;
 }) => call<{ results: MemoryRow[]; total: number; tookMs: number; text: string }>("memory_search", { query, ...(opts || {}) } as Record<string, unknown>);
 export const memorySearchDebug = (query: string, opts?: { project?: string; layer?: string }) =>
   call<{
