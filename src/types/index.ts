@@ -299,6 +299,14 @@ export interface ProxyConfig {
   checkinAuto: boolean;
   /** 每日自动签到时间（HH:mm） */
   checkinAutoTime: string;
+  /** 积分任务·猫猫旅行自动派/领（仅 WB CN，15 分钟轮询状态机） */
+  growthTravelAuto: boolean;
+  /** 积分任务·夜猫子自动领（仅 WB CN，23:00~08:00 窗口） */
+  growthCatAuto: boolean;
+  /** 积分任务·活跃地图自动跑（仅 WB CN，每日 ≥10 点一次：上报+连登奖励链） */
+  growthActivityAuto: boolean;
+  /** 积分任务·开学季自动领（仅 WB CN，每日 ≥12 点一次，活动期外自动跳过） */
+  growthSchoolAuto: boolean;
   /** 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel） */
   ccSwitchModel: string;
 }
@@ -621,6 +629,53 @@ export interface ProxyCheckinRow {
   /** zcode 领取奖励：已领取过时的下次可领窗口（毫秒时间戳） */
   nextAt?: number;
   message?: string;
+}
+
+/** 积分任务批量结果行（proxy_growth_run 返回；仅 WorkBuddy CN 渠道，四类任务各自返回字段） */
+export interface ProxyGrowthRow {
+  accountId: string;
+  channel: ProxyChannelId;
+  name: string;
+  uid: string;
+  ok: boolean;
+  /** catRun 结果分类：already 已领 | claimed 本次领取 | pending 进度中 | skipped 无任务 | error 失败 */
+  result?: "already" | "claimed" | "pending" | "skipped" | "error";
+  /** 旅行当前状态：idle 可派 | traveling 旅行中 | arrived 到站待领 */
+  state?: "idle" | "traveling" | "arrived";
+  /** 本次是否有实质领取（旅行奖励/夜猫子/兑换/抽奖/任务领奖） */
+  claimed?: boolean;
+  /** 旅行相关 */
+  locationName?: string;
+  rewardCredit?: number;
+  arriveAt?: number;
+  /** 活跃地图：上报事件数 / 连登天数 / 兑换档位 */
+  reported?: number;
+  streakDays?: number;
+  redeemedTier?: string;
+  /** 开学季：任务结果列表 + 转盘次数 */
+  tasks?: { code: string; result: string; progress?: number }[];
+  drawn?: number;
+  progress?: number;
+  message?: string;
+}
+
+/** 积分任务执行日志条目（proxy_growth_log 返回；手动与自动调度共用，环形 300 条落盘持久化） */
+export interface ProxyGrowthLogEntry {
+  ts: number;
+  action: "travel" | "cat" | "activity" | "school";
+  /** auto = 15 分钟定时调度 | manual = 号池页手动点击 */
+  trigger: "auto" | "manual";
+  total: number;
+  okCount: number;
+  rows: {
+    name?: string;
+    uid?: string;
+    ok?: boolean;
+    result?: string;
+    state?: string;
+    claimed?: boolean;
+    message?: string;
+  }[];
 }
 
 /** 更新状态快照（主进程 electron/backend/updater.cjs 维护，经 invoke 拉取 + app:event 事件推送） */

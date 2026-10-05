@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
-import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow, ZcodeDeviceRow } from "../../types";
+import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyPoolStrategy, ProxyScanCandidate, ProxyCheckinRow, ProxyGrowthLogEntry, ZcodeDeviceRow } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isQoderChannel } from "./format";
 import { coalesceAsync } from "../../utils/timing";
@@ -308,6 +308,71 @@ async function runTrial() {
     checkinBusy.value = false;
     await refresh();
   }
+}
+
+// ===== 积分任务（仅 WorkBuddy CN：旅行/夜猫子/活跃地图/开学季，四类串行跑一遍，幂等自动跳过已领） =====
+const growthBusy = ref(false);
+async function runGrowthAll() {
+  if (growthBusy.value) return;
+  growthBusy.value = true;
+  try {
+    const acts: { act: "travel" | "cat" | "activity" | "school"; label: string }[] = [
+      { act: "travel", label: "旅行" },
+      { act: "cat", label: "夜猫子" },
+      { act: "activity", label: "活跃" },
+      { act: "school", label: "开学季" },
+    ];
+    const parts: string[] = [];
+    for (const { act, label } of acts) {
+      const r = await api.proxyGrowthRun(act);
+      if (!r.ok) {
+        parts.push(`${label}失败${r.message ? `（${r.message}）` : ""}`);
+        continue;
+      }
+      const got = r.rows.filter((x) => x.claimed).length;
+      parts.push(r.total ? `${label} ${got ? `${got} 项领取` : `${r.okCount}/${r.total}`}` : `${label} 无账号`);
+    }
+    toast(`积分任务：${parts.join(" · ")}`, "info");
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    growthBusy.value = false;
+    await refresh();
+  }
+}
+
+// ===== 任务日志弹窗：主进程落盘的积分任务执行记录（手动 + 自动调度都记，新的在前） =====
+const GROWTH_LABELS: Record<string, string> = { travel: "猫猫旅行", cat: "夜猫子", activity: "活跃地图", school: "开学季" };
+const logOpen = ref(false);
+const logBusy = ref(false);
+const logRows = ref<ProxyGrowthLogEntry[]>([]);
+async function openGrowthLog() {
+  logOpen.value = true;
+  if (logBusy.value) return;
+  logBusy.value = true;
+  try {
+    const r = await api.proxyGrowthLog();
+    logRows.value = r.rows || [];
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    logBusy.value = false;
+  }
+}
+function growthLogTagCls(r: ProxyGrowthLogEntry["rows"][number]) {
+  if (!r.ok) return "tag-err";
+  if (r.claimed) return "tag-ok";
+  return "tag-dim";
+}
+function growthLogTagText(r: ProxyGrowthLogEntry["rows"][number]) {
+  if (!r.ok) return "失败";
+  if (r.claimed) return "已领取";
+  return "正常";
+}
+function fmtTs(ts: number) {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 // ===== ZCode 独立人机校验（过码）=====
@@ -998,6 +1063,14 @@ onUnmounted(() => {
             <button v-else-if="ch.id !== 'zcode'" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
               {{ checkinBusy ? "签到中…" : "一键签到" }}
             </button>
+            <el-tooltip v-if="ch.id === 'workbuddy'" content="自动跑全部中国区账号的成长任务：猫猫旅行 / 夜猫子 / 活跃地图 / 开学季（已领过的幂等跳过；夜猫子仅在 23:00~08:00 窗口可领）" placement="top">
+              <button class="btn btn-sm" :disabled="growthBusy" @click="runGrowthAll">
+                {{ growthBusy ? "任务中…" : "积分任务" }}
+              </button>
+            </el-tooltip>
+            <el-tooltip v-if="ch.id === 'workbuddy'" content="查看积分任务的执行记录：手动执行与 15 分钟自动调度都会记录（落盘持久化，重启不丢）" placement="top">
+              <button class="btn btn-sm" @click="openGrowthLog">任务日志</button>
+            </el-tooltip>
             <el-tooltip v-if="ch.id === 'zcode'" content="设备指纹（deviceMid）诊断与修复：多账号共用同一枚指纹时，一个账号领取周末套餐会把全组账号的当周资格烧掉（服务端提示「不符合领取条件」/1004）。修复即给这些账号重派全新随机指纹" placement="top">
               <button
                 class="btn btn-sm"
@@ -1452,6 +1525,42 @@ onUnmounted(() => {
           </div>
           <div class="p-actions">
             <button class="btn btn-primary" @click="checkinOpen = false">完成</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 积分任务日志弹窗：手动与 15 分钟自动调度的执行记录（环形 300 条落盘持久化，新的在前） -->
+      <div v-if="logOpen" class="p-mask" @click.self="logOpen = false">
+        <div class="p-dlg glass checkin-dlg">
+          <div class="p-title checkin-head">
+            <i class="ph ph-list-checkmarks"></i>
+            积分任务日志
+            <span class="checkin-stats"><span class="tag tag-dim">{{ logRows.length }} 条</span></span>
+          </div>
+          <div class="checkin-rows">
+            <div v-if="logBusy" class="checkin-empty">加载中…</div>
+            <template v-else>
+              <div v-for="(e, i) in logRows" :key="`${e.ts}-${i}`" class="log-entry">
+                <div class="log-head">
+                  <span class="log-time">{{ fmtTs(e.ts) }}</span>
+                  <span class="tag tag-dim">{{ GROWTH_LABELS[e.action] || e.action }}</span>
+                  <span class="tag" :class="e.trigger === 'auto' ? 'tag-dim' : 'tag-ok'">{{ e.trigger === "auto" ? "自动" : "手动" }}</span>
+                  <span class="log-sum">{{ e.okCount }}/{{ e.total }} 正常</span>
+                </div>
+                <div v-for="(r, j) in e.rows" :key="j" class="checkin-row">
+                  <div class="checkin-name">
+                    {{ r.name || r.uid }}
+                    <span class="tag" :class="growthLogTagCls(r)">{{ growthLogTagText(r) }}</span>
+                  </div>
+                  <span class="checkin-msg">{{ r.message || "" }}</span>
+                </div>
+              </div>
+              <div v-if="!logRows.length" class="checkin-empty">暂无执行记录：自动调度跑过或手动点「积分任务」后这里会出现</div>
+            </template>
+          </div>
+          <div class="p-actions">
+            <button class="btn" @click="openGrowthLog">刷新</button>
+            <button class="btn btn-primary" @click="logOpen = false">完成</button>
           </div>
         </div>
       </div>
@@ -2213,6 +2322,34 @@ onUnmounted(() => {
   text-align: center;
   font-size: 11.5px;
   color: var(--text-3);
+}
+/* ===== 积分任务日志弹窗 ===== */
+.log-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+}
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+}
+.log-time {
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.log-sum {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.log-entry .checkin-row {
+  background: transparent;
 }
 /* ===== UID 查看弹窗 ===== */
 .uid-dlg {

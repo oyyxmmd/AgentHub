@@ -346,49 +346,54 @@ const trae = {
     return unionIds(catalog, Object.keys(rules.get("model_map.json") || {}));
   },
 
-  /** 拉取官方模型目录：get_detail_param（参考项目实证：config_info_list[].config_name + display_config.display_name），
-   *  镜像域优先（与对话出口同域），失败回退官方域 */
+  /** 拉取官方模型目录：get_detail_param（参考项目实证：config_info_list[].config_name + display_config.display_name）。
+   *  ★ 返回集由 function 键决定：solo_work_lite 只挂 glm-5.3（实测），glm-5.3-flash 等
+   *  仅在 solo_agent 下（function_map 实证）——逐键拉取合并去重，取全量并集 */
   async fetchModels(account, secrets) {
     const c = this.cfg();
-    const body = JSON.stringify({
-      function: "solo_work_lite",
-      config_names: null,
-      need_prompt: false,
-      current_config_info: null,
-      poly_prompt: true,
-    });
+    const FUNCTIONS = ["solo_work_lite", "solo_agent"];
     let lastErr = "";
     for (const url of [c.modelsUrl, c.mirrorModelsUrl].filter(Boolean)) {
       const headers = { ...this.headers(account, secrets), referer: url };
-      const r = await httpJson(url, { method: "POST", headers, body })
-        .catch((e) => ({ ok: false, status: 0, message: String((e && e.message) || e) }));
-      if (!r.ok || !r.data) {
-        lastErr = r.status === 401 ? "账号登录态失效（401），请重新登录" : `HTTP ${r.status || 0} ${r.message || ""}`.trim();
-        continue;
-      }
-      const list = findList(r.data, "config_info_list", 0) || [];
       const models = [];
-      for (const it of list) {
-        const id = it && (it.config_name || it.configName);
-        if (typeof id !== "string" || !id) continue;
-        const name = (it.display_config && (it.display_config.display_name || it.display_config.name)) || id;
-        if (!models.some((m) => m.id === id)) {
-          // 上限取自官方目录条目，字段结构实证自 2026-10-03 抓取的原始响应（详见 traeLimits 注释）。
-          // 取不到写 0（=未知，与 workbuddy 系列静态兜底一致）。**原先无条件写 131072 是凭空捏造**：
-          // 下游客户端（如 DSH 的 pi-ai）会拿它比对用量 —— isContextOverflow 的
-          // 「stop 且 usage.input + cacheRead > contextWindow」分支 —— 把 30 万 token 的正常回答
-          // 误判成 CONTEXT_WINDOW_EXCEEDED，整个 turn 失败（且溢出恢复的摘要请求同样超限，二次失败）。
-          models.push({
-            id,
-            name: String(name),
-            rate: null,
-            capabilities: capsWithImages(sniffImages(it)),
-            ...traeLimits(it),
-          });
+      for (const fn of FUNCTIONS) {
+        const body = JSON.stringify({
+          function: fn,
+          config_names: null,
+          need_prompt: false,
+          current_config_info: null,
+          poly_prompt: true,
+        });
+        const r = await httpJson(url, { method: "POST", headers, body })
+          .catch((e) => ({ ok: false, status: 0, message: String((e && e.message) || e) }));
+        if (!r.ok || !r.data) {
+          lastErr = r.status === 401 ? "账号登录态失效（401），请重新登录" : `HTTP ${r.status || 0} ${r.message || ""}`.trim();
+          continue;
+        }
+        const list = findList(r.data, "config_info_list", 0) || [];
+        for (const it of list) {
+          const id = it && (it.config_name || it.configName);
+          if (typeof id !== "string" || !id) continue;
+          const name = (it.display_config && (it.display_config.display_name || it.display_config.name)) || id;
+          if (!models.some((m) => m.id === id)) {
+            // 上限取自官方目录条目，字段结构实证自 2026-10-03 抓取的原始响应（详见 traeLimits 注释）。
+            // 取不到写 0（=未知，与 workbuddy 系列静态兜底一致）。**原先无条件写 131072 是凭空捏造**：
+            // 下游客户端（如 DSH 的 pi-ai）会拿它比对用量 —— isContextOverflow 的
+            // 「stop 且 usage.input + cacheRead > contextWindow」分支 —— 把 30 万 token 的正常回答
+            // 误判成 CONTEXT_WINDOW_EXCEEDED，整个 turn 失败（且溢出恢复的摘要请求同样超限，二次失败）。
+            models.push({
+              id,
+              name: String(name),
+              rate: null,
+              capabilities: capsWithImages(sniffImages(it)),
+              function: fn, // 拉取来源键：出站 functionForModel 优先用它（比映射表权威）
+              ...traeLimits(it),
+            });
+          }
         }
       }
       if (models.length) return { ok: true, models };
-      lastErr = "官方目录解析为空（接口可能已变更）";
+      lastErr = lastErr || "官方目录解析为空（接口可能已变更）";
     }
     return { ok: false, message: lastErr || "目录拉取失败" };
   },
@@ -437,7 +442,8 @@ const trae = {
   },
 
   /** function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：部分模型仅在
-   *  solo_agent 下可用）；映射表外置 rules/function_map.json，未命中默认 solo_work_lite */
+   *  solo_agent 下可用）；映射表外置 rules/function_map.json；映射未命中时回查
+   *  catalog 条目自带的拉取来源键（fetchModels 实证写入，比默认值权威） */
   functionForModel(model) {
     const map = rules.get("function_map.json") || {};
     const direct = map[String(model)];
@@ -447,6 +453,10 @@ const trae = {
     for (const k of Object.keys(map)) {
       if (norm(k) === want) return String(map[k]);
     }
+    const entry = catalogMap("trae").get(String(model).toLowerCase())
+      || catalogMap("trae").get(want)
+      || catalogMap("trae").get(String(model).toLowerCase().replace(/_/g, "-"));
+    if (entry && entry.function) return String(entry.function);
     return "solo_work_lite";
   },
 
@@ -771,6 +781,9 @@ const trae = {
       }
       const errMsg = r.data && (r.data.ResponseMetadata && r.data.ResponseMetadata.Error && r.data.ResponseMetadata.Error.Message);
       lastErr = errMsg || (r.data && (r.data.message || r.data.msg)) || r.message || `刷新失败 HTTP ${r.status}`;
+      // 4xx 业务拒绝时响应体是唯一线索（token 过期/被吊销等），截段透出（HTML 页除外）
+      const t = r.text && !/^\s*</.test(r.text) ? String(r.text).slice(0, 160) : "";
+      if (r.status >= 400 && t && !lastErr.includes(t)) lastErr += `（上游：${t}）`;
     }
     return { ok: false, message: lastErr };
   },
@@ -1452,6 +1465,388 @@ function makeWorkBuddy(channelId) {
       if (r.ok && (code === 0 || code === 200)) return { ok: true, claimed: true, message: msg || "加油包领取成功" };
       if (/\b14051\b/.test(msg) || /已领取|已领过|already/i.test(msg)) return { ok: true, claimed: false, already: true, message: msg || "已领取过" };
       return { ok: false, message: msg || `领取失败 HTTP ${r.status}` };
+    },
+
+    // ===== 成长中心积分任务（猫猫旅行 / 夜猫子 / 活跃地图 / 开学季，参考 Buddy Switch 实证端点，仅 CN 渠道） =====
+
+    /** 任意域 JSON 请求：GET/POST，401 单飞刷新后重试一次（与 billingCall 同刷新互斥）。
+     *  extra 追加头（成长中心带 x-client-platform: web + Origin/Referer；开学季换小程序 UA） */
+    async domainCall(account, secrets, base, path, method, body, extra) {
+      const c = this.cfg();
+      const origin = c.origin || (channelId === "workbuddy_ai" ? "https://www.workbuddy.ai" : "https://www.codebuddy.cn");
+      const mkHeaders = (creds) => ({
+        ...this.billingHeaders(account, creds),
+        origin,
+        ...(extra || {}),
+      });
+      let creds = secrets;
+      for (let pass = 0; pass < 2; pass++) {
+        const r = await httpJson(`${String(base).replace(/\/+$/, "")}${path}`, {
+          method: method || "GET",
+          headers: mkHeaders(creds),
+          body: body == null ? undefined : (typeof body === "string" ? body : JSON.stringify(body)),
+        }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+        if (r.status === 401 && pass === 0) {
+          const rr = await refreshTokenLocked(this.id, account, creds).catch(() => ({ ok: false }));
+          if (!rr.ok) return { ok: false, status: 401, data: null, message: rr.message || "token 刷新失败" };
+          creds = { token: rr.token, refreshToken: rr.refreshToken };
+          continue;
+        }
+        return r;
+      }
+      return { ok: false, status: 0, data: null, message: "上游无可用响应" };
+    },
+
+    /** 成长中心域请求（CN 对话域 copilot.tencent.com，含连登/成长任务/抽奖端点） */
+    growthCall(account, secrets, path, method, body) {
+      const origin = this.cfg().origin || "https://www.codebuddy.cn";
+      const base = channelId === "workbuddy_ai" ? origin : "https://copilot.tencent.com";
+      return this.domainCall(account, secrets, base, path, method, body, {
+        referer: origin + "/profile/growth-center",
+        "x-client-platform": "web",
+      });
+    },
+
+    /** 开学季小程序域请求（计费域 + 微信小程序 UA） */
+    schoolCall(account, secrets, path, method, body) {
+      const base = this.cfg().origin || "https://www.codebuddy.cn";
+      return this.domainCall(account, secrets, base, path, method, body, {
+        "user-agent": "Mozilla/5.0 (Linux; Android 14; MicroMessenger/8.0.49 WeChat/0.8.0 MiniProgramEnv/android; wkbrowser xweb)",
+        referer: base + "/",
+      });
+    },
+
+    /** 域响应解包：HTTP 200 且业务 code 为 0/200（或缺失） */
+    _domainOk(r) {
+      if (!r.ok) return false;
+      const code = r.data && (r.data.code ?? r.data.Code);
+      return code == null || Number(code) === 0 || Number(code) === 200;
+    },
+
+    _domainMsg(r, fallback) {
+      return String((r.data && (r.data.message || r.data.msg)) || r.message || fallback || "");
+    },
+
+    _domainData(r) {
+      return (r.data && (r.data.data ?? r.data)) || null;
+    },
+
+    _sleep(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    },
+
+    /** 连登奖励档位：从高到低挑「天数达标且未领取」的最高档 */
+    _growthEligibleTier(days, redemption) {
+      if (!redemption || !Array.isArray(redemption.tiers)) return null;
+      let best = null;
+      for (const t of redemption.tiers) {
+        const name = t && t.tier;
+        const need = Number(t && t.days) || 0;
+        if (!name || days < need) continue;
+        if (redemption[`tier_${name}_status`] === "claimed") continue;
+        if (!best || need > best.need) best = { name, need };
+      }
+      return best ? best.name : null;
+    },
+
+    /** 活跃事件（craft 形态；缺 userId 上游 200 但静默丢弃） */
+    _activityEvent(cid, requestId, uid, modelId, modelName, mode) {
+      const at = Date.now();
+      return {
+        eventCode: "chat_request_send",
+        timestamp: at,
+        reportDelay: 0,
+        mode: mode || "craft",
+        conversationId: cid,
+        requestId,
+        inputLength: 12,
+        requestModelId: modelId,
+        requestModelName: modelName,
+        presentAt: at,
+        rootRequestId: cid,
+        parentConversationId: cid,
+        agentName: "default",
+        agentType: "conversation",
+        userId: uid,
+      };
+    },
+
+    /** 补签昨日漏签（有补签卡才用）：heatmap 昨日 score==0 → makeup-cards/use */
+    async _makeupYesterday(account, secrets) {
+      const yst = new Date(Date.now() - 86400000);
+      const ydate = `${yst.getFullYear()}-${String(yst.getMonth() + 1).padStart(2, "0")}-${String(yst.getDate()).padStart(2, "0")}`;
+      const hm = await this.growthCall(account, secrets, "/activity/growth/heatmap", "GET");
+      if (!this._domainOk(hm)) return false;
+      const cells = (this._domainData(hm) && this._domainData(hm).cells) || [];
+      const cell = cells.find((x) => x && String(x.date || "").slice(0, 10) === ydate);
+      if (!cell || Number(cell.score) !== 0) return false;
+      const st = await this.growthCall(account, secrets, "/activity/growth/streak", "GET");
+      const balance = Number(this._domainData(st)?.makeup_cards?.balance) || 0;
+      if (balance <= 0) return false;
+      const r = await this.growthCall(account, secrets, "/activity/growth/makeup-cards/use", "POST", { target_date: ydate });
+      return this._domainOk(r);
+    },
+
+    /** 活跃地图：5 连发活跃事件 → 回读连登 → 奖励链（礼包/补偿/补签/兑换/抽奖，CST 日幂等由编排层保证） */
+    async activityRun(account, secrets) {
+      const uid = account.uid || "";
+      if (!uid) return { ok: false, message: "缺少 uid" };
+      const cid = `wb2api-${Date.now()}`;
+      let reported = 0;
+      for (let i = 1; i <= 5; i++) {
+        const ev = this._activityEvent(cid, `${cid}-r${i}`, uid, "deepseek-v4-flash", "DeepSeek V4 Flash", "craft");
+        const r = await this.billingCall(account, secrets, ["/v2/report"], JSON.stringify([ev]));
+        if (!r.ok) break;
+        reported++;
+        if (i < 5) await this._sleep(1500);
+      }
+      if (!reported) return { ok: false, message: "活跃上报失败" };
+
+      // 礼包/补偿：有则领的幂等写，业务错误静默
+      await this.billingCall(account, secrets, ["/billing/meter/claim-gift"], "{}").catch(() => {});
+      await this.billingCall(account, secrets, ["/billing/meter/claim-compensation"], "{}").catch(() => {});
+
+      let days = 0;
+      let redemption = null;
+      const st = await this.growthCall(account, secrets, "/activity/growth/streak", "GET");
+      if (this._domainOk(st)) {
+        const d = this._domainData(st) || {};
+        days = Number(d.streak && d.streak.days) || 0;
+        redemption = d.redemption_status || null;
+      }
+      // 补签保连登：成功则重读天数
+      if (await this._makeupYesterday(account, secrets).catch(() => false)) {
+        const st2 = await this.growthCall(account, secrets, "/activity/growth/streak", "GET");
+        if (this._domainOk(st2)) {
+          const d2 = this._domainData(st2) || {};
+          days = Number(d2.streak && d2.streak.days) || days;
+          redemption = d2.redemption_status || redemption;
+        }
+      }
+      let tier = null;
+      if (days && redemption) {
+        tier = this._growthEligibleTier(days, redemption);
+        if (tier) {
+          await this.growthCall(account, secrets, "/activity/growth/redeem", "POST", {
+            tier,
+            client_token: `redeem-${tier}-${crypto.randomUUID().replace(/-/g, "")}`,
+          });
+        }
+      }
+      // 抽奖：有次数就抽一次（连登奖励赠与的次数每日一枚语义）
+      let drew = false;
+      const lc = await this.growthCall(account, secrets, "/activity/growth/lottery/chances", "GET");
+      const balance = Number(this._domainData(lc)?.balance) || 0;
+      if (balance > 0) {
+        const dr = await this.growthCall(account, secrets, "/activity/growth/lottery/draw", "POST", { client_token: `draw-${crypto.randomUUID().replace(/-/g, "")}` });
+        drew = this._domainOk(dr) || dr.status === 400; // 400 无次数/未开启为正常态
+      }
+      return { ok: true, reported, streakDays: days, redeemedTier: tier, drew, message: `上报 ${reported} 条，连登 ${days} 天${tier ? `，兑换 ${tier}` : ""}${drew ? "，已抽奖" : ""}` };
+    },
+
+    /** 夜猫子（black_cat）：23:00–08:00 窗口由编排层保证；单轮最多补 1 次事件防风控 */
+    async catRun(account, secrets) {
+      const TASKS = "/v2/activity/growth/tasks";
+      const ACCEPT = "/v2/activity/growth/tasks/accept";
+      const CLAIM = "/activity/growth/tasks/black_cat/claim";
+      const list = await this.growthCall(account, secrets, TASKS, "GET");
+      if (!this._domainOk(list)) return { ok: false, result: "error", message: "成长任务拉取失败" };
+      const tasks = (this._domainData(list) && this._domainData(list).tasks) || [];
+      const task = tasks.find((t) => t && t.task_code === "black_cat");
+      if (!task) return { ok: true, result: "skipped", message: "无夜猫子任务" };
+      const acceptStatus = String(task.accept_status || "").toLowerCase();
+      if (acceptStatus === "claimed") return { ok: true, result: "already", message: "已领取" };
+      if (acceptStatus === "not_accepted" || !acceptStatus) {
+        await this.growthCall(account, secrets, ACCEPT, "POST", { task_codes: ["black_cat"] });
+        await this._sleep(1500);
+      }
+      const cur = Number(task.progress && task.progress.current) || 0;
+      const target = Number(task.progress && task.progress.target) || 3;
+      if (acceptStatus !== "completed" && cur < target) {
+        const cid = `wbcat-${Date.now()}`;
+        const ev = this._activityEvent(cid, cid, account.uid || "", "glm-5.2", "GLM-5.2", "night");
+        const rr = await this.billingCall(account, secrets, ["/v2/report"], JSON.stringify([ev]));
+        if (!rr.ok) return { ok: false, result: "error", message: "事件上报失败" };
+        const re = await this.growthCall(account, secrets, TASKS, "GET");
+        if (!this._domainOk(re)) return { ok: false, result: "error", message: "进度回读失败" };
+        const reTask = ((this._domainData(re) && this._domainData(re).tasks) || []).find((t) => t && t.task_code === "black_cat");
+        if (!reTask) return { ok: true, result: "pending", message: "任务状态未知" };
+        if (String(reTask.accept_status || "").toLowerCase() === "claimed") return { ok: true, result: "already", message: "已领取" };
+        const reCur = Number(reTask.progress && reTask.progress.current) || 0;
+        const reTarget = Number(reTask.progress && reTask.progress.target) || 3;
+        if (String(reTask.accept_status || "").toLowerCase() !== "completed" && reCur < reTarget) {
+          return { ok: true, result: "pending", progress: reCur, message: `进行中 ${reCur}/${reTarget}` };
+        }
+      }
+      // 领奖：对话域 400 → web 域降级
+      let cl = await this.growthCall(account, secrets, CLAIM, "POST");
+      if (cl.status === 400) {
+        cl = await this.domainCall(account, secrets, "https://www.workbuddy.cn", CLAIM, "POST", null, {
+          origin: "https://www.workbuddy.cn",
+          referer: "https://www.workbuddy.cn/profile/growth-center",
+          "x-client-platform": "web",
+        });
+      }
+      if (this._domainOk(cl)) return { ok: true, result: "claimed", message: "夜猫子奖励已领取" };
+      return { ok: false, result: "error", message: this._domainMsg(cl, "领取失败") };
+    },
+
+    /** 猫猫旅行状态机：idle→(depart)→traveling→(到点)→arrived→(claim)→idle */
+    async travelRun(account, secrets) {
+      const P = "/activity/growth/buddy/travel";
+      const origin = this.cfg().origin || "https://www.codebuddy.cn";
+      const call = (path, method, body) => this.domainCall(account, secrets, origin, P + path, method, body, {
+        referer: origin + "/profile/growth-center",
+        "x-client-platform": "web",
+      });
+      const st = await call("/status", "GET");
+      if (!this._domainOk(st)) return { ok: false, message: this._domainMsg(st, "查询旅行状态失败") };
+      const d = this._domainData(st) || {};
+      const state = String(d.state || "");
+      const meta = {
+        locationName: (d.location && d.location.name) || "",
+        rewardCredit: d.reward_credit ?? null,
+        arriveAt: d.arrive_at ?? 0,
+      };
+      const recordId = Number(d.record_id) || 0;
+      if (state === "traveling") return { ok: true, state: "traveling", claimed: false, message: "旅行中", ...meta };
+      if (state === "arrived") {
+        const cl = await call("/claim", "POST", recordId > 0 ? { record_id: recordId } : {});
+        const msg = String((cl.data && (cl.data.message || cl.data.msg)) || "").toLowerCase();
+        if (this._domainOk(cl)) {
+          const cd = this._domainData(cl) || {};
+          return { ok: true, state: "idle", claimed: true, rewardCredit: cd.reward_credit ?? meta.rewardCredit, message: `旅行奖励已领取${cd.reward_credit != null ? ` +${cd.reward_credit}` : ""}` };
+        }
+        if (/no unclaimed travel|daily_limit/.test(msg)) return { ok: true, state: "idle", claimed: true, message: "已领取（网页端）" };
+        if (/not arrived yet/.test(msg)) return { ok: true, state: "arrived", claimed: false, message: "尚未到站" };
+        return { ok: false, message: this._domainMsg(cl, "领取失败") };
+      }
+      if (state === "idle") {
+        if (d.daily_limit_reached) return { ok: true, state: "idle", already: true, claimed: true, message: "今日已派", ...meta };
+        const cfgR = await call("/config", "GET");
+        if (!this._domainOk(cfgR)) return { ok: false, message: "读取旅行配置失败" };
+        const cd = this._domainData(cfgR) || {};
+        const locations = Array.isArray(cd.locations) ? cd.locations : [];
+        if (cd.enabled === false || !locations.length) return { ok: false, message: "无旅行地点" };
+        let lastUnavailable = false;
+        for (const loc of locations) {
+          const dep = await call("/depart", "POST", { location_id: loc.id });
+          const msg = String((dep.data && (dep.data.message || dep.data.msg)) || dep.message || "").toLowerCase();
+          if (this._domainOk(dep)) {
+            const st2 = await call("/status", "GET");
+            const d2 = this._domainOk(st2) ? (this._domainData(st2) || {}) : {};
+            return {
+              ok: true, state: "traveling", claimed: false, message: `已派发${loc.name ? `：${loc.name}` : ""}`,
+              locationName: loc.name || (d2.location && d2.location.name) || "",
+              rewardCredit: d2.reward_credit ?? null, arriveAt: d2.arrive_at ?? 0,
+            };
+          }
+          if (/already traveling/.test(msg)) return { ok: true, state: "traveling", already: true, message: "已在旅行中" };
+          if (/daily limit|daily_limit/.test(msg)) return { ok: true, state: "idle", already: true, claimed: true, message: "今日已派" };
+          if (/no active buddy/.test(msg)) return { ok: false, message: "无 Buddy" };
+          if (/location not available/.test(msg)) { lastUnavailable = true; continue; }
+          return { ok: false, message: msg.slice(0, 80) || "派发失败" };
+        }
+        return { ok: false, message: lastUnavailable ? "地点不可用" : "派发失败" };
+      }
+      return { ok: false, message: `未知旅行状态: ${state}` };
+    },
+
+    /** 开学季活动：任务列表 in_period 判定 → 逐任务 viewed→判据→回读→claim → 转盘抽空 */
+    async schoolRun(account, secrets) {
+      const TASKS = "/portal/activity/school/tasks";
+      const uid = account.uid || "";
+      const gap = () => this._sleep(1500);
+      const r = await this.schoolCall(account, secrets, TASKS, "GET");
+      if (!this._domainOk(r)) return { ok: false, message: this._domainMsg(r, "活动任务拉取失败") };
+      const d = this._domainData(r) || {};
+      if (d.in_period !== true) return { ok: true, skipped: true, message: "活动未开放" };
+      const ACTIONS = { chat_3_times: "mini", expert_use: "expert", share_invite: "share", desktop_chat_1_time: "desktop" };
+      const trigger = async (act) => {
+        const cid = `wbact-${act}-${Date.now()}`;
+        if (act === "share") {
+          await this.schoolCall(account, secrets, TASKS + "/share-complete", "POST", { channel: "wechat" });
+        } else if (act === "mini") {
+          const ev = {
+            eventCode: "chat_request_send", timestamp: Date.now(), reportDelay: 0, source: "mini_program",
+            ideName: "wx_app_cloud", ideType: "WorkBuddy_MP", extName: "workbuddy-mp", extVersion: "SaaS",
+            mode: "chat", conversationId: cid, requestId: cid, inputLength: 12,
+            activityId: "school_open_day_2026", mentionContexts: [], mentionContextCount: 0, userId: uid,
+          };
+          await this.billingCall(account, secrets, ["/v2/report"], JSON.stringify([ev]));
+        } else if (act === "expert") {
+          const ev = {
+            eventCode: "expert_actual_use", timestamp: Date.now(), reportDelay: 0, source: "mini_program",
+            ideName: "wx_app_cloud", ideType: "WorkBuddy_MP", extName: "workbuddy-mp", extVersion: "SaaS",
+            userId: uid, id: "ex_jB0dyFIQJEWa", name: "ex_jB0dyFIQJEWa", expertTitle: "论小舟",
+            type: "send_message", characterCount: 12, expertType: "agent", conversationId: cid,
+            activityId: "school_open_day_2026",
+          };
+          await this.billingCall(account, secrets, ["/v2/report"], JSON.stringify([ev]));
+        } else {
+          const base = (code) => ({ eventCode: code, userId: uid, activityId: "school_open_day_2026" });
+          const at = Date.now();
+          const events = [
+            { ...base("agent_task_created"), source: "LOCAL", name: "working", task_target: "local", mode: "craft", requestModelId: "fast-model", requestModelName: "fast-model", conversationId: cid, messageId: cid },
+            { ...base("chat_message_send"), messageId: `${cid}-assistant`, historyCount: 0, currentStepCount: 1, traceId: cid, rootRequestId: cid, parentConversationId: cid, agentName: "cli", agentType: "main" },
+            { ...base("chat_request_send"), inputLength: 24, mode: "craft", conversationId: cid, requestId: cid, traceId: cid, rootRequestId: cid, parentConversationId: cid, agentName: "cli", agentType: "main", timestamp: at },
+            { ...base("chat_message_response"), messageId: `${cid}-assistant`, responseModelId: "fast-model", isSuccessful: true, finishReason: "stop", traceId: cid, conversationId: cid, rootRequestId: cid, parentConversationId: cid, agentName: "cli", agentType: "main" },
+            { ...base("chat_message_status"), messageId: `${cid}-assistant`, messageErrorCode: "0", traceId: cid, rootRequestId: cid, parentConversationId: cid },
+            { ...base("chat_request_response"), mode: "craft", isSuccessful: true, finishReason: "stop", rootRequestId: cid, parentConversationId: cid },
+          ];
+          await this.billingCall(account, secrets, ["/v2/report"], JSON.stringify(events));
+        }
+      };
+      const results = [];
+      const tasks = Array.isArray(d.tasks) ? d.tasks : [];
+      for (const t of tasks) {
+        const act = ACTIONS[t && t.task_code];
+        if (!act) continue; // 人工/未知任务保守跳过
+        const code = t.task_code;
+        let status = String(t.status || "").toLowerCase();
+        if (status === "completed" || status === "claimed") { results.push({ code, result: "already" }); continue; }
+        if (status === "pending") {
+          await this.schoolCall(account, secrets, `${TASKS}/${code}/viewed`, "POST", {});
+          await gap();
+        }
+        const cur = Number(t.progress) || 0;
+        const target = Number(t.target_count) || 1;
+        const rounds = (act === "share" || act === "desktop") ? 1 : Math.max(target - cur, 1);
+        for (let i = 0; i < rounds; i++) {
+          await trigger(act);
+          await gap();
+        }
+        const re = await this.schoolCall(account, secrets, TASKS, "GET");
+        const reTask = this._domainOk(re) ? ((this._domainData(re) && this._domainData(re).tasks) || []).find((x) => x && x.task_code === code) : null;
+        const reStatus = String((reTask && reTask.status) || "").toLowerCase();
+        const reCur = Number(reTask && reTask.progress) || cur;
+        if (reStatus === "claimed") { results.push({ code, result: "already" }); continue; }
+        if (reStatus === "completed" || reCur >= target) {
+          const cl = await this.schoolCall(account, secrets, `${TASKS}/${code}/claim`, "POST", {});
+          results.push({ code, result: this._domainOk(cl) ? "claimed" : "claim_failed" });
+          await gap();
+        } else {
+          results.push({ code, result: "pending", progress: reCur });
+        }
+      }
+      // 转盘：抽空次数（409 no chance 正常结束）
+      let drawn = 0;
+      const cfg = await this.schoolCall(account, secrets, "/portal/activity/school/config", "GET");
+      const cd = this._domainOk(cfg) ? (this._domainData(cfg) || {}) : null;
+      if (cd && cd.in_period === true) {
+        let balance = Number(cd.chance && cd.chance.balance) || 0;
+        while (balance > 0 && drawn < 20) {
+          const dr = await this.schoolCall(account, secrets, "/portal/activity/school/wheel/draw", "POST", { draw_uuid: crypto.randomUUID() });
+          if (dr.status === 409 || !this._domainOk(dr)) break;
+          const next = Number(dr.data && dr.data.data && dr.data.data.chance_balance);
+          if (!Number.isFinite(next) || next >= balance) break;
+          balance = next;
+          drawn++;
+          await gap();
+        }
+      }
+      const claimedCount = results.filter((x) => x.result === "claimed").length;
+      return { ok: true, tasks: results, drawn, message: `领取 ${claimedCount} 项${drawn ? `，转盘 ${drawn} 次` : ""}` };
     },
 
     /** Token 刷新：X-Refresh-Token 头 + 空体 {}（该头只允许出现在此端点）。

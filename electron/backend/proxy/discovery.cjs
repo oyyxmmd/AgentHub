@@ -180,6 +180,60 @@ function pick(node, re) {
   return v == null ? "" : String(v);
 }
 
+/** 读本机官方 Trae 客户端的 icube 设备身份（参考 icube.rs 实证）：
+ *  - DeviceID = storage.json 键 `iCubeAuthInfo://icube-dc:<deviceId>` 内嵌的 deviceId；
+ *  - MachineID = 同文件 `telemetry.machineId`（参考真机日志：URL 与兑换体的 machine_id
+ *    三处同值都报它）；
+ *  - DevicePublicKey = tc 信封解出 JSON 的 publicKeyPEM（上游认识已注册的 EC P-256 SPKI）。
+ *  兑换体/授权 URL 的设备字段必须用它（自造身份会被网关 10101 拒——实测）。
+ *  本机没装官方客户端 / 解不开时返回 null（上层回退自造身份并提示）。 */
+/** 读本机官方 SOLO 客户端安装包版本（macOS 安装目录，本机实证）：
+ *  appVersion = Contents/Info.plist 的 CFBundleShortVersionString（本机 0.1.69，
+ *  与参考 manifest.json appVersion 同义同值——安装包版本，≠ Resources/app/package.json
+ *  的内核版本 1.107.1）；buildVersion = product.json tronBuildVersion（本机 2.3.87413）。
+ *  参考 ClientFacts：版本三处同值（授权 URL + 兑换体），读不到返回 null 走回落常量 */
+function readTraeInstallMeta() {
+  const roots = ["/Applications/TRAE SOLO CN.app", "/Applications/Trae.app", "/Applications/Trae CN.app", "/Applications/TRAE.app"];
+  for (const root of roots) {
+    let appVersion = "";
+    let buildVersion = "";
+    try {
+      const plist = fs.readFileSync(path.join(root, "Contents", "Info.plist"), "utf8");
+      const m = plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
+      if (m) appVersion = m[1].trim();
+    } catch { /* 换下一个目录/来源 */ }
+    try {
+      const p = JSON.parse(fs.readFileSync(path.join(root, "Contents", "Resources", "app", "product.json"), "utf8"));
+      buildVersion = String(p.tronBuildVersion || "");
+    } catch { /* 保持空 */ }
+    if (appVersion) return { appVersion, buildVersion };
+  }
+  return null;
+}
+
+function readTraeDeviceIdentity() {
+  const paths = traeStoragePaths(TRAE_APP_DIRS.trae || ["TRAE SOLO CN", "Trae", "trae"]);
+  for (const p of paths) {
+    let data = null;
+    try {
+      data = JSON.parse(fs.readFileSync(p, "utf8"));
+    } catch {
+      continue;
+    }
+    if (!data || typeof data !== "object") continue;
+    const dcKey = Object.keys(data).find((k) => /^iCubeAuthInfo:\/\/icube-dc:(.+)$/.test(k));
+    if (!dcKey) continue;
+    const deviceId = dcKey.replace(/^iCubeAuthInfo:\/\/icube-dc:/, "").trim();
+    const plain = parseLooseValue(data[dcKey]);
+    const publicKeyPem = plain && typeof plain === "object" ? String(plain.publicKeyPEM || plain.publicKeyPem || "") : "";
+    const machineId = pick(data, /^telemetry\.machineid$/i) || pick(data, /^machineid$/i);
+    if (deviceId && publicKeyPem) {
+      return { deviceId, machineId, publicKeyPem, source: p };
+    }
+  }
+  return null;
+}
+
 // ===== 本地扫描：候选凭据 =====
 
 /**
@@ -708,6 +762,14 @@ function pkcePair() {
   return { verifier, challenge: crypto.createHash("sha256").update(verifier).digest("base64url") };
 }
 
+// ===== OAuth 版本常量（对齐 Buddy Switch oauth.rs ClientFacts 语义）=====
+// ★ 授权 URL 的 x_app_version/plugin_version 与兑换体 ClientVersion/IDEVersion 是
+// **三处同值** = 本机 SOLO 客户端安装包版本（manifest.json 的 appVersion，参考实证
+// 0.1.69）。IDE 线抓包常量 3.3.100 用在 SOLO 线会被 10101 拒（参考改造前缺陷实录）。
+const OAUTH_SOLO_APP_VERSION = "0.1.69"; // 本机读不到 manifest 时的回落
+const OAUTH_SOLO_BUILD_VERSION = "2.3.87413"; // product.json tronBuildVersion 抓包值（回落用）
+const OAUTH_PAGE_PLUGIN_VERSION = OAUTH_SOLO_BUILD_VERSION;
+
 /** 从 GetLoginGuidance 响应里取登录主机（字段名各版本不一，宽容取） */
 function extractLoginHost(data) {
   const hit = util.dig(data, /^(loginhost|login_host|loginurl|login_url|host)$/i);
@@ -759,7 +821,7 @@ function buildTraeAuthUrl(host, opts) {
   q.set("login_version", "1");
   q.set("auth_from", "solo");
   q.set("login_channel", "native_ide");
-  q.set("plugin_version", c.pluginVersion || "local");
+  q.set("plugin_version", opts.buildVersion || OAUTH_PAGE_PLUGIN_VERSION);
   q.set("auth_type", "local");
   q.set("client_id", c.clientId || "en1oxy7wnw8j9n");
   q.set("redirect", "0");
@@ -773,17 +835,26 @@ function buildTraeAuthUrl(host, opts) {
   q.set("x_device_brand", c.deviceBrand || "CREFG-XX");
   q.set("x_device_type", "windows");
   q.set("x_os_version", c.osVersion || "Windows 11 Home China");
-  q.set("x_env", "prod");
-  q.set("x_app_version", c.authAppVersion || "3.5.66");
+  q.set("x_env", ""); // 真机客户端发空值，不要填 prod（Buddy Switch 抓包实证）
+  q.set("x_app_version", opts.appVersion || OAUTH_SOLO_APP_VERSION); // 与兑换体 ClientVersion/IDEVersion 三处同值
   q.set("x_app_type", "stable");
   q.set("code_challenge", opts.challenge);
   q.set("code_challenge_method", "S256");
+  q.set("channel_name", "common"); // 参考授权 URL 22 参数之一，缺失会被当非官方客户端
   q.set("hide_saas_login", "true");
   return url.toString();
 }
 
 const OK_PAGE = (text) => `<meta charset=utf-8><body style="font-family:system-ui,'Microsoft YaHei UI',sans-serif;background:#0b0d0f;color:#44e07f;display:grid;place-items:center;height:100vh;margin:0">${text}</body>`;
 const ERR_PAGE = (text) => `<meta charset=utf-8><body style="font-family:system-ui,'Microsoft YaHei UI',sans-serif;background:#0b0d0f;color:#f26d6d;display:grid;place-items:center;height:100vh;margin:0">${text}</body>`;
+/** 回环页统一出口：必须显式 text/html; charset=utf-8——缺 Content-Type 时浏览器按纯文本
+ *  处理（显示源码）或按 GBK 猜编码（中文乱码），meta 标签救不了这两种情况 */
+const sendHtml = (res, html, code) => {
+  if (!res) return;
+  if (code) res.statusCode = code;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(html);
+};
 // 官方授权页登录前会先空参探测回调地址可达性，回 200 挂起页并继续等待。
 // 脚本把 fragment 里的参数（#refreshToken=…）转成 query 后自动重载——官方某些回流形态把参数放在 hash 里，
 // hash 不会发给服务器，只能靠页面脚本回捞（参考项目 callback_pending_html 同款）
@@ -837,14 +908,24 @@ function validateTraeCallback(q, session) {
   return { ok: false, message: "安全拦截：回调缺少会话校验标识（state/login_trace_id），拒绝直接注入裸凭据" };
 }
 
-/** 解回调里 URL 编码的 JSON 参数（userInfo / userJwt / authCodeInfo），参考项目 parse_json_param */
+/** 解回调里 URL 编码的 JSON 参数（userInfo / userJwt / authCodeInfo），参考项目 parse_json_param：
+ *  searchParams.get 已解一层，官方可能多重编码——反复 decodeURIComponent 到不变为止（≤4 层） */
 function parseJsonParam(raw) {
   if (!raw) return null;
-  for (const val of [raw, decodeURIComponent(raw)]) {
+  let text = String(raw);
+  for (let i = 0; i < 4; i++) {
     try {
-      const obj = JSON.parse(val);
+      const obj = JSON.parse(text);
       if (obj && typeof obj === "object") return obj;
-    } catch { /* 继续 */ }
+    } catch { /* 继续解码再试 */ }
+    let next;
+    try {
+      next = decodeURIComponent(text);
+    } catch {
+      break; // 序列非法（残留的孤立 %），不能再解
+    }
+    if (next === text) break;
+    text = next;
   }
   return null;
 }
@@ -883,11 +964,29 @@ async function resolveTraeCredentials(q, session) {
     lastErr = r.message || "refreshToken 换取令牌失败";
   }
   if (authCode) {
-    const r = await exchangeTraeAuthCode(authCode, session.verifier, cbHost);
+    // 诊断：authCodeInfo 结构（字段名 + 值长度，防泄露）——官方签发形态是判断
+    // 「AuthCode 是否完整/有无 challenge 关联字段」的唯一现场
+    try {
+      const infoRaw = q.get("authCodeInfo") || q.get("auth_code_info") || "";
+      const info = parseJsonParam(infoRaw);
+      if (info && typeof info === "object") {
+        const shape = Object.entries(info).map(([k, v]) => `${k}:${typeof v === "string" ? `str(${v.length})` : typeof v}`).join(",");
+        console.error(`[trae-oauth] authCodeInfo 字段：${shape}`);
+      }
+    } catch { /* 日志失败不影响流程 */ }
+    const r = await exchangeTraeAuthCode(authCode, session.verifier, cbHost, session);
     if (r.ok) return { accessToken: r.token, refreshToken: r.refreshToken, extra };
-    lastErr = r.message || "授权码换取令牌失败";
+    // AuthCode 指纹（长度+首 6 字符，不含完整值）：判断提取值是否正常（正常应为无空格/无 % 的短 token）
+    const fp = `${authCode.length}字符/头${String(authCode).slice(0, 6).replace(/[^A-Za-z0-9_-]/g, "?")}`;
+    lastErr = `${r.message || "授权码换取令牌失败"}｜AuthCode(${fp})`;
   }
-  throw new Error(lastErr || "回调未携带凭据（accessToken / refreshToken / authCode 都没有）");
+  // 仍失败：附回调字段名（不含值，防泄露）——官方回调形态是定位 400 的关键线索；
+  // 本机无 icube 设备凭证时给出可操作提示（上游只认官方客户端注册的设备身份）
+  const fields = [...q.keys()].filter(Boolean).join(",");
+  const identityHint = session && session.deviceSource !== "icube"
+    ? "｜本机未检测到官方 Trae 客户端的设备凭证（storage.json 无 icube-dc 键）：请先安装并登录一次官方 TRAE SOLO CN / Trae 客户端后重试"
+    : "";
+  throw new Error(`${lastErr || "回调未携带凭据（accessToken / refreshToken / authCode 都没有）"}｜回调字段：${fields}${identityHint}`);
 }
 
 /** 回调给的登录主机 → API origin（换令牌候选域的头一个） */
@@ -902,35 +1001,117 @@ function cbOrigin(host) {
   }
 }
 
-/** 授权码换令牌：CN 走 /trae/api/v3/oauth/ExchangeToken + PKCE code_verifier；回调带的 loginHost 优先 */
-async function exchangeTraeAuthCode(authCode, codeVerifier, cbHost) {
+/** 授权码换令牌（对齐 Buddy Switch 新协议实证）：
+ *  ① 主变体 `${host}/trae/api/v3/oauth/ExchangeToken`，body 必须带完整 DeviceInfo 块
+ *     （缺它上游回 10101「无效参数：{__Message.field}.」——网关 schema 校验拒绝）；
+ *  ② 兜底 `${origin}/cloudide/api/v3/trae/oauth/ExchangeToken` + 精简体。
+ *  同源红线：body 里与授权 URL 重叠的字段（ClientID/MachineID/DeviceID/版本/机型）
+ *  必须取自同一会话的同一来源，否则上游报 20403 Token device not match。
+ *  host 优先用回调回传的 loginHost，回落 guidance 下发域，再回落 accountOrigins。 */
+async function exchangeTraeAuthCode(authCode, codeVerifier, cbHost, session) {
   const c = traeCfg();
   const origins = Array.isArray(c.accountOrigins) && c.accountOrigins.length ? c.accountOrigins : ["https://api.trae.cn", "https://api.trae.com.cn"];
-  const o = cbOrigin(cbHost);
-  const candidates = [...(o ? [o] : []), ...origins.filter((x) => String(x).replace(/\/+$/, "") !== o)];
-  const body = JSON.stringify({
-    ClientID: c.clientId || "en1oxy7wnw8j9n",
-    AuthCode: authCode,
-    CodeVerifier: codeVerifier,
-    IDEVersion: c.authAppVersion || "3.5.66",
+  const o = cbOrigin(cbHost) || cbOrigin(session && session.host);
+  const clientId = c.clientId || "en1oxy7wnw8j9n"; // 与授权 URL 的 client_id 同源（SOLO 线钥匙）
+  const appVersion = (session && session.appVersion) || OAUTH_SOLO_APP_VERSION; // 与授权 URL x_app_version 三处同值（本机 SOLO 安装包版本）
+  const brand = c.deviceBrand || "CREFG-XX";
+  const osVersion = c.osVersion || "Windows 11 Home China";
+  // PlatformCode 与授权 URL 的 auth_from 同线：auth_from=solo ⇒ SOLO_PC
+  const platformCode = "SOLO_PC";
+  const deviceId = (session && session.deviceId) || "";
+  const machineId = (session && session.machineId) || "";
+  const pubKey = (session && session.devicePublicKey) || "";
+  const deviceInfo = {
+    DeviceID: deviceId,
+    MachineID: machineId,
+    PlatformCode: platformCode,
+    DeviceType: "PC",
+    DeviceName: "",
+    DeviceModel: brand,
+    ClientVersion: appVersion,
+    DevicePublicKey: pubKey,
+    DeviceBrand: brand,
+    DeviceCPU: "",
+    OSInfo: "Windows",
+    OSVersion: osVersion,
+  };
+  const baseHeaders = {
+    "content-type": "application/json",
+    accept: "*/*",
+    // ★ 不发 user-agent：参考 trae_http_client 是 reqwest 默认（无 UA），
+    // 自造 UA 打 OAuth 端点会被网关统一拒 10101
+    "x-device-id": deviceId,
+    "x-app-id": c.appId || "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8",
+    "x-platform-code": platformCode,
+    // 必须存在且为空串：缺失报 20403，带旧 token 报 20405（参考项目实证）
+    "x-cloudide-token": "",
+  };
+  const variants = [
+    { tag: "v3/DeviceInfo", path: "/trae/api/v3/oauth/ExchangeToken", body: { ClientID: clientId, AuthCode: authCode, CodeVerifier: codeVerifier, DeviceInfo: deviceInfo, IDEVersion: appVersion } },
+    // 旧端点两种历史拼法（AuthCode / Code），固定打 icube_base（参考 fallback 语义）
+    { tag: "cloudide/AuthCode", path: "/cloudide/api/v3/trae/oauth/ExchangeToken", body: { ClientID: clientId, AuthCode: authCode, CodeVerifier: codeVerifier, DeviceID: deviceId, PlatformCode: platformCode } },
+    { tag: "cloudide/Code", path: "/cloudide/api/v3/trae/oauth/ExchangeToken", body: { ClientID: clientId, Code: authCode, CodeVerifier: codeVerifier, DeviceID: deviceId, PlatformCode: platformCode } },
+    { tag: "v3/legacy", path: "/trae/api/v3/oauth/ExchangeToken", body: { ClientID: clientId, AuthCode: authCode, CodeVerifier: codeVerifier, IDEVersion: appVersion } },
+  ];
+  // icube_base 是参考项目 fallback 的固定域——不依赖 accountOrigins 配置，强制入列
+  const ICUBE_BASE = "https://api.trae.com.cn";
+  const seen = new Set();
+  const candidateList = [...(o ? [o] : []), ...origins, ICUBE_BASE].filter((x) => {
+    const k = String(x).replace(/\/+$/, "");
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
   });
   let lastMsg = "";
-  for (const origin of candidates) {
-    const r = await adapters
-      .httpJson(`${String(origin).replace(/\/$/, "")}/trae/api/v3/oauth/ExchangeToken`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "user-agent": c.userAgent || "TraeClient/TTNet", "x-cloudide-token": "" },
-        body,
-      })
-      .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
-    const d = r.data && (r.data.data || r.data);
-    const token = d && (d.access_token || d.accessToken);
-    if (r.ok && token) {
-      return { ok: true, token: String(token).replace(/^Cloud-IDE-JWT\s+/i, ""), refreshToken: String((d.refresh_token || d.refreshToken) || "") };
+  const attempts = [];
+  for (const origin of candidateList) {
+    for (const v of variants) {
+      const fullUrl = `${String(origin).replace(/\/$/, "")}${v.path}`;
+      // 诊断日志：主进程终端可见（dev 直接看；AuthCode/verifier/公钥只出指纹防泄露）
+      try {
+        const bodyLog = JSON.stringify(v.body, (k, val) => {
+          if (k === "AuthCode" || k === "Code") return `${String(val).slice(0, 8)}…(${String(val).length})`;
+          if (k === "CodeVerifier") return `${String(val).slice(0, 8)}…(${String(val).length})`;
+          if (k === "DevicePublicKey") return `${String(val).slice(0, 27)}…(${String(val).length})`;
+          return val;
+        });
+        console.error(`[trae-oauth] → ${v.tag} ${fullUrl} ${bodyLog}`);
+      } catch { /* 日志失败不影响流程 */ }
+      const r = await adapters
+        .httpJson(fullUrl, { method: "POST", headers: baseHeaders, body: JSON.stringify(v.body) })
+        .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      // ★ 响应信封：200 成功时 token 在 `Result.AccessToken`（PascalCase，参考
+      // account.rs 单测实证 {"Result":{"AccessToken","RefreshToken"}}）；宽容兼容
+      // result/data 信封与 snake/camel 拼法
+      const env = (r.data && (r.data.Result || r.data.result)) || r.data || {};
+      const token =
+        env.AccessToken || env.accessToken || env.access_token ||
+        env.Token || env.token || (env.Data && (env.Data.AccessToken || env.Data.token)) || "";
+      if (r.ok && token) {
+        try {
+          const shape = Object.keys(env).join(",");
+          console.error(`[trae-oauth] ✓ 200 响应字段：${shape}`);
+        } catch { /* 日志失败不影响流程 */ }
+        return {
+          ok: true,
+          token: String(token).replace(/^Cloud-IDE-JWT\s+/i, ""),
+          refreshToken: String(env.RefreshToken || env.refreshToken || env.refresh_token || ""),
+        };
+      }
+      // 火山引擎标准信封：错误在 ResponseMetadata.Error.{Code,Message}
+      const envErr = r.data && r.data.ResponseMetadata && r.data.ResponseMetadata.Error;
+      lastMsg = (envErr && envErr.Message) || (r.data && (r.data.message || r.data.msg)) || r.message || `HTTP ${r.status}`;
+      const t = r.text && !/^\s*</.test(r.text) ? String(r.text).slice(0, 180) : "";
+      if (t && !lastMsg.includes(t)) lastMsg += `（上游：${t}）`;
+      const envCode = envErr && envErr.Code ? `${envErr.Code}/` : "";
+      const one = `${v.tag}@${String(origin).replace(/^https?:\/\//, "")} → ${envCode}${lastMsg}`;
+      attempts.push(one);
+      console.error(`[trae-oauth] ← ${one}`);
+      // 授权码被消费/过期时不再重试其余变体（重放只会得到同样的拒绝）
+      if (envErr && /expired|已使用|已过期|invalid auth|auth code/i.test(String(envErr.Message || "") + String(envErr.Code || ""))) break;
     }
-    lastMsg = (r.data && (r.data.message || r.data.msg)) || r.message || `HTTP ${r.status}`;
   }
-  return { ok: false, message: lastMsg };
+  return { ok: false, message: `${lastMsg}｜尝试明细：${attempts.join(" / ")}` };
 }
 
 /** 落库：同渠道同 uid 已存在则更新凭据（重复登录/回调重放不产生重复行）。
@@ -1685,7 +1866,28 @@ async function beginTraeOAuth(channel, onDone) {
   const state = crypto.randomBytes(16).toString("hex");
   const traceId = util.uuid();
   const { verifier, challenge } = pkcePair();
-  const fp = deviceFingerprint(`${channel}:${state}`);
+  const fp0 = deviceFingerprint(`${channel}:${state}`);
+  // 设备身份：优先本机官方 Trae 客户端的 icube 凭证（上游只认已注册的设备身份，
+  // 自造 deviceId + 随机公钥兑换会被 10101 拒——实测；参考实现同样取不到即失败）
+  const identity = readTraeDeviceIdentity();
+  const fp = identity
+    ? { deviceId: identity.deviceId, machineId: identity.machineId || fp0.machineId, icube: true }
+    : { ...fp0, icube: false };
+  // 版本三处同值（参考 ClientFacts 红线）：授权 URL 的 x_app_version/plugin_version 与
+  // 兑换体 ClientVersion/IDEVersion 全取本机 SOLO 安装包版本（IDE 线常量 3.3.100 用于
+  // SOLO 线会被 10101 拒——参考改造前缺陷实录与本机 10101 实测一致）
+  const installMeta = readTraeInstallMeta();
+  const appVersion = (installMeta && installMeta.appVersion) || OAUTH_SOLO_APP_VERSION;
+  const buildVersion = (installMeta && installMeta.buildVersion) || OAUTH_PAGE_PLUGIN_VERSION;
+  // 会话级设备公钥：优先 icube 信封里的 publicKeyPEM（上游认识的注册公钥）；
+  // 本机无凭证时随会话现生成 RSA（大概率仍被拒，但保留链路便于诊断）
+  let devicePublicKey = identity ? identity.publicKeyPem : "";
+  if (!devicePublicKey) {
+    try {
+      const { publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+      devicePublicKey = publicKey.export({ type: "spki", format: "pem" }).toString();
+    } catch { /* 极端环境失败：DeviceInfo 以空串兜底 */ }
+  }
 
   const server = http.createServer((req, res) => {
     const u = new URL(req.url || "/", "http://127.0.0.1");
@@ -1700,7 +1902,7 @@ async function beginTraeOAuth(channel, onDone) {
   const handleTraeCallback = async (q, res) => {
     const session = oauthSession;
     if (!session) {
-      if (res) res.end(ERR_PAGE("登录会话已结束，请返回应用重新发起"));
+      sendHtml(res, ERR_PAGE("登录会话已结束，请返回应用重新发起"));
       return;
     }
     // 官方页主动报错（error / error_code）：明确失败，结束会话
@@ -1708,18 +1910,12 @@ async function beginTraeOAuth(channel, onDone) {
     if (errParam) {
       const desc = q.get("error_description") || q.get("error_desc") || q.get("errorDescription") || q.get("message") || "";
       const msg = desc ? `授权失败：${errParam}（${desc}）` : `授权失败：${errParam}`;
-      if (res) {
-        res.statusCode = 400;
-        res.end(ERR_PAGE(msg));
-      }
+      sendHtml(res, ERR_PAGE(msg), 400);
       finishOAuth({ ok: false, message: msg });
       return;
     }
     if (q.get("isRedirect") === "false" || q.get("is_redirect") === "false") {
-      if (res) {
-        res.statusCode = 400;
-        res.end(ERR_PAGE("回调参数 isRedirect=false：授权未完成，请回到官方页完成登录"));
-      }
+      sendHtml(res, ERR_PAGE("回调参数 isRedirect=false：授权未完成，请回到官方页完成登录"), 400);
       finishOAuth({ ok: false, message: "回调参数 isRedirect=false，授权未完成" });
       return;
     }
@@ -1728,26 +1924,23 @@ async function beginTraeOAuth(channel, onDone) {
       // 官方授权页在用户登录前会先空参探测回调地址可达性（参考项目实证）：
       // 回 200 挂起页继续等待，绝不能按失败处理——老实现在这里报错并结束会话，
       // 登录完成后真正的回调打进来时服务器已经关了，「登录后无法回调」就是这么来的
-      if (res) res.end(PENDING_PAGE);
+      sendHtml(res, PENDING_PAGE);
       return;
     }
     // 校验只挡明确的外来请求；不通过只拒绝本次请求、不结束会话
     const v = validateTraeCallback(q, session);
     if (!v.ok) {
-      if (res) {
-        res.statusCode = 400;
-        res.end(ERR_PAGE(`登录失败：${v.message}`));
-      }
+      sendHtml(res, ERR_PAGE(`登录失败：${v.message}`), 400);
       return;
     }
     try {
       const cred = await resolveTraeCredentials(q, session);
       const r = await saveTraeAccount(cred.accessToken, cred.refreshToken, session.channel, cred.extra);
-      if (res) res.end(OK_PAGE("登录成功，已加入 Trae 号池，可关闭本页"));
+      sendHtml(res, OK_PAGE("登录成功，已加入 Trae 号池，可关闭本页"));
       finishOAuth({ ok: true, id: r.id, uid: r.uid });
     } catch (e) {
       const msg = String((e && e.message) || e);
-      if (res) res.end(ERR_PAGE(`登录失败：${msg}`));
+      sendHtml(res, ERR_PAGE(`登录失败：${msg}`));
       finishOAuth({ ok: false, message: msg });
     }
   };
@@ -1767,6 +1960,8 @@ async function beginTraeOAuth(channel, onDone) {
     challenge,
     deviceId: fp.deviceId,
     machineId: fp.machineId,
+    appVersion,
+    buildVersion,
   });
 
   oauthSession = {
@@ -1778,6 +1973,13 @@ async function beginTraeOAuth(channel, onDone) {
     server,
     host,
     callbackUrl,
+    // 设备事实：授权 URL 与兑换体 DeviceInfo 必须同源取这里（20403 红线）
+    deviceId: fp.deviceId,
+    machineId: fp.machineId,
+    devicePublicKey,
+    deviceSource: fp.icube ? "icube" : "synthetic",
+    appVersion,
+    buildVersion,
     onDone,
     timer: setTimeout(() => finishOAuth({ ok: false, message: "登录超时（3 分钟）" }), OAUTH_TIMEOUT_MS),
     // 手动粘贴回调地址的入口（浏览器没跳到回环地址时的兜底，参考项目同款）

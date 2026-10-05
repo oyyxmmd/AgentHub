@@ -63,6 +63,10 @@ function defaultConfig(): AppConfig {
       ccSwitchModel: "",
       checkinAuto: false,
       checkinAutoTime: "09:00",
+      growthTravelAuto: true,
+      growthCatAuto: true,
+      growthActivityAuto: true,
+      growthSchoolAuto: true,
     },
   };
 }
@@ -1026,6 +1030,45 @@ export const mock = {
             { accountId: "a1", channel: "trae", name: "主账号 · 沐", uid: "88213476", ok: true, message: "签到成功", credit: 100 },
             { accountId: "a2", channel: "workbuddy", name: "工作号", uid: "wb_7c21", ok: true, already: true, message: "今天已签到" },
             { accountId: "a3", channel: "workbuddy_ai", name: "国际版号", uid: "wb_9e05", ok: true, unavailable: true, message: "国际版无签到体系" },
+          ],
+        };
+      case "proxy_growth_run":
+        return {
+          ok: true,
+          action: args?.action || "travel",
+          total: 2,
+          okCount: 2,
+          rows: [
+            { accountId: "a2", channel: "workbuddy", name: "工作号", uid: "wb_7c21", ok: true, state: "traveling", claimed: false, message: "旅行中" },
+            { accountId: "a4", channel: "workbuddy", name: "备用号", uid: "wb_4d8a", ok: true, result: "claimed", claimed: true, message: "夜猫子奖励已领取" },
+          ],
+        };
+      case "proxy_growth_log":
+        return {
+          ok: true,
+          rows: [
+            {
+              ts: NOW - 12 * 60000,
+              action: "travel",
+              trigger: "auto",
+              total: 2,
+              okCount: 2,
+              rows: [
+                { name: "工作号", uid: "wb_7c21", ok: true, state: "traveling", claimed: false, message: "旅行中" },
+                { name: "备用号", uid: "wb_4d8a", ok: true, state: "idle", claimed: true, message: "旅行奖励已领取 +20" },
+              ],
+            },
+            {
+              ts: NOW - 3 * 3600000,
+              action: "activity",
+              trigger: "manual",
+              total: 2,
+              okCount: 2,
+              rows: [
+                { name: "工作号", uid: "wb_7c21", ok: true, claimed: true, message: "上报 5 条，连登 6 天，兑换 tier_5，已抽奖" },
+                { name: "备用号", uid: "wb_4d8a", ok: true, message: "上报 5 条，连登 2 天" },
+              ],
+            },
           ],
         };
       case "proxy_scan":

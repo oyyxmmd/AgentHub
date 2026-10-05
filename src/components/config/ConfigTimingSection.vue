@@ -193,6 +193,34 @@ onMounted(async () => {
           <div class="switch" :class="{ on: app.config.proxy.checkinAuto }" role="switch" :aria-checked="app.config.proxy.checkinAuto" @click="app.config.proxy.checkinAuto = !app.config.proxy.checkinAuto; saveFramework()"></div>
         </div>
       </div>
+      <div class="switch-row">
+        <div class="s-left">
+          <div class="s-title">积分任务 · 猫猫旅行</div>
+          <div class="s-desc">仅 WorkBuddy 中国区；每 15 分钟轮询状态机：可派则派出、到站自动领奖励</div>
+        </div>
+        <div class="switch" :class="{ on: app.config.proxy.growthTravelAuto }" role="switch" :aria-checked="app.config.proxy.growthTravelAuto" @click="app.config.proxy.growthTravelAuto = !app.config.proxy.growthTravelAuto; saveFramework()"></div>
+      </div>
+      <div class="switch-row">
+        <div class="s-left">
+          <div class="s-title">积分任务 · 夜猫子</div>
+          <div class="s-desc">仅 WorkBuddy 中国区；每日 23:00~08:00 窗口内自动完成并领取</div>
+        </div>
+        <div class="switch" :class="{ on: app.config.proxy.growthCatAuto }" role="switch" :aria-checked="app.config.proxy.growthCatAuto" @click="app.config.proxy.growthCatAuto = !app.config.proxy.growthCatAuto; saveFramework()"></div>
+      </div>
+      <div class="switch-row">
+        <div class="s-left">
+          <div class="s-title">积分任务 · 活跃地图</div>
+          <div class="s-desc">仅 WorkBuddy 中国区；每日 10 点后自动上报活跃并领连登奖励链（礼包/补签/兑换/抽奖）</div>
+        </div>
+        <div class="switch" :class="{ on: app.config.proxy.growthActivityAuto }" role="switch" :aria-checked="app.config.proxy.growthActivityAuto" @click="app.config.proxy.growthActivityAuto = !app.config.proxy.growthActivityAuto; saveFramework()"></div>
+      </div>
+      <div class="switch-row">
+        <div class="s-left">
+          <div class="s-title">积分任务 · 开学季</div>
+          <div class="s-desc">仅 WorkBuddy 中国区；每日 12 点后自动完成任务并领奖、抽空转盘（活动期外自动跳过）</div>
+        </div>
+        <div class="switch" :class="{ on: app.config.proxy.growthSchoolAuto }" role="switch" :aria-checked="app.config.proxy.growthSchoolAuto" @click="app.config.proxy.growthSchoolAuto = !app.config.proxy.growthSchoolAuto; saveFramework()"></div>
+      </div>
     </template>
   </div>
 </template>

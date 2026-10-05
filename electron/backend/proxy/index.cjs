@@ -262,6 +262,137 @@ function stopCheckinAuto() {
   checkinTimer = null;
 }
 
+// ===== 号池积分任务自动化（参考 Buddy Switch 实证端点，仅 WorkBuddy CN 渠道适用） =====
+// 四类成长任务：travel 猫猫旅行（状态机幂等，每轮补跑）/ cat 夜猫子（23:00~08:00 窗口）/
+// activity 活跃地图（事件上报 + 连登奖励链，≥10 点）/ school 开学季（限时活动，≥12 点）。
+
+// 执行日志（环形 + 落盘）：手动与自动调度共用一条记录路径，号池页「任务日志」弹窗回看。
+// 落盘尽力而为（写失败只影响回看不影响任务）；重启读回，跨会话可审计。
+const GROWTH_LOG_MAX = 300;
+let growthLog = [];
+function growthLogFile() {
+  const d = path.join(config.dataDir(), "proxy");
+  fs.mkdirSync(d, { recursive: true });
+  return path.join(d, "growth-log.json");
+}
+function growthLogLoad() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(growthLogFile(), "utf8"));
+    growthLog = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    growthLog = [];
+  }
+}
+function growthLogPush(entry) {
+  growthLog.unshift(entry);
+  if (growthLog.length > GROWTH_LOG_MAX) growthLog.length = GROWTH_LOG_MAX;
+  try {
+    fs.writeFileSync(growthLogFile(), JSON.stringify(growthLog));
+  } catch { /* 落盘失败不影响任务执行 */ }
+}
+
+let growthBusy = false;
+async function growthBatch({ accountId, action, trigger }) {
+  const act = ["travel", "cat", "activity", "school"].includes(String(action)) ? String(action) : "";
+  if (!act) return { ok: false, action: "", total: 0, okCount: 0, rows: [], message: "未知任务类型" };
+  if (growthBusy) return { ok: false, action: act, total: 0, okCount: 0, rows: [], message: "任务执行中" };
+  growthBusy = true;
+  try {
+    const accounts = store.listAccounts().filter(
+      (a) =>
+        a.channel === "workbuddy" &&
+        (!accountId || a.id === accountId) &&
+        a.hasToken &&
+        a.status !== "disabled"
+    );
+    const rows = [];
+    for (const acc of accounts) {
+      // 防风控：账号间 800ms ~ 2000ms 随机抖动（与批量签到一致）
+      if (accounts.length > 1 && rows.length > 0) {
+        await new Promise((r) => setTimeout(r, 800 + Math.floor(Math.random() * 1200)));
+      }
+      const ad = adapters.get(acc.channel);
+      const secrets = store.accountSecrets(store.getAccount(acc.id));
+      try {
+        const fn = act === "travel" ? ad.travelRun : act === "cat" ? ad.catRun : act === "activity" ? ad.activityRun : ad.schoolRun;
+        // .call(ad)：方法从适配器取出后 this 会丢，四个 run 内部依赖 this.cfg()/this.growthCall() 等
+        const r = typeof fn === "function" ? await fn.call(ad, acc, secrets) : { ok: false, message: "该渠道不支持此任务" };
+        rows.push({ accountId: acc.id, channel: acc.channel, name: acc.name, uid: acc.uid, ...r });
+        // 有实质领取（旅行奖励/夜猫子/兑换/抽奖/任务领奖）才刷新余额，幂等已领不白打上游
+        const gained =
+          r.claimed === true ||
+          r.result === "claimed" ||
+          !!r.redeemedTier ||
+          r.drew === true ||
+          (Array.isArray(r.tasks) && r.tasks.some((t) => t && t.result === "claimed"));
+        if (gained) credits.refreshAccount(acc.id).catch(() => {});
+      } catch (e) {
+        rows.push({ accountId: acc.id, channel: acc.channel, name: acc.name, uid: acc.uid, ok: false, message: String((e && e.message) || e) });
+      }
+    }
+    events.emit({ type: "credits" });
+    const res = { ok: true, action: act, total: rows.length, okCount: rows.filter((r) => r.ok).length, rows };
+    // 日志行只留摘要字段（控制体积），完整结果本来就不出主进程
+    growthLogPush({
+      ts: Date.now(),
+      action: act,
+      trigger: trigger === "auto" ? "auto" : "manual",
+      total: res.total,
+      okCount: res.okCount,
+      rows: rows.map(({ name, uid, ok, result, state, claimed, message }) => ({ name, uid, ok, result, state, claimed, message })),
+    });
+    return res;
+  } finally {
+    growthBusy = false;
+  }
+}
+
+// 定时成长任务：单一 15 分钟 tick 动态读配置（开关改完即生效）。
+// cat/activity/school 用内存 day 标记当日只跑一次——重启后当天会再跑，靠上游幂等兜底
+// （redeem 409 / claim 已领取均为正常态），与定时签到的设计一致。
+// travel 无需 day 标记：状态机本身幂等（traveling 等待 / arrived 领取 / idle 派发）。
+let growthTimer = null;
+const growthDayDone = { cat: "", activity: "", school: "" };
+function growthAutoTick() {
+  try {
+    const cfg = settings();
+    const now = new Date();
+    const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const step = (enabled, act) => {
+      if (!enabled) return Promise.resolve();
+      if (act !== "travel" && growthDayDone[act] === day) return Promise.resolve();
+      return growthBatch({ action: act, trigger: "auto" }).then((res) => {
+        if (res && res.ok) {
+          if (act === "cat") {
+            // 夜猫子窗口内全部账号都已领/无任务/跳过 → 当日不再重跑；pending 保留标记等下轮
+            const done = res.total > 0 && res.rows.every((r) => r.ok && ["already", "claimed", "skipped"].includes(r.result));
+            if (done) growthDayDone.cat = day;
+          } else {
+            growthDayDone[act] = day;
+          }
+        }
+      }).catch(() => {});
+    };
+    // 串行执行，账号内任务间不并发（防风控）
+    step(cfg.growthTravelAuto !== false, "travel")
+      .then(() => step(cfg.growthCatAuto !== false && (now.getHours() >= 23 || now.getHours() < 8), "cat"))
+      .then(() => step(cfg.growthActivityAuto !== false && now.getHours() >= 10, "activity"))
+      .then(() => step(cfg.growthSchoolAuto !== false && now.getHours() >= 12, "school"))
+      .catch(() => {});
+  } catch {
+    /* 配置读取失败下轮再试 */
+  }
+}
+function startGrowthAuto() {
+  stopGrowthAuto();
+  growthTimer = setInterval(growthAutoTick, 15 * 60000);
+  growthAutoTick(); // 启动即补跑一轮（旅行状态机/到点任务）
+}
+function stopGrowthAuto() {
+  if (growthTimer) clearInterval(growthTimer);
+  growthTimer = null;
+}
+
 /** 启动装配：规则热加载初始化 + 数据库 + 定时额度刷新 + 按上次的开关状态恢复网关
  *  （restoreOnLaunch 不是「用户偏好」而是「上次退出时网关是开是关」，默认 false → 首次打开是关闭的） */
 async function boot() {
@@ -281,6 +412,8 @@ async function boot() {
   } catch { /* 迁移失败不阻断启动，号池页仍可手动修复 */ }
   credits.startScheduler(() => settings().creditsRefreshMin);
   startCheckinAuto();
+  growthLogLoad();
+  startGrowthAuto();
   // 远程锚定指纹（remoteMid）的云端兜底：本机 anchor 缺锚（重装/换机）先从 WebDAV 拉回；
   // 有锚则顺手上传一份（内容 hash 记账，未变不重传）。fire-and-forget，WebDAV 未配置/网络
   // 失败一律静默——锚定的主事实在本机 anchor 文件里，云端只是防丢副本
@@ -588,6 +721,11 @@ function register(ipcMain) {
   // 手动发起 interactive=true——zcode 领取需要人机校验时允许弹官方 SDK 验证窗
   ipcMain.handle("proxy_checkin_status", handle(({ channel, accountId }) => checkinBatch({ channel, accountId, action: "status" })));
   ipcMain.handle("proxy_checkin_run", handle(({ channel, accountId, action }) => checkinBatch({ channel, accountId, action: action || "checkin", interactive: true })));
+
+  // ===== 积分任务（仅 WorkBuddy CN：travel 猫猫旅行 / cat 夜猫子 / activity 活跃地图 / school 开学季） =====
+  // 批量动作见模块级 growthBatch（手动 IPC 与 15 分钟自动 tick 共用同一互斥闸）
+  ipcMain.handle("proxy_growth_run", handle(({ accountId, action }) => growthBatch({ accountId, action })));
+  ipcMain.handle("proxy_growth_log", handle(() => ({ ok: true, rows: growthLog })));
 
   // ===== 凭据接入：本机软件导入 =====
   ipcMain.handle("proxy_scan", handle(() => {

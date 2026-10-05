@@ -84,6 +84,29 @@
         "to": "mcp/mcp-memory-server.cjs"
       }
     ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "identity": null
+    },
+    "dmg": {
+      "artifactName": "AgentHub-${version}-${arch}.dmg",
+      "title": "AgentHub ${version}"
+    },
     "win": {
       "target": [
         {

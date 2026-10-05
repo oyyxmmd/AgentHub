@@ -34,6 +34,7 @@ const proxyTimingSummary = computed(() =>
   [
     `额度每 ${app.config.proxy.creditsRefreshMin} 分钟刷新`,
     app.config.proxy.checkinAuto ? `签到 ${app.config.proxy.checkinAutoTime}` : "定时签到关",
+    app.config.proxy.growthTravelAuto || app.config.proxy.growthCatAuto || app.config.proxy.growthActivityAuto || app.config.proxy.growthSchoolAuto ? "积分任务开" : "积分任务关",
   ].join(" · "),
 );
 

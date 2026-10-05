@@ -6,7 +6,7 @@ import type {
   WebDavStatus, RemoteDevice, WebDavLog, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
   ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy,
-  ProxyCheckinRow, CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, ZcodeDeviceStatusResult, ZcodeClaimModeResult,
+  ProxyCheckinRow, ProxyGrowthRow, ProxyGrowthLogEntry, CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, ZcodeDeviceStatusResult, ZcodeClaimModeResult,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
   MemoryAgentCard, MemoryAgentVerify, MemoryBridgeStatus, MemoryConfigEnvelope, MemoryStatusEnvelope,
   MemoryToolRow,
@@ -18,7 +18,7 @@ export type {
   WebDavStatus, RemoteDevice, WebDavLog, WebDavEvent, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
   ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy,
-  ProxyAccountStatus, ProxyEvent, ProxyCheckinRow, CcSwitchStatus, CcSwitchRegisterResult,
+  ProxyAccountStatus, ProxyEvent, ProxyCheckinRow, ProxyGrowthRow, ProxyGrowthLogEntry, CcSwitchStatus, CcSwitchRegisterResult,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
   MemoryAgentCard, MemoryAgentVerify, MemoryBridgeStatus, MemoryConfigEnvelope, MemoryStatusEnvelope,
   MemoryToolRow, MemoryEvent,
@@ -260,6 +260,12 @@ export const proxyCheckinStatus = (channel?: ProxyChannelId | "", accountId?: st
   call<{ ok: boolean; action: string; total: number; okCount: number; rows: ProxyCheckinRow[] }>("proxy_checkin_status", { channel, accountId }, 0);
 export const proxyCheckinRun = (opts: { channel?: ProxyChannelId | ""; accountId?: string; action?: "checkin" | "trial" }) =>
   call<{ ok: boolean; action: string; total: number; okCount: number; rows: ProxyCheckinRow[]; message?: string }>("proxy_checkin_run", opts as Record<string, unknown>, 0);
+/** 积分任务（仅 WorkBuddy CN）：travel 猫猫旅行 / cat 夜猫子 / activity 活跃地图 / school 开学季。
+ *  逐账号串行 + 随机抖动，与 15 分钟自动 tick 共用主进程 growthBusy 互斥闸，豁免看门狗 */
+export const proxyGrowthRun = (action: "travel" | "cat" | "activity" | "school", accountId?: string) =>
+  call<{ ok: boolean; action: string; total: number; okCount: number; rows: ProxyGrowthRow[]; message?: string }>("proxy_growth_run", { action, accountId }, 0);
+/** 积分任务执行日志（环形 300 条落盘持久化，新的在前；手动与自动调度都记录） */
+export const proxyGrowthLog = () => call<{ ok: boolean; rows: ProxyGrowthLogEntry[] }>("proxy_growth_log");
 /** 扫描本机已装软件的登录态（凭据不出主进程，只回候选信息） */
 export const proxyScan = () => call<ProxyScanCandidate[]>("proxy_scan");
 /** 导入本机候选；file/uid 用于身份核对（两次扫描之间文件变化时不至于导错账号） */

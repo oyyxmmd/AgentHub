@@ -166,6 +166,10 @@ function defaultConfig() {
       channelCooldownCapMs: 900000,  // 渠道降级指数退避封顶（15 分钟）
       checkinAuto: false,       // 定时自动签到（默认关）：每天到点自动跑全渠道签到/领加油包
       checkinAutoTime: "09:00", // 每日自动签到时间（HH:mm）
+      growthTravelAuto: true,   // 积分任务·猫猫旅行自动派/领（仅 WB CN，15 分钟轮询状态机）
+      growthCatAuto: true,      // 积分任务·夜猫子自动领（仅 WB CN，23:00~08:00 窗口）
+      growthActivityAuto: true, // 积分任务·活跃地图自动跑（仅 WB CN，每日 ≥10 点一次：上报+连登奖励链）
+      growthSchoolAuto: true,   // 积分任务·开学季自动领（仅 WB CN，每日 ≥12 点一次，活动期外自动跳过）
       ccSwitchModel: "",        // 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel）
     },
   };
