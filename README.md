@@ -2,389 +2,60 @@
   <img src="./logo.png" alt="AgentHub Logo" width="128" />
 </p>
 
-# AgentHub —— Agent 中控台
+# AgentHub —— Agent 中控台（个人增强 Fork）
 
-> 把「技能、用量、额度、记忆」四件事收进一个 Windows 桌面应用。
-
-AgentHub 是一个**本地运行**的中控台（Electron + Vue 3 + TypeScript）。它自己不带任何模型，做的是把你在各家 AI 编程工具里的东西统一管起来：技能在哪个工具里重复安装、这个月 token 花在哪儿、订阅额度能不能给别的客户端用、Agent 记不住项目——这四类日常麻烦，对应下面四个板块。
-
-| 板块 | 一句话 | 适合谁 |
-| --- | --- | --- |
-| **技能仓库** | 把散落在各工具的 Skill 收进中央库，一处维护、一键分发 | 同时用 Codex / Claude Code / ZCode / Cursor 等多个工具的人 |
-| **用量统计** | 汇总 20 个数据源的 token 用量与费用，按天/项目/模型看趋势 | 想知道「这个月到底烧了多少」的人 |
-| **反代网关** | 把已登录的订阅额度包成 OpenAI 兼容 API，给任何客户端用 | 有订阅额度、想让其他软件也能调用的人 |
-| **记忆中枢** | 本地 Markdown 记忆库 + MCP 服务，让 Agent 记住项目与偏好 | 不想每次开新会话都重新交代背景的人 |
+> 把「技能、用量、额度、记忆」收进一个桌面应用：本地运行的 Electron + Vue 3 中控台，自己不带模型，把你在各家 AI 编程工具里的技能、token 用量、订阅额度、Agent 记忆统一管起来。
 
 ---
 
-## 目录
+## > **本 Fork 的修改**（相对上游 [HUIdada1/AgentHub](https://github.com/HUIdada1/AgentHub)）
 
-- [下载与安装](#下载与安装)
-- [界面总览](#界面总览)
-- [板块一：技能仓库](#板块一技能仓库)
-- [板块二：用量统计](#板块二用量统计)
-- [板块三：反代网关](#板块三反代网关)
-- [板块四：记忆中枢](#板块四记忆中枢)
-- [常见问题](#常见问题)
-- [开发与自测](#开发与自测)
-- [免责声明](#免责声明)
-
----
-
-## 下载与安装
-
-### 安装版（推荐）
-
-1. 打开 [Releases 页面](https://github.com/HUIdada1/AgentHub/releases/latest)
-2. 下载 `AgentHub-Setup-x.y.z.exe`
-3. 双击安装。安装过程中可以改安装目录，装完会在桌面和开始菜单创建「AgentHub」快捷方式
-4. 启动后程序常驻系统托盘，关窗口不会退出；托盘图标双击可唤回窗口，右键菜单里能暂停同步、看今日用量
-
-### 便携版
-
-下载 `AgentHub-x.y.z-portable.exe`，双击即用、免安装，适合放 U 盘或临时机器。便携版同样会检查并提示新版本，但不支持自动下载安装，按提示到 Releases 下载新文件替换即可。
-
-### 系统要求
-
-- Windows 10 / 11（x64）
-- 不需要预装 Node、浏览器等任何依赖，运行时已打包在内
-- 部分能读到数据的工具需要本机登录过对应客户端（如用量统计要读 Codex、Trae 的本地库）
-
-### 数据、更新与备份
-
-- 所有配置与数据都存在 `%APPDATA%\AgentHub`，卸载程序不会删除它
-- 自动更新：默认**每小时**检查一次 GitHub Releases，检测到新版本会在侧栏设置齿轮和「设置 · 通用」的更新按钮上冒红点；自动检查可在「设置 · 通用」关闭
-- 左下角「设置」= 全局项（通用 / WebDAV 同步 / 同步时间 / 数据与备份）；每个板块右上角还有一个「配置」按钮，管的是这个板块自己的设置
-
----
-
-## 界面总览
-
-- **左侧**：四个板块卡片（可拖动排序），卡片上直接显示该板块的关键状态；最左下角是设置齿轮、版本号、亮暗主题切换
-- **顶部横条**：当前板块的子页面切换；最右侧「配置」按钮进入该板块的配置页
-- **页面红点**：某个页签右上角出现小红点，表示那一页有东西等你处理（如技能冲突裁决、记忆待确认），处理完自动消失
-- **托盘**：双击唤回窗口；右键可暂停同步、手动同步、查看今日用量
-
----
-
-## 板块一：技能仓库
-
-### 它解决什么问题
-
-同一个 Skill 你可能在 Codex、Claude Code、ZCode、Cursor 里各装了一份，改一处忘一处。技能仓库的做法是：**把所有工具的 Skill 目录收进一个中央仓库，再由中央仓库挂载回各工具**——之后只在中央仓库维护，一处更新，处处生效。
-
-### 页面构成
-
-| 页面 | 作用 |
+| 修改 | 说明 |
 | --- | --- |
-| 仪表盘 | 中央库与各工具连接状态总览：收了多少技能、挂载是否健康、有没有孤儿目录 |
-| 中央技能库 | 技能列表与详情，逐条查看/收纳/挂载，挂载失效时可一键修复 |
-| 去重与冲突 | 同一技能在不同工具里内容不一致时列出差异，人工裁决保留哪份 |
-| 同步中心 | 扫描预览 → 确认执行 → 查看报告，一次把「收什么、挂什么、有什么要裁决」讲清楚 |
-| WebDAV 同步 | 中央仓库跨设备同步（服务器地址在「设置 · WebDAV 同步」里配） |
-
-### 怎么用
-
-1. 打开「技能仓库 · 仪表盘」，确认工具列表里检测到了你的工具（ZCode / Codex / Claude Code / Antigravity / 通用 `~/.agents` 为内置，其他工具会按本机目录自动建议添加）
-2. 进入「同步中心」，先点扫描看看这次会收哪些技能、往哪些工具挂——预览不写任何文件，看清楚再执行
-3. 点执行。技能会以软链接（junction）的方式从中央仓库挂回各工具，几乎不占额外空间
-4. 日常在某处新增/修改了技能，回「同步中心」再跑一次即可；出现冲突会进入「去重与冲突」页面等你裁决
-5. 多台电脑：在「设置 · WebDAV 同步」填好服务器，然后在「WebDAV 同步」页跑一次，中央仓库就同步过去了
+| **WorkBuddy CN 积分任务自动化** | 参考 [Buddy Switch](https://github.com/NextAgentX/trae-workbuddy-switch) 接入四类成长任务：**猫猫旅行**（状态机自动派猫/领奖）、**夜猫子**（23:00–08:00 窗口内自动补事件领奖）、**活跃地图**（对话事件连发上报 + 连登奖励链：礼包/补偿/补签/兑换/抽奖）、**开学季**（任务链 + 转盘）。每类独立开关（配置 · 反代网关 · 定时），15 分钟自动调度 + 号池页手动执行，执行记录在「任务日志」弹窗可查，落盘持久化，正常态静默幂等 |
+| **Trae SOLO CN OAuth 登录修复** | 对齐 Buddy Switch 的 Rust 实现：读本机官方客户端 icube 设备身份（DeviceID/MachineID/EC P-256 公钥）、SOLO 安装包版本三处同值（授权 URL + 兑换体）、`Result.AccessToken` 信封解析、四变体 × 多域兑换链、回调参数反复 percent-decode、完整请求/响应诊断日志（`[trae-oauth]`） |
+| **Trae 模型目录完整拉取** | `get_detail_param` 按 `function` 键逐键拉取合并（`solo_work_lite` + `solo_agent` 并集，修复只回 1 个模型的问题），条目记录来源键，出站 `functionForModel` 优先回查 catalog 条目 |
+| **macOS（Apple Silicon）支持** | electron-builder dmg/zip 目标（仅 arm64、跳过签名），`build/icon.icns` 由 logo 生成；首次打开需右键「打开」绕过 Gatekeeper 或 `xattr -cr /Applications/AgentHub.app` |
 
 ---
 
-## 板块二：用量统计
+## 四大板块
 
-### 它解决什么问题
-
-各家 AI 工具的用量分散在各自的本地数据库里，没人告诉你「这个月一共花了多少」。用量统计直接读**本机客户端自己的数据文件**，把 20 个数据源归一成同一套口径，做汇总、趋势、费用与跨设备对比。
-
-### 支持的数据源（20 个）
-
-ZCode、商汤小浣熊、Xiaomi MiMo、Codex、DeepSeek Harness、WorkBuddy、WorkBuddy AI、Reasonix、CodeBuddy、Qoder、Qoder CN、Antigravity、Antigravity IDE、Antigravity 老数据恢复、Trae、Trae CN、TRAE SOLO、TRAE SOLO CN、OpenSquilla、Grok。
-
-在「配置 · 用量统计」里可以逐个开关、指定自定义数据目录——没装过的源自动跳过，不会报错。
-
-### 页面构成
-
-| 页面 | 作用 |
+| 板块 | 一句话 |
 | --- | --- |
-| 总览 | 核心指标卡 + 全年热力图 + 用量趋势（当天可按小时看）+ 各电脑用量构成 |
-| 用量明细 | 按来源/模型/项目筛选，逐条记录，可分页、可导出 CSV |
-| 费用 | 按模型价格折算费用；需要先在「计费规则」里配好价格 |
-| 计费规则 | 模型价格表、远程价格源、模型别名归并（变体模型名按目标价格计费） |
-| 同步日志 | 每次同步的时间、窗口、条数、结果，出问题先看这里 |
+| **技能仓库** | 把散落在各工具的 Skill 收进中央库，一处维护、一键分发（软链接挂载） |
+| **用量统计** | 汇总 20 个数据源的 token 用量与费用，按天/项目/模型看趋势 |
+| **反代网关** | 把已登录的订阅额度包成 OpenAI 兼容 API（`http://127.0.0.1:9527/v1`），给任何客户端用；号池五态管理、自动换号、冷却、多机 WebDAV 同步 |
+| **记忆中枢** | 本地 Markdown 记忆库 + MCP 服务，让 Agent 记住项目与偏好 |
 
-### 同步节奏
+**反代网关渠道**：Trae SOLO CN / WorkBuddy CN / WorkBuddy AI / 商汤小浣熊 / ZCode（智谱）/ Qoder CN / Qoder International——号池、签到、策略各渠道独立；添加账号支持 OAuth 登录、本机客户端导入、JSON/ZIP 文件、粘贴 JSON 四种方式。
 
-- 本机统计：**每 30 分钟**自动入库一次（固定，不设开关）
-- 跨设备同步：在「设置 · 同步时间」里配置，支持「每小时」或「每天定时」两种自动节奏，也可以随时手动触发
-- 没有配置 WebDAV 也能正常用：会自动进入本地模式，只统计本机数据
+> Qoder 渠道依赖本机安装的客户端（签名由客户端内置 wasm 生成）；每日领 Credits 同理。Trae 不支持「切到 IDE」（登录态为设备绑定的加密信封）。
 
 ---
 
-## 板块三：反代网关
-
-> 这是本项目最核心的板块。它把你**本机已经登录**的订阅额度，包装成一个标准的 **OpenAI Chat Completions API**，任何支持「自定义 OpenAI 接口」的客户端都能直接调用。
-
-### 支持的渠道
-
-| 渠道 | 对应订阅 | 登录形态 | 签到 |
-| --- | --- | --- | --- |
-| **Trae SOLO CN** | Trae SOLO 国内版 | 官方授权页 + 本机回环回调 | 每日签到 |
-| **WorkBuddy CN** | WorkBuddy 国内版 | 官方登录页 + 本机轮询 | 每日签到 |
-| **WorkBuddy AI** | WorkBuddy 国际版 | 官方登录页 + 本机轮询 | 一次性加油包 |
-| **商汤小浣熊** | 商汤小浣熊 | 应用内授权窗截获（不经过系统浏览器） | 每日签到 |
-| **ZCode（智谱）** | Z.ai GLM 编码套餐 | Z.ai 授权页 + 本机轮询 | 领取奖励 |
-| **Qoder CN** | Qoder 国内版 | 官方登录页设备码轮询（无需本机客户端）/ 从本机软件导入 | 每日领 Credits |
-| **Qoder International** | Qoder 国际版 | 同上 | 每日领 Credits |
-
-各渠道的号池、签到、策略完全独立，互不影响：在号池页顶部切换渠道，下方整块区域只显示当前渠道的账号。
-
-> **Qoder 渠道的两点特别说明**
->
-> - **推理依赖本机安装的 Qoder 客户端**：该渠道每个请求的签名头与请求体编码都由客户端内置的 wasm 实时生成（无法手工构造）。AgentHub 会在首次调用时从已安装客户端中提取这部分能力并按版本缓存（客户端升级自动重建，无需重装 AgentHub）。因此**只导入凭据、没装对应客户端时，账号可入池但无法发起请求**——建议保持客户端处于安装状态，安装目录放在默认位置或客户端自带启动器的默认路径均可（自定义安装路径也能自动识别）。
-> - **每日 Credits**：号池页的按钮是「领 Credits」（每天 100，10:00 UTC+8 刷新，领取后 30 天有效，重复点击按"今日已领"处理）；领取接口要求客户端自带的风控身份，故同样需要本机安装客户端。国际版免费额度不含 DeepSeek / GLM Flash 系列，需订阅覆盖才有可用模型。
-
-### 页面构成
-
-| 页面 | 作用 |
-| --- | --- |
-| 总览 | 服务开关、接入地址、今日指标、渠道一览、实时请求流（每一步都有问号说明） |
-| 号池 | 按渠道管理账号：状态、余额、套餐到期、策略、添加账号、一键签到、切到 IDE |
-| API Keys | 生成/停用 Key，配置日配额与限速；完整 Key 随时可查看复制 |
-| 模型目录 | 全渠道模型合并视图，逐模型启停、指定渠道、设置倍率与别名；各渠道官方目录可一键从云端拉取 |
-| 用量统计 | 网关自身的请求流水：总览 / 趋势 / TOP（渠道、模型、Key、账号）/ 明细分页，保留 90 天 |
-| 号池同步 | 多台电脑共享号池：账号与凭据打包经 WebDAV 同步，可选只同步某一个渠道 |
-| 生态接入 | 一键把网关注册进 CC Switch，给 Claude Code / Codex / Claude Desktop 用 |
-
-### 上手教程
-
-#### 第 0 步：准备一个上游账号
-
-在电脑上装好并用你自己的账号登录至少一个上游客户端（Trae SOLO CN / WorkBuddy / 商汤小浣熊 / ZCode / Qoder 任一）。如果你已经在本机登录过，第 2 步可以直接「从本机软件导入」，连登录都不用重新做——Qoder 的登录凭据存在加密信封里，AgentHub 也能直接读取（需与客户端同一 Windows 用户）。
-
-#### 第 1 步：启动网关服务
-
-打开「反代网关 · 总览」，点右上角的**启动服务**，状态变成 `RUNNING` 即为就绪。默认监听：
-
-```
-http://127.0.0.1:9527/v1
-```
-
-这个地址只会先给本机用。端口、绑定地址（想让局域网其他设备访问就把 `127.0.0.1` 改成 `0.0.0.0`）都在「配置 · 反代网关」里改，改完需要重启服务。
-
-#### 第 2 步：往号池里加账号
-
-进入「反代网关 · 号池」，先在顶部选中渠道，再点**添加账号**。每个渠道都支持四种添加方式，挑一种就行：
-
-1. **OAuth 登录**（最推荐）——跳转官方授权页登录，登录完成后自动入池，全程不用手工填任何 token：
-   - Trae SOLO CN：授权后会回调本机回环地址；万一浏览器停在回调页没自动跳回，把地址栏内容整段粘到输入框兜底
-   - WorkBuddy 两个版本：登录完本机自动轮询结果，无需任何粘贴
-   - 商汤小浣熊：授权窗在 AgentHub 应用内弹出，授权码由应用直接截获；被拦截时可粘贴 `office-raccoon://auth/callback?code=…` 兜底
-   - ZCode：跳 Z.ai 授权页，登录后自动入池；随后后台会用几十秒初始化套餐并解析编码套餐 API Key
-   - Qoder 两个版本：跳官方登录页（qoder.cn / qoder.com）完成登录，本机每秒轮询直接取回设备凭据对，**无需本机安装客户端、也不用粘贴回调**
-   - 每次登录对应一个账号，想加几个号就重复几次
-2. **从本机软件导入** —— 直接扫描本机已登录客户端的凭据，零请求入池，最省事（Qoder 走的也是这条：从客户端登录态里读出设备令牌）
-3. **从 JSON / ZIP 文件** —— 批量导入别人给你的账号文件
-4. **粘贴 JSON** —— 手动粘贴单条或一组凭据
-
-账号加进来后，号池列表里能看到它的余额、套餐到期时间和状态（online / cooling / exhausted / relogin / disabled）。想主动养护账号，点该渠道的**一键签到**（或领加油包，Qoder 是「领 Credits」）；也可以打开定时自动签到，每天到点自动跑全渠道。
-
-#### 第 3 步：生成 API Key
-
-进入「API Keys」页，点生成：
-
-- **名称**：随便起，方便自己认，比如 `cherry-studio`
-- **路由**：默认 `auto` 会按号池策略自动挑渠道；也可以锁死只走某一个渠道
-- **日配额 / 限速**：不填即不限；按需设置可以防止某个客户端把额度跑光
-
-生成的 Key 会立刻弹出来给你复制；之后也能在列表里随时「查看 / 复制」完整 Key（经 DPAPI 加密存库），所以不用怕一次没存住。真泄露了就把它停用（开关即时生效）再生成一个新的。
-
-#### 第 4 步：在客户端里填三项
-
-任何支持「OpenAI 兼容 / 自定义 OpenAI 接口」的客户端都行（Cherry Studio、ChatBox、NextChat、Cline、Roo Code、各类 IDE 插件……）：
-
-| 项目 | 填什么 |
-| --- | --- |
-| API 地址（Base URL） | `http://127.0.0.1:9527/v1`（部分客户端只要求填到端口，按它的提示来） |
-| API Key | 第 3 步生成的 `sk-` 开头的 Key |
-| 模型 | 从「模型目录」页里挑一个可用的模型名 |
-
-保存后发一句话测试，回到「总览」看到实时请求流里出现记录，就说明链路通了。
-
-> **给 Claude Code / Codex / Claude Desktop 用？** 它们说的是自家协议（Anthropic Messages / Responses），不能直连。按下面第 5 步走「生态接入」。
-
-#### 第 5 步（可选）：接入 Claude Code / Codex
-
-1. 先装好 [CC Switch](https://github.com/farion1231/cc-switch)
-2. 进入「反代网关 · 生态接入」，选择要接入的应用（Claude Code / Codex / Claude Desktop），选定一个 API Key 和默认模型，点注册
-   - 注册前会自动备份 CC Switch 数据库，且只会写入自己那一条固定条目，不动你的其它 provider
-   - Claude 侧只写 `ANTHROPIC_AUTH_TOKEN`（网关只认 `Authorization: Bearer`），避免和 `x-api-key` 同时出现触发鉴权告警
-3. 注册完成后，到 CC Switch 里**打开「代理接管」**再启动对应客户端——CC Switch 要靠它做协议翻译，直连网关必 404
-4. Codex 的 `wire_api` 语义上必须是 `responses`，CC Switch 会依据条目里的 `apiFormat` 判定需要转换，不用手动改
-
-### 号池与自动切换
-
-- **五态状态机**：online（可用）/ cooling（冷却中）/ exhausted（额度耗尽）/ relogin（需重新登录）/ disabled（手动停用）
-- **池内策略**：到期优先（默认，先把快过期的额度用掉）/ 余额优先 / 轮询，按渠道单独设置
-- **运行期自动换号**：上游返回 402 / 额度类错误时自动换下一个号（单请求最多换 2 次）；已知零余额的号在调度时直接跳过
-- **冷却表**：不同错误按不同时长冷却（限流 60 秒、服务端错误 10 分钟、次日额度类错误等到次日 04:00、401 标记为需重新登录），避免死号被反复重试
-- **模型回退**：模型未知或全部号不可用时，按「配置 · 反代网关」里设置的全局回退模型自动切换
-
-### 切到本机 IDE（可选）
-
-号池里每个账号都有一个「切到 IDE」按钮：把该账号写成本机客户端的当前登录态，适合「号池里的号想直接在本机客户端里用」。
-
-- 支持 WorkBuddy 双区、商汤小浣熊、ZCode。**Trae 不支持**——它的登录态是绑定设备密钥的加密信封，构造不出合法文件，程序会直接说明原因，不会硬写
-- 点击后会弹确认框，确认即自动：关闭客户端 → 备份原登录态 → 写入 → 重新打开客户端
-- 写入前后有多道校验（防并发回写、写后回读校验失败自动回滚）；ZCode 采用合并式写回，不会动你的远程连接地址；小浣熊会保留账号专属设备指纹，避免跨号串号导致旧号被吊销
-
-### 多台电脑共享号池
-
-「号池同步」页把账号与凭据打包（用统一 WebDAV 密码 AES-256-GCM 加密）传到 WebDAV，另一台电脑拉下来即可共用同一批号。可以选择同步全部渠道，也可以只同步某一个渠道；进度按阶段展示，中途可看细节。
-
-### 防监测与稳定性
-
-- 请求指纹（UA、设备头、链路追踪头、来源 referer）逐字段对齐官方客户端
-- WorkBuddy 侧会做指纹清洗（剥离 `cc_*` / `x-anthropic-*`、审核模板最小改写，模板外置可热更新）
-- 请求间有 40~220ms 的拟人化随机抖动，换号痕迹不会外泄
-- 规则热加载：`rules/*.json`（模型映射 / 清洗模板 / 渠道头）改完即时生效，无需重启
-
----
-
-## 板块四：记忆中枢
-
-### 它解决什么问题
-
-Agent 每次开新会话都不记得你的项目背景、技术决策和踩过的坑。记忆中枢在本地维护一个 **Markdown 记忆库**，把会话中值得长期保留的事实沉淀下来，再通过 **MCP 服务**提供给各个 Agent 读写——你的记忆始终是本地一堆可读可 diff 的 md 文件。
-
-默认仓库位置：`~/AgentHub/memory`，按 `projects/<项目>/l1/<agent>/<日期>.md`（原始事实）与 `projects/<项目>/l2/...`（蒸馏出的项目汇总 / 决策 / 知识）组织。
-
-### 页面构成
-
-| 页面 | 作用 |
-| --- | --- |
-| 仪表盘 | 记忆总量、增长趋势、各项目与 Agent 的分布 |
-| 记忆浏览 | 列表 / 热力图 / 待确认 / 回收站四个视图；三类待人工裁决的条目在「待确认」里处理 |
-| 项目归档 | 按项目看汇总与归类溯源，项目可重命名、合并到其他项目 |
-| 深层画像 | 从长期记录里蒸馏出的偏好与人格画像 |
-| Agent 接入 | 一键给各 Agent 注入 MCP 与指令块，并做三级校验 |
-| 检索与索引 | 全文检索（中文 bigram 分词 + 同义词扩展），索引状态与自愈 |
-| 自动化 | 九个后台任务的开关、节奏、立即执行与运行历史 |
-| 导入与去重 | 从各工具的历史会话导入记忆，重复内容合并 |
-| WebDAV同步 | 记忆库跨设备同步 |
-
-### 怎么用
-
-1. **接入 Agent**：进入「Agent 接入」，找到你要用的 Agent（内置 ZCode、Codex CLI、WorkBuddy、Claude Code、DeepSeek Harness、Trae Solo、Cursor、通用 `~/.agents`），点一键注入。它会做两件事：往 Agent 配置里加一条 MCP 启动项，往它的指令文件（`AGENTS.md` / `CLAUDE.md` 等）写一段受控块——都在写前自动备份，卸载时只删自己的部分
-2. **验证**：卡片上的三级校验会依次确认「配置条目在不在 → 桥能不能真的拉起并列出工具 → 这个 Agent 有没有真的调用过」。只有第三级出现心跳，才说明它确实在用
-3. **导入历史**：进入「导入与去重」，把已有会话历史导进来做底料（支持 Codex、ZCode、WorkBuddy 等来源的会话库），导入前可以先跑干跑预览
-4. **开自动化**：进入「自动化」按需打开任务。九个任务分两类：
-   - 本地算法类：项目归类建议、索引自愈扫描（不耗 token）
-   - 需要模型类：抽取结构化信息、生成摘要、自动打标签、失效判定、L2 蒸馏、去重合并、人格/偏好画像
-5. **给记忆任务配模型**：在记忆中枢的配置页选择模型来源——可以填自己的 API，也可以直接**走本板块里已经搭好的 AgentHub 网关**，并配置失败时的降级链
-
-### 待确认收件箱
-
-自动化跑完后，有三类结论不会直接生效，而是排队等你确认：**事实失效判定**（新事实是否覆盖旧事实）、**项目归类建议**、**去重合并建议**。它们收在「记忆浏览 → 待确认」里，逐条采用或驳回；每条都带推荐建议，也可以按推荐一键全部确认。
-
----
-
-## 常见问题
-
-**Q：客户端连不上网关怎么办？**
-先看三处：① 「总览」页服务状态是不是 `RUNNING`；② 客户端填的地址是不是以 `/v1` 结尾；③ Key 有没有停用。再看错误码：`401` 是 Key 不对，`429` 是该 Key 触发了限速或当日配额，`400` 是请求参数有问题，`502` 是上游返回异常（号池会自动换号重试），`503` 是当前渠道没有可用账号（去号池看看是不是全都在冷却或需重新登录）。
-
-**Q：手机上/另一台电脑能访问吗？**
-可以。「配置 · 反代网关」把绑定地址改成 `0.0.0.0`，重启服务，然后用局域网 IP + 端口访问。注意这意味着同网段的设备都能访问，请务必设置 Key 的日配额与限速。
-
-**Q：为什么 Trae 不能「切到 IDE」？**
-Trae 的本地登录态是 ByteCrypto 加密信封，绑定了设备密钥，无法在外部构造出合法文件。程序会诚实提示而不是写坏你的登录态。
-
-**Q：小浣熊多账号要注意什么？**
-多账号入池请统一在 AgentHub 的「OAuth 登录」里做。**不要在电脑端小浣熊软件里点「退出登录」**——商汤服务端会因此吊销旧号凭证，导致号池里的旧账号失效。
-
-**Q：点「切到 IDE」会不会打断我正在用的客户端？**
-会：程序需要先关闭对应客户端，写入登录态后再自动打开（这也是为什么每次都会先弹一个确认框）。如果你此刻正在那个客户端里干活，先存盘再点。
-
-**Q：我的凭据安全吗？**
-账号 token 经 Windows DPAPI 加密后落盘，且只在主进程中流转，不暴露给界面层；网关的 API Key 在库里只存 SHA-256 哈希（完整 Key 单独用加密信封保存，供你自己查看）。所有请求只发往你所用服务的官方接口，以及你自己配置的 WebDAV 服务器，中途不经过任何第三方服务器。
-
-**Q：没配置 WebDAV 是不是很多功能不能用？**
-不是。用量统计会自动进入本地模式；技能仓库、反代网关、记忆中枢的单机功能全部可用，WebDAV 只是「多台电脑共享」用的。
-
-**Q：自动签到什么时候跑？**
-默认关闭。开启后每天到设定时间（默认 09:00，可改）自动给全部渠道跑一遍签到/领加油包，结果按渠道分别记录，切渠道看得到各自的历史。
-
----
-
-## 开发与自测
+## 快速开始
 
 ```bash
 # 环境：Node >= 18
 npm install
+npm run dev              # 桌面端开发（Electron + Vite HMR）
+npm run build            # 类型检查 + 前端构建
 
-npm run dev          # 桌面端开发（Electron + Vite HMR）
-npm run dev:web      # 纯浏览器预览 UI（mock 数据，不启动 Electron）
-npm run build        # 类型检查 + 前端构建
-npm run electron:build   # 打包安装版与便携版到 release/
+# macOS arm64 打包（dmg + zip，产物在 release/）
+npx electron-builder --mac --publish never
 ```
 
-反代网关后端全链路自测（含假上游端到端：换号 / 自动切换 / 流式双态 / 指纹头）：
-
-```bash
-ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe tools/proxy-smoke.cjs
-```
-
-Qoder 渠道专项自测（离线，默认不联网、不消耗额度；凭据与签名器相关断言需要本机装有 Qoder 客户端）：
-
-```bash
-ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe tools/proxy-qoder-adapter-selftest.cjs      # 适配器纯函数 + SSE 信封解包
-ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe tools/proxy-qoder-integration-selftest.cjs  # 每日领取（stub）+ 记忆中枢适配器
-ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe tools/proxy-qoder-selftest.cjs              # 凭据解密 + wasm 签名器
-```
-
-记忆中枢验证入口：
-
-```bash
-npm run verify:memory
-```
-
-代码结构：
-
-```
-electron/            主进程
-  backend/
-    adapter-*.cjs    各用量数据源适配器
-    proxy/           反代网关（存储 / 适配器 / 号池 / 网关服务 / 规则热加载 / IDE 切换）
-    memory/          记忆中枢（存储 / 索引 / 检索 / 接入 / 自动化 / 导入）
-  main.cjs           应用入口（窗口 / 托盘 / 更新）
-src/                 渲染层（Vue 3）
-  views/             四大板块的页面
-  components/        公共组件（侧栏 / 页签 / 配置中心）
-```
-
-反代网关的协议细节参考 TraeWorkAssistant 等项目公开的逆向事实，代码独立实现。
-
----
+- 账号 token 经系统级加密（macOS Keychain / Windows DPAPI）落盘，只在主进程流转；网关 API Key 只存 SHA-256 哈希
+- 所有请求只发往对应服务的官方接口与你自己的 WebDAV 服务器
 
 ## 免责声明
 
-本项目为**开源学习研究项目**，仅供个人在已合法订阅相应服务的前提下，于本地环境调用自有账号额度。使用者不得用于任何违反目标服务条款、侵犯第三方权益或商业转售的用途；因使用本项目产生的一切后果（包括但不限于账号限制、封禁）由使用者自行承担，作者概不负责。本项目与 Trae、WorkBuddy、腾讯、商汤、智谱等公司无任何关联，相关商标归其各自所有者。
+本项目为**开源学习研究项目**，仅供个人在已合法订阅相应服务的前提下，于本地环境调用自有账号额度。使用者不得用于任何违反目标服务条款、侵犯第三方权益或商业转售的用途；因使用本项目产生的一切后果由使用者自行承担。本项目与 Trae、WorkBuddy、腾讯、商汤、智谱等公司无任何关联。
 
-## 作者
+## 致谢
 
-**沐辉**（GitHub: [@HUIdada1](https://github.com/HUIdada1)）
+- 原项目：**沐辉**（[@HUIdada1](https://github.com/HUIdada1)）的 [AgentHub](https://github.com/HUIdada1/AgentHub)（MIT License）
+- 积分任务与 Trae OAuth 实现参考：[NextAgentX/trae-workbuddy-switch](https://github.com/NextAgentX/trae-workbuddy-switch)（Buddy Switch）
 
-## License
-
-本项目基于 [MIT License](./LICENSE) 开源发布。
-
-Copyright (c) 2026 沐辉 (HUIdada1)
-
-> Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
->
-> The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
->
-> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+License: [MIT](./LICENSE)
