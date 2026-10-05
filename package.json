@@ -28,7 +28,7 @@
     "@vitejs/plugin-vue": "^4.6.2",
     "concurrently": "^8.2.2",
     "echarts": "^5.4.3",
-    "electron": "^35.0.0",
+    "electron": "^35.7.5",
     "electron-builder": "^24.13.3",
     "element-plus": "^2.14.5",
     "pinia": "^2.1.7",
