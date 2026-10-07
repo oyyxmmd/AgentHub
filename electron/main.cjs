@@ -2,7 +2,7 @@
 // 技能仓库后台能力：定时 WebDAV 同步调度、自动感知收纳、软件自更新
 "use strict";
 const path = require("node:path");
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain, nativeTheme, Notification } = require("electron");
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain, nativeTheme, Notification, screen } = require("electron");
 
 // ===== 闪退取证（本地补丁 __agenthubCrashTrace）=====
 // 1.42.0 出现静默退出：Windows 无 Application Error 事件、无 minidump、应用自身零日志，
@@ -79,6 +79,44 @@ function iconPath(name) {
   } catch {
     return nativeImage.createEmpty();
   }
+}
+
+/** 图标画布合成：logo 是满幅图，直接做托盘/Dock 图标会比系统图标大一圈
+ *  （macOS 规范：托盘内容占 ~68%，Dock 图标内容占画布 ~80%、四周透明边距）。
+ *  把原图缩到 inner 大小居中写进透明画布，失败回落原图；结果按用途缓存 */
+const iconPadCache = new Map();
+function paddedIcon(key, raw, canvas, inner, scaleFactor) {
+  if (iconPadCache.has(key)) return iconPadCache.get(key);
+  const img = raw && !raw.isEmpty() ? raw : iconPath("icon.png");
+  let result = img;
+  try {
+    const scaled = img.resize({ width: inner, height: inner, quality: "best" });
+    const s = scaled.getSize();
+    if (s.width && s.height) {
+      const out = Buffer.alloc(canvas * canvas * 4, 0);
+      const offX = Math.floor((canvas - s.width) / 2);
+      const offY = Math.floor((canvas - s.height) / 2);
+      const bmp = scaled.toBitmap();
+      for (let y = 0; y < s.height; y++) {
+        const src = y * s.width * 4;
+        bmp.copy(out, ((y + offY) * canvas + offX) * 4, src, src + s.width * 4);
+      }
+      result = nativeImage.createFromBitmap(out, { width: canvas, height: canvas, scaleFactor });
+    }
+  } catch { /* 合成失败回落原图 */ }
+  iconPadCache.set(key, result);
+  return result;
+}
+
+/** 托盘图标：@2x 44px（22pt）画布、内容 30px（~68%） */
+function trayIcon() {
+  const raw = iconPath("tray.png");
+  return paddedIcon("tray", raw.isEmpty() ? iconPath("icon.png") : raw, 44, 30, 2);
+}
+
+/** Dock 图标：1024 画布、内容 824（macOS 标准边距比例 ~80%），解决满幅图标在 Dock 里偏大 */
+function dockIcon() {
+  return paddedIcon("dock", iconPath("icon.png"), 1024, 824, 1);
 }
 
 /** 应用主题同步到原生窗口框架（标题栏/边框）：否则外框颜色只跟系统主题走，不跟应用主题走 */
@@ -197,13 +235,13 @@ function triggerUsageSync() {
   });
 }
 
-/** 今日用量摘要（托盘菜单用），无数据时返回 null */
+/** 今日用量摘要（托盘菜单用）：请求数 + token；无数据时返回 null */
 function usageTodaySummary() {
   try {
     const cfg = usageConfig.loadConfig();
     const s = usagedb.getSummary(cfg.totalMode || "full");
     // 无记录时返回 null（托盘显示「今日用量 —」）；todayTokens 恒 >= 0，不能用其判断空态
-    return s && s.todayRecordCount > 0 ? s.todayTokens : null;
+    return s && s.todayRecordCount > 0 ? { count: s.todayRecordCount, tokens: s.todayTokens } : null;
   } catch {
     return null;
   }
@@ -231,7 +269,7 @@ function fmtTime(iso) {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/** 托盘菜单（动态构建：技能同步状态 + 今日用量 + 更新提示 + 暂停/恢复定时同步） */
+/** 托盘右键菜单（纯操作项；数据展示由左键弹出面板承载） */
 function buildTrayMenu() {
   const cfg = config.loadConfig();
   const running = remotesync.isRunning();
@@ -244,7 +282,7 @@ function buildTrayMenu() {
   const usageToday = usageTodaySummary();
   const items = [
     { label: `技能仓库：${statusText}`, enabled: false },
-    { label: usageToday != null ? `今日用量 ${formatNum(usageToday)} token` : "今日用量 —", enabled: false },
+    { label: usageToday ? `今日 ${usageToday.count} 次请求 · ${formatNum(usageToday.tokens)} token` : "今日用量 —", enabled: false },
     { type: "separator" },
   ];
   const st = updater.getStatus();
@@ -259,11 +297,11 @@ function buildTrayMenu() {
     {
       label: scheduler.isPaused() ? "恢复定时同步" : "暂停定时同步",
       enabled: remotesync.configured(cfg) && !!(cfg.schedule && (cfg.schedule.hourly || cfg.schedule.daily)),
-      click: () => { scheduler.setPaused(!scheduler.isPaused()); refreshTrayMenu(); },
+      click: () => { scheduler.setPaused(!scheduler.isPaused()); },
     },
     {
       label: usageScheduler.isPaused() ? "恢复用量定时同步" : "暂停用量定时同步",
-      click: () => { usageScheduler.setPaused(!usageScheduler.isPaused()); refreshTrayMenu(); },
+      click: () => { usageScheduler.setPaused(!usageScheduler.isPaused()); },
     },
     { type: "separator" },
     { label: "退出", click: () => { quitting = true; app.quit(); } },
@@ -280,15 +318,90 @@ function focusSettingsUpdate() {
   } catch { /* 无窗口就算了 */ }
 }
 
-function refreshTrayMenu() {
-  if (tray) tray.setContextMenu(buildTrayMenu());
+// ===== 托盘弹出面板（iStat 风格信息面板：左键弹出、失焦隐藏；右键才是操作菜单） =====
+
+let trayPanel = null;
+
+function createTrayPanel() {
+  trayPanel = new BrowserWindow({
+    width: 380,
+    height: 540,
+    show: false,
+    frame: false,
+    resizable: false,
+    // 注意：不能设 movable:false——macOS 上会连程序化 setPosition 一起禁用，
+    // 导致面板回落到屏幕居中（必须跟随托盘图标）
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    // 透明窗口 + CSS 实色圆角卡片：贴出 iStat 式悬浮面板；纯 CSS 跟随系统深浅色
+    transparent: true,
+    hasShadow: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  trayPanel.setAlwaysOnTop(true, "pop-up-menu");
+  // blur 延时确认：show()/focus() 竞态瞬间可能误报失焦，200ms 后仍未聚焦才隐藏
+  trayPanel.on("blur", () => {
+    if (!trayPanel || !trayPanel.isVisible()) return;
+    setTimeout(() => {
+      if (trayPanel && trayPanel.isVisible() && !trayPanel.isFocused()) trayPanel.hide();
+    }, 200);
+  });
+  trayPanel.on("closed", () => { trayPanel = null; });
+  if (app.isPackaged) {
+    trayPanel.loadFile(path.join(__dirname, "..", "dist", "tray.html"));
+  } else {
+    trayPanel.loadURL(`${DEV_URL}/tray.html`);
+  }
 }
 
+/** 面板定位到托盘图标附近：mac 菜单栏在下、Windows 托盘在上，水平夹在可视区内 */
+function positionTrayPanel() {
+  if (!tray || !trayPanel) return;
+  try {
+    const tb = tray.getBounds();
+    const wb = trayPanel.getBounds();
+    const work = screen.getPrimaryDisplay().workArea;
+    let x = Math.round(tb.x + tb.width / 2 - wb.width / 2);
+    x = Math.max(work.x + 8, Math.min(x, work.x + work.width - wb.width - 8));
+    const below = tb.y <= work.y + work.height / 2;
+    const y = below ? tb.y + tb.height + 6 : tb.y - wb.height - 6;
+    trayPanel.setPosition(x, y, false);
+  } catch { /* 定位失败用系统默认位置 */ }
+}
+
+function toggleTrayPanel() {
+  if (!trayPanel) return;
+  if (trayPanel.isVisible()) {
+    trayPanel.hide();
+    return;
+  }
+  positionTrayPanel();
+  trayPanel.show();
+  // 透明窗口首次显示偶发位置重置，显示后再校准一次
+  positionTrayPanel();
+  trayPanel.focus();
+}
+
+function showTrayMenu() {
+  if (tray) tray.popUpContextMenu(buildTrayMenu());
+}
+
+/** 菜单已改为右键时动态构建（数据即时最新），无需预刷新；
+ *  保留函数作为 updater/通知的刷新挂点，避免散落的调用点失效 */
+function refreshTrayMenu() { /* no-op：保留挂点 */ }
+
 function createTray() {
-  const icon = iconPath("tray.png");
-  tray = new Tray(icon.isEmpty() ? iconPath("icon.png") : icon);
+  tray = new Tray(trayIcon());
   tray.setToolTip("AgentHub · Agent中控台");
-  refreshTrayMenu();
+  tray.setIgnoreDoubleClickEvents(true);
+  tray.on("click", toggleTrayPanel);
+  tray.on("right-click", showTrayMenu);
   tray.on("double-click", showWindow);
 }
 
@@ -401,6 +514,13 @@ if (!gotLock) {
     memory.boot().catch(() => {});
     createWindow();
     createTray();
+    createTrayPanel();
+    // 托盘面板「打开主界面」按钮：显示并聚焦主窗口
+    ipcMain.handle("open_main_window", () => { showWindow(); });
+    // Dock 图标换标准边距版本（仅 macOS；仅运行期覆盖，不改 icns 本体）
+    if (process.platform === "darwin" && app.dock) {
+      try { app.dock.setIcon(dockIcon()); } catch { /* 旧系统无 dock API */ }
+    }
     scheduler.start();
     usageScheduler.start();
     watch.start();

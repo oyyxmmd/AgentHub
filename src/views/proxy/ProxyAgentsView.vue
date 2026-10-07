@@ -342,7 +342,29 @@ async function runGrowthAll() {
 }
 
 // ===== 任务日志弹窗：主进程落盘的积分任务执行记录（手动 + 自动调度都记，新的在前） =====
-const GROWTH_LABELS: Record<string, string> = { travel: "猫猫旅行", cat: "夜猫子", activity: "活跃地图", school: "开学季" };
+const GROWTH_LABELS: Record<string, string> = { checkin: "每日签到", travel: "猫猫旅行", cat: "夜猫子", activity: "活跃地图", school: "开学季" };
+
+/** 每日自动签到快捷开关（全局总开关，所有渠道共用）：切换即存，60s 内调度 tick 感知 */
+const autoToggling = ref(false);
+async function toggleCheckinAuto() {
+  if (autoToggling.value) return;
+  autoToggling.value = true;
+  try {
+    app.config.proxy.checkinAuto = !app.config.proxy.checkinAuto;
+    const r = await app.save();
+    if (r && r.ok === false) {
+      app.config.proxy.checkinAuto = !app.config.proxy.checkinAuto;
+      toast(`保存失败：${r.message || "未知错误"}`, "err");
+    } else {
+      toast(app.config.proxy.checkinAuto ? "每日自动签到已开启：每天到点自动为所有渠道签到" : "每日自动签到已关闭", "info");
+    }
+  } catch (e) {
+    app.config.proxy.checkinAuto = !app.config.proxy.checkinAuto;
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    autoToggling.value = false;
+  }
+}
 const logOpen = ref(false);
 const logBusy = ref(false);
 const logRows = ref<ProxyGrowthLogEntry[]>([]);
@@ -1063,12 +1085,20 @@ onUnmounted(() => {
             <button v-else-if="ch.id !== 'zcode'" class="btn btn-sm" :disabled="checkinBusy" @click="runCheckinChannel">
               {{ checkinBusy ? "签到中…" : "一键签到" }}
             </button>
+            <el-tooltip content="每日自动签到快捷开关（全局）：开启后每天到点自动为所有渠道签到，执行记录见「任务日志」；时间在 设置→同步时间 调整" placement="top">
+              <button
+                class="btn btn-sm"
+                :class="app.config.proxy.checkinAuto ? 'btn-primary' : ''"
+                :disabled="autoToggling"
+                @click="toggleCheckinAuto"
+              >{{ app.config.proxy.checkinAuto ? "自动开" : "自动关" }}</button>
+            </el-tooltip>
             <el-tooltip v-if="ch.id === 'workbuddy'" content="自动跑全部中国区账号的成长任务：猫猫旅行 / 夜猫子 / 活跃地图 / 开学季（已领过的幂等跳过；夜猫子仅在 23:00~08:00 窗口可领）" placement="top">
               <button class="btn btn-sm" :disabled="growthBusy" @click="runGrowthAll">
                 {{ growthBusy ? "任务中…" : "积分任务" }}
               </button>
             </el-tooltip>
-            <el-tooltip v-if="ch.id === 'workbuddy'" content="查看积分任务的执行记录：手动执行与 15 分钟自动调度都会记录（落盘持久化，重启不丢）" placement="top">
+            <el-tooltip v-if="ch.id === 'workbuddy' || ch.id === 'trae'" content="查看签到与积分任务的执行记录：手动执行与定时调度都会记录，含每次获得的积分（落盘持久化，重启不丢）" placement="top">
               <button class="btn btn-sm" @click="openGrowthLog">任务日志</button>
             </el-tooltip>
             <el-tooltip v-if="ch.id === 'zcode'" content="设备指纹（deviceMid）诊断与修复：多账号共用同一枚指纹时，一个账号领取周末套餐会把全组账号的当周资格烧掉（服务端提示「不符合领取条件」/1004）。修复即给这些账号重派全新随机指纹" placement="top">
@@ -1551,6 +1581,7 @@ onUnmounted(() => {
                   <div class="checkin-name">
                     {{ r.name || r.uid }}
                     <span class="tag" :class="growthLogTagCls(r)">{{ growthLogTagText(r) }}</span>
+                    <span v-if="(r.reward || 0) > 0" class="tag tag-ok">+{{ r.reward }} 积分</span>
                   </div>
                   <span class="checkin-msg">{{ r.message || "" }}</span>
                 </div>

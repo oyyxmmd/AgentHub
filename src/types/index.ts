@@ -659,11 +659,11 @@ export interface ProxyGrowthRow {
   message?: string;
 }
 
-/** 积分任务执行日志条目（proxy_growth_log 返回；手动与自动调度共用，环形 300 条落盘持久化） */
+/** 积分任务/每日签到执行日志条目（proxy_growth_log 返回；手动与自动调度共用，环形 300 条落盘持久化） */
 export interface ProxyGrowthLogEntry {
   ts: number;
-  action: "travel" | "cat" | "activity" | "school";
-  /** auto = 15 分钟定时调度 | manual = 号池页手动点击 */
+  action: "checkin" | "travel" | "cat" | "activity" | "school";
+  /** auto = 定时调度（签到每日定时 / 积分任务 15 分钟轮询）| manual = 号池页手动点击 */
   trigger: "auto" | "manual";
   total: number;
   okCount: number;
@@ -674,6 +674,8 @@ export interface ProxyGrowthLogEntry {
     result?: string;
     state?: string;
     claimed?: boolean;
+    /** 本次执行获得的积分（签到/旅行等有数值的任务；0 = 无数值或未领取） */
+    reward?: number;
     message?: string;
   }[];
 }

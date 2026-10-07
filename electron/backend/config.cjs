@@ -164,7 +164,7 @@ function defaultConfig() {
       channelFailoverMax: 3,    // 单请求最多尝试渠道数（含主渠道，每模型 6 次上游尝试预算）
       channelCooldownMs: 120000,     // 渠道降级基础时长（毫秒），失败翻倍（防半开震荡）
       channelCooldownCapMs: 900000,  // 渠道降级指数退避封顶（15 分钟）
-      checkinAuto: false,       // 定时自动签到（默认关）：每天到点自动跑全渠道签到/领加油包
+      checkinAuto: true,        // 定时自动签到（默认开）：每天到点自动跑全渠道签到/领加油包
       checkinAutoTime: "09:00", // 每日自动签到时间（HH:mm）
       growthTravelAuto: true,   // 积分任务·猫猫旅行自动派/领（仅 WB CN，15 分钟轮询状态机）
       growthCatAuto: true,      // 积分任务·夜猫子自动领（仅 WB CN，23:00~08:00 窗口）

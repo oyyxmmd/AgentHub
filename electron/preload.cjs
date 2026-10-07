@@ -150,6 +150,7 @@ const ALLOWED_COMMANDS = new Set([
   "proxy_zcode_claim_mode",
   "proxy_zcode_restore_mid",
   "proxy_stats_overview",
+  "open_main_window",
   "proxy_stats_top",
   "proxy_stats_detail",
   "proxy_recent",

@@ -149,9 +149,10 @@ let booted = false;
 
 // ===== 签到（Trae ug 签到 / WB 双区 daily-checkin / WB AI trial 加油包，参考项目实证端点） =====
 /** 批量签到动作：channel 为空 = 全渠道；accountId 指定 = 单账号（OAuth 登录后自动签到用）。
- *  国际版没有每日签到体系，checkin 动作对它自动改走 trial 加油包（与号池页按钮行为一致） */
+ *  国际版没有每日签到体系，checkin 动作对它自动改走 trial 加油包（与号池页按钮行为一致）。
+ *  trigger：manual（号池页手动）/ auto（每日定时）——仅用于执行日志标注 */
 let checkinBusy = false;
-async function checkinBatch({ channel, accountId, action, interactive }) {
+async function checkinBatch({ channel, accountId, action, interactive, trigger }) {
   const acts = ["status", "checkin", "trial"];
   const act = acts.includes(String(action)) ? String(action) : "checkin";
   if (checkinBusy && act !== "status") return { ok: false, action: act, total: 0, okCount: 0, rows: [], message: "签到进行中" };
@@ -205,6 +206,26 @@ async function checkinBatch({ channel, accountId, action, interactive }) {
       }
     }
     const okCount = rows.filter((r) => r.ok).length;
+    // 签到执行日志（与积分任务日志同一条环形落盘通道）：Trae 记今日获得积分，
+    // WB 记本次 credit，travel 系任务行已有 rewardCredit——统一折算成 reward 供 UI 展示
+    if (act !== "status") {
+      growthLogPush({
+        ts: Date.now(),
+        action: "checkin",
+        trigger: trigger === "auto" ? "auto" : "manual",
+        total: rows.length,
+        okCount,
+        rows: rows.map((x) => ({
+          name: x.name,
+          uid: x.uid,
+          ok: !!x.ok,
+          result: x.deferred ? "deferred" : x.unavailable ? "unavailable" : x.needCaptcha ? "captcha" : x.already ? "already" : x.ok ? "claimed" : "error",
+          claimed: !!(x.ok && !x.already && !x.unavailable && !x.deferred),
+          reward: Number(x.credit || x.rewardCredit || (x.status && x.status.creditsEarnedToday) || 0) || 0,
+          message: x.message || "",
+        })),
+      });
+    }
     // 只有真正改了状态的 checkin/trial 才广播：status 是纯读取。广播它会让「收到 credits 就刷新」
     // 的号池页被自己触发的刷新再次唤醒，形成约 1.2 秒一轮的自激刷新循环（每轮还白打一次上游接口）
     if (act !== "status") events.emit({ type: "credits" });
@@ -238,7 +259,7 @@ function checkinAutoTick() {
     if (lastAutoCheckinDay === day) return;
     if (Date.now() < autoDeferredUntil) return;
     lastAutoCheckinDay = day;
-    checkinBatch({ action: "checkin" }).then((res) => {
+    checkinBatch({ action: "checkin", trigger: "auto" }).then((res) => {
       // deferred：撤销当天标记并记录重试时刻——60s tick 到点自会重跑并真正完成签到
       if (res && res.deferredRetryAt && res.deferredRetryAt > Date.now()) {
         lastAutoCheckinDay = "";
@@ -291,6 +312,51 @@ function growthLogPush(entry) {
   } catch { /* 落盘失败不影响任务执行 */ }
 }
 
+/** 托盘聚合摘要：账号积分 / 今日各任务最近执行 / 当前 IDE 节点。
+ *  各段独立兜底（库未就绪/无日志/未切节点都不抛错），托盘菜单每次打开时调用 */
+function traySummary() {
+  const day = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  let accounts = [];
+  try {
+    const chans = new Map(store.CHANNELS.map((c) => [c.id, c.display]));
+    accounts = store
+      .listAccounts()
+      .filter((a) => a.hasToken && a.status !== "disabled")
+      .map((a) => ({
+        uid: a.uid || "",
+        name: a.name || a.uid || "",
+        channel: chans.get(a.channel) || a.channel,
+        credits: Number(a.credits) || 0,
+      }))
+      .sort((x, y) => y.credits - x.credits);
+  } catch { /* 号池库未就绪 */ }
+  const tasks = {};
+  try {
+    for (const e of growthLog) {
+      const dt = new Date(e.ts);
+      const ds = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+      if (ds !== day || tasks[e.action]) continue; // growthLog 新在前：首遇即当日最新
+      tasks[e.action] = {
+        ok: e.okCount,
+        total: e.total,
+        at: `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`,
+      };
+    }
+  } catch { /* 无执行日志 */ }
+  let node = "";
+  try {
+    const st = ideswitch.ideSwitchStatus();
+    if (st && st.currentUid) {
+      const acc = accounts.find((a) => a.uid === st.currentUid);
+      node = acc ? `${acc.name}（${acc.channel}）` : st.currentUid;
+    }
+  } catch { /* IDE 切换状态不可用 */ }
+  return { accounts, tasks, node };
+}
+
 let growthBusy = false;
 async function growthBatch({ accountId, action, trigger }) {
   const act = ["travel", "cat", "activity", "school"].includes(String(action)) ? String(action) : "";
@@ -339,7 +405,7 @@ async function growthBatch({ accountId, action, trigger }) {
       trigger: trigger === "auto" ? "auto" : "manual",
       total: res.total,
       okCount: res.okCount,
-      rows: rows.map(({ name, uid, ok, result, state, claimed, message }) => ({ name, uid, ok, result, state, claimed, message })),
+      rows: rows.map(({ name, uid, ok, result, state, claimed, message, credit, rewardCredit }) => ({ name, uid, ok, result, state, claimed, reward: Number(credit || rewardCredit || 0) || 0, message })),
     });
     return res;
   } finally {
@@ -948,4 +1014,4 @@ function register(ipcMain) {
   ipcMain.handle("proxy_poolsync_cancel", handle(() => poolsync.cancel()));
 }
 
-module.exports = { boot, shutdown, register, settings };
+module.exports = { boot, shutdown, register, settings, traySummary };

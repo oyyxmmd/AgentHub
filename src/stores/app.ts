@@ -38,7 +38,7 @@ const defaultConfig: AppConfig = {
     modelReverseAliases: {},
     modelCustom: {},
     autoFallbackEnabled: true,
-    checkinAuto: false,
+    checkinAuto: true,
     checkinAutoTime: "09:00",
     growthTravelAuto: true,
     growthCatAuto: true,
