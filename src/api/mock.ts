@@ -7,11 +7,20 @@ const KEY = "agenthub-config";
 const PREVIEW_NOTE = "（浏览器预览 mock 数据，桌面端才真实生效）";
 const NOW = Date.now();
 const ago = (minutes: number) => new Date(NOW - minutes * 60000).toISOString();
+/** 本地时区的今天（YYYY-MM-DD）：与后端 store.dayStr 同口径，签到记录的跨天判定用 */
+const TODAY = (() => {
+  const d = new Date(NOW);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+})();
 
 function defaultConfig(): AppConfig {
   return {
     theme: "dark",
-    fx: false,
+    fx: true,
+    fxParticles: false,
+    fxPools: false,
+    fxCursor: true,
     moduleOrder: MODULES.map((m) => m.key),
     tools: {
       zcode: { enabled: true, paths: [".zcode/skills"] },
@@ -43,6 +52,7 @@ function defaultConfig(): AppConfig {
       restoreOnLaunch: false,
       routeStrategy: "smart",
       fixedChannel: "trae",
+      routeOrder: "score",
       rateLimitPerMin: 120,
       concurrency: 8,
       creditsRefreshMin: 30,
@@ -61,8 +71,10 @@ function defaultConfig(): AppConfig {
       channelCooldownMs: 120000,
       channelCooldownCapMs: 900000,
       ccSwitchModel: "",
+      channelEnabled: {},
       checkinAuto: false,
       checkinAutoTime: "09:00",
+      checkinAutoRules: {},
       growthTravelAuto: true,
       growthCatAuto: true,
       growthActivityAuto: true,
@@ -230,52 +242,79 @@ const REPORT_TEXT = "# 技能仓库同步报告\n\n- 设备：DESK-01\n- 下载 
 // ===== 反代网关样例数据（浏览器预览；桌面端数据来自主进程 SQLite） =====
 
 const PROXY_KEYS = [
-  { id: "k1", name: "本地主 Key", mask: "sk-9f2c···d41a", secret: "sk-9f2c1e5b8a4d47c2b6f0e3d1a9c87b52e4f6a0d3c1b2a4e6", route: "auto", dailyQuota: 2000, rateLimit: 0, enabled: true, createdAt: NOW - 12 * 86400000, todayReq: 612, todayTokens: 148200 },
-  { id: "k2", name: "Trae 专用", mask: "sk-31bc···77e0", secret: "sk-31bc74f0d9e2a6c8b1d3f5a7c9e1b2d4f6a8c0e2b4d6f8a1", route: "trae", dailyQuota: 1000, rateLimit: 0, enabled: true, createdAt: NOW - 9 * 86400000, todayReq: 403, todayTokens: 96400 },
-  { id: "k3", name: "WorkBuddy 专用", mask: "sk-d07e···a2c9", secret: "sk-d07e2b8d4f6a9c1e3b5d7f9a2c4e6b8d0f2a4c6e8b1d3f5a", route: "workbuddy", dailyQuota: 800, rateLimit: 60, enabled: true, createdAt: NOW - 5 * 86400000, todayReq: 269, todayTokens: 67800 },
+  { id: "k1", name: "本地主 Key", mask: "sk-9f2c···d41a", secret: "sk-9f2c1e5b8a4d47c2b6f0e3d1a9c87b52e4f6a0d3c1b2a4e6", route: "auto", routeOrder: "", dailyQuota: 2000, rateLimit: 0, enabled: true, createdAt: NOW - 12 * 86400000, todayReq: 612, todayTokens: 148200 },
+  { id: "k2", name: "Trae 专用", mask: "sk-31bc···77e0", secret: "sk-31bc74f0d9e2a6c8b1d3f5a7c9e1b2d4f6a8c0e2b4d6f8a1", route: "trae", routeOrder: "", dailyQuota: 1000, rateLimit: 0, enabled: true, createdAt: NOW - 9 * 86400000, todayReq: 403, todayTokens: 96400 },
+  { id: "k3", name: "WorkBuddy 专用", mask: "sk-d07e···a2c9", secret: "sk-d07e2b8d4f6a9c1e3b5d7f9a2c4e6b8d0f2a4c6e8b1d3f5a", route: "workbuddy", routeOrder: "", dailyQuota: 800, rateLimit: 60, enabled: true, createdAt: NOW - 5 * 86400000, todayReq: 269, todayTokens: 67800 },
   // 旧版本创建的 Key（无加密存档）：列表不带 secret，不能反查完整 Key
-  { id: "k4", name: "旧测试 Key", mask: "sk-4419···0b3f", secret: "", route: "auto", dailyQuota: 100, rateLimit: 0, enabled: false, createdAt: NOW - 30 * 86400000, todayReq: 0, todayTokens: 0 },
+  { id: "k4", name: "旧测试 Key", mask: "sk-4419···0b3f", secret: "", route: "auto", routeOrder: "", dailyQuota: 100, rateLimit: 0, enabled: false, createdAt: NOW - 30 * 86400000, todayReq: 0, todayTokens: 0 },
 ];
 
 const PROXY_POOL = [
   {
-    id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", poolStrategy: "expire_first",
+    id: "trae", display: "Trae SOLO CN", domain: "api.trae.cn", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: true, time: "08:30", jitterMin: 15 },
     summary: { channel: "trae", totalCredits: 72480, accountCount: 2, onlineCount: 2, earliestExpire: NOW + 48 * 86400000, expiringSoon: false, todayReq: 412, todayTokens: 96400, lastCreditsAt: ago(25) },
     accounts: [
-      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: ago(25), expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(3), todayReq: 301, todayTokens: 70200, createdAt: NOW - 20 * 86400000, hasToken: true },
-      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: ago(25), expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(40), todayReq: 111, todayTokens: 26200, createdAt: NOW - 6 * 86400000, hasToken: true },
+      // 今日已签到（行内按钮"已签到"态；点开看今日详情）
+      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: ago(25), expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(3), todayReq: 301, todayTokens: 70200, createdAt: NOW - 20 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 3600000, action: "checkin", ok: true, credit: 100, streakDays: 5, message: "签到成功" } },
+      // 今日签到失败（行内按钮"签到失败"态；点开看失败原因）
+      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: ago(25), expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(40), todayReq: 111, todayTokens: 26200, createdAt: NOW - 6 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 3000000, action: "checkin", ok: false, message: "上游 429：签到请求过于频繁，请稍后重试" } },
     ],
   },
   {
-    id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com", poolStrategy: "credit_first",
+    id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com", costTier: "", poolStrategy: "credit_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: ago(40) },
     accounts: [
-      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: ago(40), expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: ago(8), todayReq: 203, todayTokens: 41200, createdAt: NOW - 15 * 86400000, hasToken: true },
-      { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: ago(300), expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: ago(55), todayReq: 0, todayTokens: 0, createdAt: NOW - 15 * 86400000, hasToken: true },
+      // 该渠道今日已全部签完（工具栏按钮应显示"签到成功"完成态）
+      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: ago(40), expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: ago(8), todayReq: 203, todayTokens: 41200, createdAt: NOW - 15 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 4000000, action: "checkin", ok: true, already: true, streakDays: 12, message: "今日已签到" } },
+      { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: ago(300), expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: ago(55), todayReq: 0, todayTokens: 0, createdAt: NOW - 15 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 4000000, action: "checkin", ok: true, credit: 50, streakDays: 3, message: "签到成功" } },
     ],
   },
   {
-    id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai", poolStrategy: "expire_first",
+    id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: ago(70) },
     accounts: [
-      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: ago(70), expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(30), todayReq: 66, todayTokens: 14800, createdAt: NOW - 4 * 86400000, hasToken: true },
+      // 一次性加油包已领（行内按钮应显示"已领取"）
+      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: ago(70), expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(30), todayReq: 66, todayTokens: 14800, createdAt: NOW - 4 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 5000000, action: "trial", ok: true, already: true, credit: 500, message: "加油包已领取" } },
     ],
   },
   {
-    id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", poolStrategy: "expire_first",
+    id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "raccoon", totalCredits: 9800, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 29 * 86400000, expiringSoon: true, todayReq: 18, todayTokens: 5200, lastCreditsAt: ago(12) },
     accounts: [
       { id: "a6", channel: "raccoon", uid: "rc_88213", name: "小浣熊 1 号", status: "online", credits: 9800, creditsAt: ago(12), expiresAt: NOW + 29 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: ago(9), todayReq: 18, todayTokens: 5200, createdAt: NOW - 3 * 86400000, hasToken: true },
     ],
   },
   {
-    id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", poolStrategy: "expire_first",
+    id: "modelscope", display: "ModelScope（魔搭）", domain: "api-inference.modelscope.cn", costTier: "free", poolStrategy: "credit_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "modelscope", totalCredits: 341, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 86400000, expiringSoon: true, todayReq: 5, todayTokens: 1200, lastCreditsAt: ago(2) },
+    accounts: [
+      { id: "a9", channel: "modelscope", uid: "demo-user", name: "魔搭主号", status: "online", credits: 341, creditsAt: ago(2), expiresAt: NOW + 86400000, coolUntil: 0, coolReason: "", source: "token", lastUsed: ago(1), todayReq: 5, todayTokens: 1200, createdAt: NOW - 86400000, hasToken: true },
+    ],
+  },
+  {
+    id: "lobster", display: "LobsterAI（有道）", domain: "lobsterai-server.youdao.com", costTier: "low", poolStrategy: "credit_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "lobster", totalCredits: 300, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 14 * 86400000, expiringSoon: true, todayReq: 6, todayTokens: 1800, lastCreditsAt: ago(4) },
+    accounts: [
+      { id: "a8", channel: "lobster", uid: "lb_20481", name: "龙虾主号", status: "online", credits: 300, creditsAt: ago(4), expiresAt: NOW + 14 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(3), todayReq: 6, todayTokens: 1800, createdAt: NOW - 2 * 86400000, hasToken: true },
+    ],
+  },
+  {
+    id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai", costTier: "", poolStrategy: "expire_first",
     // 演示降级态：浏览器预览里能看到渠道卡降级徽标与回切倒计时的样式
     health: { until: NOW + 95_000, reason: "上游 5xx，流量已走其他渠道", streak: 1 } as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "zcode", totalCredits: 150000000, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 90 * 86400000, expiringSoon: false, todayReq: 12, todayTokens: 250000, lastCreditsAt: ago(10) },
     accounts: [
       { id: "a7", channel: "zcode", uid: "zc_1001", name: "智谱主号", status: "online", credits: 150000000, creditsAt: ago(10), expiresAt: NOW + 90 * 86400000, coolUntil: 0, coolReason: "", source: "json", lastUsed: ago(5), todayReq: 12, todayTokens: 250000, createdAt: NOW - 5 * 86400000, hasToken: true },
@@ -283,19 +322,32 @@ const PROXY_POOL = [
   },
   {
     // Qoder 双区：credits 用浮点演示（整数化会丢计量，见 format.ts fmtCredits）
-    id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn", poolStrategy: "expire_first",
+    id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "qoder", totalCredits: 199.9934, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 9, todayTokens: 48200, lastCreditsAt: ago(6) },
     accounts: [
       { id: "a8", channel: "qoder", uid: "qd_3001", name: "Qoder 主号", status: "online", credits: 199.9934, creditsAt: ago(6), expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: ago(4), todayReq: 9, todayTokens: 48200, createdAt: NOW - 2 * 86400000, hasToken: true },
     ],
   },
   {
-    id: "qoder_intl", display: "Qoder International", domain: "api2.qoder.sh", poolStrategy: "expire_first",
+    id: "qoder_intl", display: "Qoder International", domain: "api2.qoder.sh", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
     summary: { channel: "qoder_intl", totalCredits: 0.0066, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 1, todayTokens: 2100, lastCreditsAt: ago(30) },
     accounts: [
-      { id: "a9", channel: "qoder_intl", uid: "qd_2001", name: "Qoder INTL", status: "online", credits: 0.0066, creditsAt: ago(30), expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(30), todayReq: 1, todayTokens: 2100, createdAt: NOW - 86400000, hasToken: true },
+      // 服务不开放（unavailable）：行内按钮应显示「不开放」而不是「已领取」
+      { id: "a9", channel: "qoder_intl", uid: "qd_2001", name: "Qoder INTL", status: "online", credits: 0.0066, creditsAt: ago(30), expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(30), todayReq: 1, todayTokens: 2100, createdAt: NOW - 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 6000000, action: "checkin", ok: true, unavailable: true, message: "该账号的服务未开放" } },
+    ],
+  },
+  {
+    // CatPaw（美团）：凭据取自桌面端登录态（meta.desktop），演示里给一条导入来源为 scan 的账号
+    id: "catpaw", display: "CatPaw（美团）", domain: "ai.catpaw.meituan.com", costTier: "", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "catpaw", totalCredits: 8600, accountCount: 1, onlineCount: 1, earliestExpire: 0, expiringSoon: false, todayReq: 24, todayTokens: 62400, lastCreditsAt: ago(8) },
+    accounts: [
+      { id: "a10", channel: "catpaw", uid: "cp_57130", name: "猫爪主号", status: "online", credits: 8600, creditsAt: ago(8), expiresAt: 0, coolUntil: 0, coolReason: "", source: "scan", lastUsed: ago(2), todayReq: 24, todayTokens: 62400, createdAt: NOW - 3 * 86400000, hasToken: true },
     ],
   },
 ];
@@ -321,6 +373,8 @@ const PROXY_MODELS = [
   { id: "gpt-5", object: "model", created: 0, owned_by: "workbuddy", sources: ["workbuddy", "workbuddy_ai"], name: "GPT-5", rate: 0.5, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 32000, enabled: true, override: "", fallback: "" },
   { id: "gemini-2.5-pro", object: "model", created: 0, owned_by: "workbuddy_ai", sources: ["workbuddy_ai"], name: "Gemini 2.5 Pro", rate: 0.05, capabilities: { images: true, tools: true }, contextLength: 1000000, maxOutputTokens: 64000, enabled: false, override: "", fallback: "" },
   { id: "raccoon-chat-ml-5-5", object: "model", created: 0, owned_by: "raccoon", sources: ["raccoon"], name: "Raccoon Chat ML 5.5", rate: null, capabilities: { reasoning: true, tools: true }, contextLength: 180000, maxOutputTokens: 80000, enabled: true, override: "", fallback: "" },
+  { id: "glm-5.3-flash", object: "model", created: 0, owned_by: "catpaw", sources: ["catpaw"], name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1024000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  { id: "kimi-k3", object: "model", created: 0, owned_by: "catpaw", sources: ["catpaw"], name: "Kimi-K3", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
 ];
 
 const PROXY_RULES = [
@@ -375,19 +429,43 @@ const MOCK_AUTO = {
     { id: "summarize", name: "生成摘要", needsModel: true, estimate: "每批 20 条约 600 token", enabled: false, intervalMin: 30, daily: null, weekly: null, weeklyTime: null, batchSize: 20, thresholdCount: null, lastAt: 0, nextAt: NOW + 1800000, successRate: null, runs: 0, tokens: 0 },
     { id: "tag", name: "自动打标签", needsModel: true, estimate: "每批 20 条约 400 token", enabled: false, intervalMin: 30, daily: null, weekly: null, weeklyTime: null, batchSize: 20, thresholdCount: null, lastAt: 0, nextAt: NOW + 1800000, successRate: null, runs: 0, tokens: 0 },
     { id: "classify", name: "项目归类建议", needsModel: false, estimate: "0（本地算法）", enabled: true, intervalMin: 60, daily: null, weekly: null, weeklyTime: null, batchSize: null, thresholdCount: null, lastAt: NOW - 180000, nextAt: NOW + 3420000, successRate: 100, runs: 31, tokens: 0 },
-    { id: "supersede", name: "失效判定", needsModel: true, estimate: "每组约 1,500 token", enabled: false, daily: "23:00", weekly: null, weeklyTime: null, batchSize: null, thresholdCount: null, lastAt: 0, nextAt: NOW + 43200000, successRate: null, runs: 0, tokens: 0 },
-    { id: "distill", name: "L2 蒸馏", needsModel: true, estimate: "每项目约 3,000 token", enabled: false, daily: "23:30", weekly: null, weeklyTime: null, batchSize: null, thresholdCount: null, lastAt: 0, nextAt: NOW + 46800000, successRate: null, runs: 0, tokens: 0 },
-    { id: "consolidate", name: "去重合并", needsModel: true, estimate: "每轮约 5,000 token", enabled: false, daily: null, weekly: 0, weeklyTime: "02:00", batchSize: null, thresholdCount: null, lastAt: 0, nextAt: NOW + 172800000, successRate: null, runs: 0, tokens: 0 },
-    { id: "profile", name: "人格 / 偏好画像", needsModel: true, estimate: "每次约 8,000 token", enabled: false, daily: null, weekly: 0, weeklyTime: "03:00", batchSize: null, thresholdCount: null, lastAt: 0, nextAt: NOW + 176400000, successRate: null, runs: 0, tokens: 0 },
+    { id: "supersede", name: "失效判定", needsModel: true, estimate: "每组约 1,500 token", enabled: false, daily: "11:00", weekly: null, weeklyTime: null, batchSize: null, thresholdCount: null, lastAt: 0, nextAt: NOW + 43200000, successRate: null, runs: 0, tokens: 0 },
+    { id: "distill", name: "L2 蒸馏", needsModel: true, estimate: "每项目约 3,000 token", enabled: false, daily: "11:10", weekly: null, weeklyTime: null, batchSize: null, thresholdCount: null, lastAt: 0, nextAt: NOW + 46800000, successRate: null, runs: 0, tokens: 0 },
+    { id: "consolidate", name: "去重合并", needsModel: true, estimate: "每轮约 5,000 token", enabled: false, daily: null, weekly: 1, weeklyTime: "11:00", batchSize: null, thresholdCount: null, lastAt: 0, nextAt: NOW + 172800000, successRate: null, runs: 0, tokens: 0 },
+    { id: "profile", name: "人格 / 偏好画像", needsModel: true, estimate: "每次约 8,000 token", enabled: false, daily: null, weekly: 1, weeklyTime: "11:10", batchSize: null, thresholdCount: null, lastAt: 0, nextAt: NOW + 176400000, successRate: null, runs: 0, tokens: 0 },
     { id: "index-scan", name: "索引自愈扫描", needsModel: false, estimate: "0（本地扫描）", enabled: true, intervalMin: 360, daily: null, weekly: null, weeklyTime: null, batchSize: null, thresholdCount: null, lastAt: NOW - 3600000, nextAt: NOW + 18000000, successRate: 100, runs: 8, tokens: 0 },
+    // 与真实 TASK_DEFS 对齐：清理任务每天 11:20（2026-10-08 起随默认时间迁移进入 11~12 点档）
+    { id: "cleanup", name: "异常记忆清理", needsModel: false, estimate: "0（本地扫描）", enabled: true, intervalMin: null, daily: "11:20", weekly: null, weeklyTime: null, batchSize: null, thresholdCount: null, lastAt: NOW - 7200000, nextAt: NOW + 28800000, successRate: 100, runs: 12, tokens: 0 },
   ] as Record<string, unknown>[],
 };
+
+/** 预览模式的出厂节奏快照（加载时定格）：task_save 改写 MOCK_AUTO.tasks 后，
+    「恢复默认时间」按钮仍要拿得到初始节奏 —— 与真实后端 status.tasks[].default 同构 */
+const MOCK_TASK_DEFAULT_RHYTHM: Record<string, Record<string, unknown>> = {};
+for (const t of MOCK_AUTO.tasks) {
+  MOCK_TASK_DEFAULT_RHYTHM[String(t.id)] = { intervalMin: (t.intervalMin as number | null) ?? null, daily: (t.daily as string | null) ?? null, weekly: (t.weekly as number | null) ?? null, weeklyTime: (t.weeklyTime as string | null) ?? null };
+}
+
+/** 预览模式的模型池（可变）：行内开关要真的拨得动，探针才能断言状态翻转 */
+const MOCK_MODELS: Record<string, unknown>[] = [
+  { id: "m1", providerId: "gw-local", modelId: "gpt-4o-mini", displayName: "轻量（去重/抽取）", enabled: true, reasoning: { enabled: false, effort: "minimal", customBudget: null }, caps: { vision: true, tools: true, stream: true, jsonMode: true, contextWindow: 128000 }, tags: ["light", "dedup", "extract"], priority: 10, temperature: 0.2, maxTokens: 2048 },
+  { id: "m2", providerId: "gw-local", modelId: "gpt-4o", displayName: "重型（总结/蒸馏）", enabled: true, reasoning: { enabled: true, effort: "medium", customBudget: null }, caps: { vision: true, tools: true, stream: true, jsonMode: true, contextWindow: 128000 }, tags: ["heavy", "distill", "profile"], priority: 20, temperature: 0.2, maxTokens: 4096 },
+  { id: "m3", providerId: "prov_demo", modelId: "claude-3-5-sonnet", displayName: "Sonnet", enabled: true, reasoning: { enabled: true, effort: "high", customBudget: 8192 }, caps: { vision: true, tools: true, stream: true, jsonMode: false, contextWindow: 200000 }, tags: ["heavy", "profile"], priority: 30, temperature: 0.2, maxTokens: 4096 },
+  { id: "m4", providerId: "prov_demo", modelId: "gemini-2.5-flash", displayName: "", enabled: false, reasoning: { enabled: false, effort: "minimal", customBudget: null }, caps: { vision: true, tools: true, stream: true, jsonMode: true, contextWindow: 1000000 }, tags: ["light", "classify"], priority: 40, temperature: 0.2, maxTokens: 2048 },
+];
+/** 预览模式的供应商列表（可变）：行内启用开关点一下要真的变，探针才能断言「开关链路」而非只看静态样例 */
+const MOCK_PROVIDERS: Record<string, unknown>[] = [
+  { id: "prov_demo", name: "我的中转站", kind: "custom", baseUrl: "https://api.example.com", apiFormat: "anthropic_messages", apiKeyMasked: "••••••••sk-4f2a", hasKey: true, enabled: true, note: "", status: "offline", lastCheck: { at: NOW - 3600000, ok: false, latencyMs: 890 }, modelCount: 2, enabledModelCount: 1, isGateway: false },
+  { id: "prov_idle", name: "备用中转", kind: "custom", baseUrl: "https://mirror.example.com", apiFormat: "chat_completions", apiKeyMasked: "", hasKey: false, enabled: false, note: "停用态样例", status: "unknown", lastCheck: null, modelCount: 0, enabledModelCount: 0, isGateway: false },
+];
 
 /** 预览模式的「正在执行」模拟：点任务卡「立即执行」后 4 秒内 status 返回 running。
     顶部进度条 / 百分比数字 / 中文任务名这几样要有东西可显示，探针也才有得断言
     （真实环境由调度器 emit task-progress 事件驱动，这里给一个按时间推进的假快照）。 */
 let MOCK_RUNNING: { id: string; startedAt: number } | null = null;
 const MOCK_RUN_MS = 4000;
+/** 预览模式的排队任务（id 按入队顺序）：当前任务跑完后由 mockRunning 依次接棒 */
+let MOCK_QUEUE: string[] = [];
 
 /** 预览模式的时间线（可变）：任务执行后推入一条记录，进度弹窗结束后才能从时间线取到结果 */
 const MOCK_TIMELINE: Record<string, unknown>[] = [
@@ -398,12 +476,13 @@ const MOCK_TIMELINE: Record<string, unknown>[] = [
 ];
 
 function mockRunning() {
-  if (!MOCK_RUNNING) return null;
-  const elapsed = Date.now() - MOCK_RUNNING.startedAt;
-  if (elapsed > MOCK_RUN_MS) {
-    MOCK_RUNNING = null;
-    return null;
+  // 上一轮跑完（或没有在跑的）：从队列接棒下一个，体现「依次执行」
+  if (!MOCK_RUNNING || Date.now() - MOCK_RUNNING.startedAt > MOCK_RUN_MS) {
+    const next = MOCK_QUEUE.shift();
+    MOCK_RUNNING = next ? { id: next, startedAt: Date.now() } : null;
+    if (!MOCK_RUNNING) return null;
   }
+  const elapsed = Date.now() - MOCK_RUNNING.startedAt;
   const task = MOCK_AUTO.tasks.find((t) => t.id === MOCK_RUNNING!.id);
   return {
     id: MOCK_RUNNING.id,
@@ -606,6 +685,8 @@ export const mock = {
       case "memory_project_confirm":
       case "memory_project_assign":
         return { ok: true, moved: 0 };
+      case "memory_project_attach":
+        return { ok: true, isRepo: true, addedRemotes: ["example/demo-repo"], localPath: "C:/tmp/work/demo-repo" };
       case "memory_project_suggest":
         return { items: [{ id: "rq_1", slug: "HUIdada1--AgentHub", name: "AgentHub", score: 0.79, candidate: "记忆中枢设计", memoryId: MEM_ROWS[1].id, title: MEM_ROWS[1].title, path: MEM_ROWS[1].path }] };
       case "memory_index_status":
@@ -681,10 +762,10 @@ export const mock = {
 
       // ===== 记忆中枢：模型与网关 / 自动化 / 同步 / 去重 / 导入（预览样例） =====
       case "memory_provider_list":
-        // 与真实后端同口径：gw-local 不在此返回，本机网关由 memory_gateway_list 单独下发
-        return { providers: [
-          { id: "prov_demo", name: "我的中转站", kind: "custom", baseUrl: "https://api.example.com", apiFormat: "anthropic_messages", apiKeyMasked: "••••••••sk-4f2a", hasKey: true, enabled: true, note: "", status: "offline", lastCheck: { at: NOW - 3600000, ok: false, latencyMs: 890 }, modelCount: 1, enabledModelCount: 1, isGateway: false },
-        ] };
+        // 与真实后端同口径：gw-local 不在此返回，本机网关由 memory_gateway_list 单独下发。
+        // 浅拷贝是必须的：真实 IPC 走结构化克隆，每次都是新对象；直接返回同一个引用会让渲染层的
+        // ref 赋值判等通过而跳过更新（预览里"点开关没反应"就是这么来的）
+        return { providers: MOCK_PROVIDERS.map((p) => ({ ...p })) };
       case "memory_gateway_list":
         return { gateways: [
           { id: "gw-local", name: "本机网关（AgentHub 反代）", baseUrl: "http://127.0.0.1:9527/v1", available: true, urlOverride: "", modelCount: 2, enabledModelCount: 2, fallbackModel: "gpt-4o-mini" },
@@ -693,6 +774,14 @@ export const mock = {
         return { ok: true, id: String((args?.id as string) || "prov_preview") };
       case "memory_provider_delete":
         return { ok: true, removedModels: 2 };
+      case "memory_provider_toggle": {
+        // 预览模式也要"拨得动"：写回内存列表，下一次 list 读到的就是新值
+        const id = String(args?.id || "");
+        const next = args?.enabled !== false;
+        const row = MOCK_PROVIDERS.find((p) => p.id === id);
+        if (row) row.enabled = next;
+        return { ok: true, enabled: next };
+      }
       case "memory_provider_test":
         return {
           ok: true,
@@ -710,17 +799,19 @@ export const mock = {
       case "memory_provider_quirks":
         return { memo: { prov_demo: { supportsReasoningEffort: false, dropped: { reasoning_effort: true } } }, log: [] };
       case "memory_model_list":
-        return { models: [
-          { id: "m1", providerId: "gw-local", modelId: "gpt-4o-mini", displayName: "轻量（去重/抽取）", enabled: true, reasoning: { enabled: false, effort: "minimal", customBudget: null }, tags: ["light", "dedup", "extract"], priority: 10, temperature: 0.2, maxTokens: 2048 },
-          { id: "m2", providerId: "gw-local", modelId: "gpt-4o", displayName: "重型（总结/蒸馏）", enabled: true, reasoning: { enabled: true, effort: "medium", customBudget: null }, tags: ["heavy", "distill", "profile"], priority: 20, temperature: 0.2, maxTokens: 4096 },
-          { id: "m3", providerId: "prov_demo", modelId: "claude-3-5-sonnet", displayName: "Sonnet", enabled: true, reasoning: { enabled: true, effort: "high", customBudget: 8192 }, tags: ["heavy", "profile"], priority: 30, temperature: 0.2, maxTokens: 4096 },
-        ] };
+        return { models: MOCK_MODELS.map((m) => ({ ...m })) };
       case "memory_model_save":
       case "memory_model_delete":
       case "memory_model_batch":
         return { ok: true, id: "m_preview", changed: 1 };
-      case "memory_model_toggle":
-        return { ok: true, enabled: !!args?.enabled };
+      case "memory_model_toggle": {
+        // 预览模式也真的拨得动（与 provider_toggle 同口径），探针据此断言状态翻转
+        const id = String(args?.id || "");
+        const next = args?.enabled !== false;
+        const row = MOCK_MODELS.find((m) => m.id === id);
+        if (row) row.enabled = next;
+        return { ok: true, enabled: next };
+      }
       case "memory_model_probe":
         return { ok: true, caps: { vision: true, tools: true, stream: true, jsonMode: true, contextWindow: 128000, lastProbe: { at: NOW, ok: true, sample: "ok" } } };
       case "memory_llm_sources":
@@ -749,18 +840,25 @@ export const mock = {
         ], today: { tokens: 12340, calls: 412 } };
       case "memory_auto_status":
         return {
-          enabled: MOCK_AUTO.enabled, paused: MOCK_AUTO.paused, pausedUntil: 0, running: mockRunning(), queue: [],
+          enabled: MOCK_AUTO.enabled, paused: MOCK_AUTO.paused, pausedUntil: 0, running: mockRunning(), queue: [...MOCK_QUEUE],
           todayTokens: 12340, todayCalls: 412, dailyTokenLimit: MOCK_AUTO.dailyTokenLimit, overBudget: false,
           pending: { unprocessed: 137, classified: 3, review: 7, dedup: 14 },
-          tasks: MOCK_AUTO.tasks.map((t) => ({ ...t })),
+          tasks: MOCK_AUTO.tasks.map((t) => ({ ...t, default: MOCK_TASK_DEFAULT_RHYTHM[String(t.id)] || null })),
         };
       case "memory_auto_timeline":
         // 与真实后端一致：条目带中文任务名（name），前端列表直接显示它
         return { entries: MOCK_TIMELINE.slice(0, 50) };
       case "memory_auto_task_run": {
         // 预览模式模拟一段"运行中"（约 4 秒）：顶部「正在执行」卡片的进度条/百分比/中文任务名才有东西可显示；
-        // 同时往时间线推一条记录（at 为预计结束时间），进度弹窗结束后能取到结果
+        // 同时往时间线推一条记录（at 为预计结束时间），进度弹窗结束后能取到结果。
+        // 已有任务在跑时模拟排队：与真实后端一致（入队等当前任务跑完，queue 非空时顶部显示排队链）
         const id = String(args?.id || "extract");
+        if (MOCK_RUNNING && Date.now() - MOCK_RUNNING.startedAt <= MOCK_RUN_MS) {
+          if (!MOCK_QUEUE.includes(id)) MOCK_QUEUE.push(id);
+          const qTask = MOCK_AUTO.tasks.find((t) => t.id === id);
+          MOCK_TIMELINE.unshift({ task: id, name: String(qTask?.name || id), at: Date.now() + MOCK_RUN_MS * (MOCK_QUEUE.length + 1), ok: true, ms: 320, tokens: 0, detail: "（预览模式）任务已执行" });
+          return { ok: true, queued: true, detail: "（预览模式）已加入队列，等当前任务执行完" };
+        }
         MOCK_RUNNING = { id, startedAt: Date.now() };
         const task = MOCK_AUTO.tasks.find((t) => t.id === id);
         MOCK_TIMELINE.unshift({ task: id, name: String(task?.name || id), at: Date.now() + MOCK_RUN_MS, ok: true, ms: 320, tokens: 0, detail: "（预览模式）任务已执行" });
@@ -774,6 +872,7 @@ export const mock = {
         return { ok: true, tasks: MOCK_AUTO.tasks };
       }
       case "memory_auto_cancel":
+        MOCK_QUEUE = []; // 与真实后端一致：取消清空排队（不影响在跑的任务）
         return { ok: true };
       case "memory_auto_pause":
         MOCK_AUTO.paused = !args?.resume;
@@ -862,6 +961,8 @@ export const mock = {
           { id: "claude", name: "Claude Code 会话", kind: "jsonl", path: "C:\\Users\\demo\\.claude\\projects", enabled: true, exists: true, items: 38, sizeBytes: 40960, note: "", estimate: "首次导入，将全量扫描", cursor: null },
           { id: "codex", name: "Codex 会话", kind: "jsonl", path: "C:\\Users\\demo\\.codex\\sessions", enabled: true, exists: true, items: 12, sizeBytes: 20480, note: "", estimate: "首次导入，将全量扫描", cursor: null },
           { id: "workbuddy", name: "WorkBuddy 会话", kind: "jsonl", path: "C:\\Users\\demo\\.workbuddy-ai", enabled: true, exists: true, items: 5, sizeBytes: 10240, note: "", estimate: "首次导入，将全量扫描", cursor: null },
+          { id: "trae", name: "Trae 系会话（Trae / CN / SOLO）", kind: "trae", path: "C:\\Users\\demo\\AppData\\Roaming", enabled: true, exists: true, items: 2, sizeBytes: 424673280, note: "已识别 Trae / Trae CN 的加密会话库", estimate: "Trae 已读到 id=1798 · Trae CN 已读到 id=920，本次按增量续读", cursor: { files: { Trae: { lastId: 1798 }, "Trae CN": { lastId: 920 } } } },
+          { id: "antigravity", name: "Antigravity 会话（Antigravity / IDE）", kind: "antigravity", path: "C:\\Users\\demo\\.gemini", enabled: true, exists: true, items: 322, sizeBytes: 24117248, note: "已识别 antigravity / antigravity-ide 的 322 份会话日志", estimate: "已记录 89 份会话日志的读取水位，本次只读新增内容", cursor: { files: {} } },
           { id: "notes-md", name: "Markdown 笔记目录", kind: "md", path: "", enabled: false, exists: false, items: 0, sizeBytes: 0, note: "未配置路径", estimate: "", cursor: null },
         ], importDir: "C:\\Users\\demo\\AgentHub\\memory\\_import" };
       case "memory_import_source_save":
@@ -960,7 +1061,8 @@ export const mock = {
           running: true, port: 9527, bind: "127.0.0.1", baseUrl: "http://127.0.0.1:9527/v1",
           uptime: 3 * 3600000, active: 1,
           today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820 },
-          channels: PROXY_POOL.map((c) => ({ id: c.id, display: c.display, ...c.summary, health: c.health })),
+          // 关闭的渠道不出现在网关状态里（语义对齐 backend poolView/gatewayStatus 的过滤）
+          channels: PROXY_POOL.filter((c) => (read().proxy.channelEnabled || {})[c.id] !== false).map((c) => ({ id: c.id, display: c.display, ...c.summary, health: c.health })),
           keyCount: PROXY_KEYS.length, vaultOk: true, dbDriver: "node:sqlite",
         };
       case "proxy_start":
@@ -989,10 +1091,11 @@ export const mock = {
           appType: args?.appType,
         };
       case "proxy_key_create":
-        return { id: "k-new", name: String(args?.name || "新 Key"), mask: "sk-demo···0000", route: args?.route || "auto", dailyQuota: args?.dailyQuota || 0, rateLimit: 0, enabled: true, createdAt: NOW, todayReq: 0, todayTokens: 0, secret: "sk-demo0000000000000000000000000000000000000000000000" };
+        return { id: "k-new", name: String(args?.name || "新 Key"), mask: "sk-demo···0000", route: args?.route || "auto", routeOrder: args?.routeOrder || "", dailyQuota: args?.dailyQuota || 0, rateLimit: 0, enabled: true, createdAt: NOW, todayReq: 0, todayTokens: 0, secret: "sk-demo0000000000000000000000000000000000000000000000" };
       case "proxy_key_update":
       case "proxy_key_delete":
       case "proxy_pool_strategy":
+      case "proxy_pool_tier":
       case "proxy_account_remove":
       case "proxy_account_toggle":
       case "proxy_oauth_cancel":
@@ -1000,6 +1103,22 @@ export const mock = {
         return { ok: true };
       case "proxy_pool":
         return JSON.parse(JSON.stringify(PROXY_POOL));
+      // 渠道启闭（预览）：list 全量带 enabled；toggle 写 mock 配置即生效
+      case "proxy_channel_list":
+        return JSON.parse(JSON.stringify(PROXY_POOL)).map((c: Record<string, unknown>) => ({
+          ...c,
+          enabled: (read().proxy.channelEnabled || {})[c.id as string] !== false,
+        }));
+      case "proxy_channel_toggle": {
+        const cfg = read();
+        const map = { ...(cfg.proxy.channelEnabled || {}) } as Record<string, boolean>;
+        const ch = String(args?.channel || "");
+        if (args?.enabled === false) map[ch] = false;
+        else delete map[ch];
+        cfg.proxy.channelEnabled = map;
+        localStorage.setItem(KEY, JSON.stringify(cfg));
+        return { ok: true, channel: ch, enabled: args?.enabled !== false };
+      }
       case "proxy_account_add":
         return { ok: true, id: "a-new" };
       case "proxy_account_refresh":
@@ -1020,18 +1139,25 @@ export const mock = {
             { accountId: "a3", channel: "workbuddy_ai", name: "国际版号", uid: "wb_9e05", ok: true, unavailable: true, message: "国际版无签到体系" },
           ],
         };
-      case "proxy_checkin_run":
-        return {
-          ok: true,
-          action: args?.action || "checkin",
-          total: 3,
-          okCount: 2,
-          rows: [
-            { accountId: "a1", channel: "trae", name: "主账号 · 沐", uid: "88213476", ok: true, message: "签到成功", credit: 100 },
-            { accountId: "a2", channel: "workbuddy", name: "工作号", uid: "wb_7c21", ok: true, already: true, message: "今天已签到" },
-            { accountId: "a3", channel: "workbuddy_ai", name: "国际版号", uid: "wb_9e05", ok: true, unavailable: true, message: "国际版无签到体系" },
-          ],
-        };
+      case "proxy_checkin_run": {
+        // 按渠道返回该渠道账号的签到结果，并把结果写回池视图（模拟主进程 meta.checkin 落库）：
+        // 预览里点完「一键签到」行内按钮随即变「已签到/已领取」，工具栏进完成态
+        type MockAcct = { id: string; channel: string; name: string; uid: string; checkin?: unknown };
+        const pools = PROXY_POOL as unknown as { id: string; accounts: MockAcct[] }[];
+        const ch = pools.find((c) => c.id === String(args?.channel || "trae")) || pools[0];
+        const action = args?.action === "trial" ? "trial" : "checkin";
+        const rows = ch.accounts.map((a) => ({ accountId: a.id, channel: a.channel, name: a.name, uid: a.uid, ok: true, message: action === "trial" ? "加油包已领取" : "签到成功", credit: 100 }));
+        for (const a of ch.accounts) a.checkin = { day: TODAY, at: Date.now(), action, ok: true, credit: 100, streakDays: 1, message: action === "trial" ? "加油包已领取" : "签到成功" };
+        return { ok: true, action, total: rows.length, okCount: rows.length, rows };
+      }
+      case "proxy_checkin_auto_set": {
+        const chId = String(args?.channel || "");
+        const pools = PROXY_POOL as unknown as { id: string; checkinAuto?: { enabled: boolean; time: string; jitterMin: number } }[];
+        const ch = pools.find((c) => c.id === chId);
+        const rule = { enabled: !!args?.enabled, time: String(args?.time || "09:00"), jitterMin: Number(args?.jitterMin || 0) };
+        if (ch) ch.checkinAuto = rule;
+        return { ok: true, channel: chId, ...rule };
+      }
       case "proxy_growth_run":
         return {
           ok: true,
@@ -1151,6 +1277,28 @@ export const mock = {
         return { total: PROXY_USAGE.length, page: 1, pageSize: 20, rows: JSON.parse(JSON.stringify(PROXY_USAGE)) };
       case "proxy_recent":
         return JSON.parse(JSON.stringify(PROXY_USAGE));
+      case "proxy_oplog_list": {
+        // 预览数据语义对齐 backend：from/to 毫秒区间、level、op 过滤 + 时间倒序分页
+        const all = [
+          { id: 3, ts: Date.now() - 120000, level: "info", op: "代理请求", message: "glm-5.3-flash · HTTP 200 · 842ms", channel: "zcode", target: "默认 Key / 主账号 · 沐", detail: "" },
+          { id: 2, ts: Date.now() - 300000, level: "warn", op: "签到", message: "领取奖励需要完成一次人机校验", channel: "zcode", target: "主账号 · 沐", detail: "" },
+          { id: 1, ts: Date.now() - 600000, level: "error", op: "代理请求", message: "raccoon-chat-ml-5-5 · HTTP 502 · 1203ms", channel: "raccoon", target: "默认 Key / 小浣熊号", detail: "上游异常" },
+        ];
+        const f = args || {};
+        const rows = all.filter((r) =>
+          (Number(f.from) > 0 ? r.ts >= Number(f.from) : true) &&
+          (Number(f.to) > 0 ? r.ts <= Number(f.to) : true) &&
+          (f.level ? r.level === f.level : true) &&
+          (f.op ? r.op === f.op : true)
+        );
+        const limit = Math.max(1, Math.min(200, Number(f.limit) || 50));
+        const offset = Math.max(0, Number(f.offset) || 0);
+        return { rows: rows.slice(offset, offset + limit), total: rows.length };
+      }
+      case "proxy_oplog_ops":
+        return ["代理请求", "号池账号", "号池同步", "网关启停", "网关配置", "自动签到", "OAuth 登录", "模型目录", "生态接入", "签到", "切换账号", "API Key", "冷却与风控"];
+      case "proxy_oplog_export":
+        return { ok: true, path: "(浏览器预览)/proxy-oplog.xlsx", count: 3, message: "导出成功（3 条记录）" };
       case "proxy_rules_list":
         return JSON.parse(JSON.stringify(PROXY_RULES));
       case "proxy_open_rules_dir":

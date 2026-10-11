@@ -24,6 +24,22 @@ async function main() {
   console.log("db driver:", store.driver());
   assert(store.listAgents().length === store.CHANNELS.length, `渠道种子数 = CHANNELS 数（${store.CHANNELS.length}：${store.CHANNELS.map((c) => c.id).join("/")}）`);
 
+  // 1b. 双表一致性（CHANNELS ↔ ADAPTERS）：两向差集必须为空——
+  // 只从 CHANNELS 移除而留 ADAPTERS 会让模型被判「双区共有」路由到无账号渠道；
+  // 只加 ADAPTERS 不加 CHANNELS 会让渠道有适配器却不出现在任何 UI/健康检查里
+  const report = adapters.consistencyReport();
+  assert(!report.channelsWithoutAdapter.length && !report.adaptersWithoutChannel.length,
+    `CHANNELS↔ADAPTERS 双表一致（缺适配器：${report.channelsWithoutAdapter.join("/")}；缺渠道：${report.adaptersWithoutChannel.join("/")}）`);
+  // 1c. 适配器契约：必需方法缺失在 require 阶段已抛错；这里复验全员符合 + 残缺适配器必须被断言拦下
+  for (const [ch, ad] of Object.entries(adapters.ADAPTERS)) adapters.assertAdapterContract(ch, ad);
+  let contractThrew = "";
+  try {
+    adapters.assertAdapterContract("残缺渠道", { cfg() {}, models() { return []; } });
+  } catch (e) {
+    contractThrew = String((e && e.message) || e);
+  }
+  assert(/缺少必需的适配器方法 chat/.test(contractThrew), "契约断言：缺 chat 的残缺适配器启动期报错（实际：" + (contractThrew || "未抛错") + "）");
+
   // 2. Key 全链路
   const k = store.createKey({ name: "自测", route: "auto", dailyQuota: 10, rateLimit: 0 });
   assert(k.secret.startsWith("sk-") && k.secret.length === 51, "sk- + 48 hex");
@@ -233,22 +249,34 @@ async function main() {
     const need = ["cfg", "models", "fetchModels", "headers", "rewriteBody", "chat", "queryCredits", "refreshToken"];
     assert(need.every((k) => typeof ad[k] === "function"), `${id} 适配器十件套齐备`);
     assert(ad.cfg().gateway === gw, `${id} cfg.gateway 指向 ${gw}`);
-    assert(ad.models().length >= 14, `${id} 静态模型表 ≥14`);
+    // 静态兜底表按产品隔离（issue #74）：CN 有 14 个兜底模型；intl 未实测过其目录、
+    // 不设兜底（模型清单应来自拉取目录）。此前这里对两者都断言 ≥14，等于把「intl 凭空
+    // 宣称拥有 CN 专属模型」固化成契约——modelOwners 据此把请求 failover 到无账号的
+    // intl 渠道，上游回 400 code=11102（幽灵模型）。
+    if (id === "qoder") {
+      assert(ad.models().length >= 14, `${id} 静态兜底模型表 ≥14`);
+    } else {
+      assert(Array.isArray(ad.models()), `${id} models() 返回数组`);
+      assert(ad.models().length === 0, `${id} 不得继承 CN 静态兜底（无目录时清单为空）`);
+    }
     // headers() 必须**不含** Authorization：签名由 chat() 内 wasm 现场产出，
     // 静态头里出现 Authorization 即为「照抄 WB 静态头组」的错误实现
     const h = ad.headers();
     assert(!("authorization" in h) && !("Authorization" in h), `${id} headers() 不含 Authorization（签名下沉 chat()）`);
     assert(typeof h["user-agent"] === "string" && h.accept === "text/event-stream", `${id} headers() 基础头正确`);
   }
-  // 模型归属：INTL 关闭时 dfmodel 必须只归 qoder（残留双归属会路由到无账号渠道）
+  // 模型归属（issue #74）：dfmodel 必须只归 qoder。
+  // 此前 INTL 开启时断言「归属双区」——那是把 bug 当契约：qoder_intl 的静态兜底表与 CN
+  // 共用，于是无账号的 intl 也宣称拥有 dfmodel，failover 打过去必然 400 code=11102。
+  // 现在兜底表按产品隔离，intl 无目录时清单为空 → 不可能出现跨区幽灵归属。
   const dfOwners = adapters.modelOwners("dfmodel");
+  assert(dfOwners.length === 1 && dfOwners[0] === "qoder", "dfmodel 仅归 qoder（INTL 不得幽灵归属）");
   if (intlOn) {
-    assert(dfOwners.length === 2 && dfOwners.includes("qoder_intl"), "dfmodel 归属 Qoder 双区（多归属→打分路由）");
-  } else {
-    assert(dfOwners.length === 1 && dfOwners[0] === "qoder", "dfmodel 仅归 qoder（INTL 关闭时无幽灵归属）");
+    const intlAd = adapters.get("qoder_intl");
+    assert(!intlAd.models().includes("dfmodel"), "qoder_intl 清单不含 CN 专属模型 dfmodel");
   }
   const qModels = qd.models();
-  for (const other of ["trae", "workbuddy", "workbuddy_ai", "raccoon", "zcode"]) {
+  for (const other of ["trae", "workbuddy", "workbuddy_ai", "raccoon", "zcode", "lobster", "modelscope"]) {
     const om = adapters.get(other).models();
     const clash = qModels.filter((m) => om.includes(m));
     assert(clash.length === 0, `qoder 模型与 ${other} 零重名（无路由歧义）`);
@@ -284,6 +312,83 @@ async function main() {
   // ⑤ 401 旋转竞态重试（针头：值变了才重试，没变不原地打转）
   // 这个行为留在集成测试里跑（需要打点 fetch 与文件），smoke 只验证接口存在
   console.log("raccoon adapter ok");
+
+  // ===== LobsterAI（网易有道龙虾，lobster 渠道）离线断言 =====
+  // 与既有渠道的形态差异：上游是**原生 OpenAI 协议**（无需翻译层），头组静态（无签名），
+  // 登录走应用内回环 OAuth（无需本机安装客户端）。两个已知陷阱必须守住：
+  //   ① 上游只接受 stream=true（非流式返回 500）；
+  //   ② 签到活动按 clientVersion 门禁（旧版本号 slotState=empty，静默领不到分）。
+  const lb = adapters.get("lobster");
+  assert(lb && lb.id === "lobster", "lobster 适配器注册");
+  assert(store.CHANNELS.some((c) => c.id === "lobster"), "store.CHANNELS 含 lobster");
+  const lbCfg = rules.get("headers.json").lobster;
+  assert(lbCfg.chatUrl === "https://lobsterai-server.youdao.com/api/proxy/v1/chat/completions", "lobster 对话端点为原生 OpenAI 路径");
+  assert(lbCfg.checkinPlacement === "desktop_sidebar", "lobster 签到活动槽 = desktop_sidebar");
+  assert(typeof lbCfg.versionUrl === "string" && lbCfg.versionUrl.includes("api-overmind.youdao.com"), "lobster 版本号来源为官方更新接口");
+  assert(lb.models().length >= 16, `lobster 静态模型表 ≥16（实际 ${lb.models().length}）`);
+  assert(adapters.modelOwners("deepseek-v4-pro").includes("lobster"), "deepseek-v4-pro 归属含 lobster");
+  // 陷阱①：非流式请求必须被改写为 stream=true，否则上游 500
+  const lbBody = lb.rewriteBody("deepseek-v4-pro", { model: "deepseek-v4-pro", messages: [{ role: "user", content: "hi" }], stream: false, conversation_id: "x" });
+  assert(lbBody.stream === true && lbBody.stream_options.include_usage === true, "lobster rewriteBody 强制流式 + include_usage");
+  assert(!("conversation_id" in lbBody), "lobster rewriteBody 剥离内部字段");
+  assert(lb.mapModel("DeepSeek-V4-Pro") === "deepseek-v4-pro" && lb.mapModel("deepseek_v4_pro") === "deepseek-v4-pro", "lobster 模型名归一（大小写/下划线容错）");
+  // 陷阱②：版本号必须动态取（写死会在官方发版后静默失效）
+  assert(typeof lb.refreshVersion === "function", "lobster 具备动态版本号获取（签到门禁依赖）");
+  // 签到与刷新接口齐备
+  for (const k of ["checkin", "checkinStatus", "queryCredits", "refreshToken", "fetchModels"]) {
+    assert(typeof lb[k] === "function", `lobster 具备 ${k}`);
+  }
+  // 回环 OAuth：起本地服务器并返回官方登录 URL（本地监听，不发网络请求）
+  const lbBegin = await discovery.beginOAuth("lobster", () => {});
+  assert(lbBegin.ok === true && lbBegin.mode === "loopback", "lobster OAuth 走回环（mode=loopback）");
+  assert(/lobsterai\.youdao\.com\/portal#\/login/.test(lbBegin.url || ""), "lobster 登录 URL 指向官方门户");
+  assert(/redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A\d+%2Fauth%2Fcallback/.test(lbBegin.url || ""), "lobster 回调地址为本机回环 /auth/callback");
+  discovery.cancelOAuth();
+  console.log("lobster adapter ok");
+
+  // ===== ModelScope（魔搭，modelscope 渠道）离线断言 =====
+  // 与 raccoon/lobster 节同款：只测离线可判的改写/头/凭据形态。
+  // 非流式 Content-Type 分流的路径可达性由 proxy-modelscope-selftest T26b 锁定，此处不重复。
+  const msAd = adapters.get("modelscope");
+  assert(msAd && msAd.id === "modelscope", "modelscope 适配器注册");
+  assert(store.CHANNELS.some((c) => c.id === "modelscope"), "store.CHANNELS 含 modelscope");
+  assert(adapters.modelOwners("deepseek-ai/DeepSeek-V4.1-Flash")[0] === "modelscope", "deepseek-ai/DeepSeek-V4.1-Flash 归属 modelscope");
+  // 模型零重名（无路由歧义）：静态目录全名带 org 前缀，与既有渠道天然不撞
+  const msModels = msAd.models();
+  assert(msModels.length >= 20, `modelscope 静态模型表 ≥20（实际 ${msModels.length}）`);
+  for (const other of ["trae", "workbuddy", "workbuddy_ai", "raccoon", "zcode", "lobster", "qoder"]) {
+    const om = adapters.get(other).models();
+    const clash = msModels.filter((m) => om.includes(m));
+    assert(clash.length === 0, `modelscope 模型与 ${other} 零重名（无路由歧义）`);
+  }
+  const msBody = msAd.rewriteBody("deepseek-ai/DeepSeek-V4.1-Flash", {
+    model: "deepseek-ai/DeepSeek-V4.1-Flash",
+    messages: [{ role: "user", content: "hi" }],
+    stream: true,
+    max_completion_tokens: 128,
+  }, { uid: "msub_abc123" });
+  assert(msBody.model === "deepseek-ai/DeepSeek-V4.1-Flash", "modelscope 全名模型直通");
+  assert(msAd.mapModel("GLM-5.3-Flash") === "ZhipuAI/GLM-5.3-Flash", "modelscope 简写回退（GLM-5.3-Flash → ZhipuAI/GLM-5.3-Flash）");
+  assert(msBody.max_tokens === 128 && !("max_completion_tokens" in msBody), "modelscope max_completion_tokens → max_tokens 翻译");
+  assert(msBody.stream_options && msBody.stream_options.include_usage === true, "modelscope 流式注入 include_usage");
+  assert(typeof msBody.prompt_cache_key === "string" && msBody.prompt_cache_key.startsWith("agenthub-msub_abc"), "modelscope prompt_cache_key 注入（账号段硬隔离）");
+  assert(!("conversation_id" in msBody), "modelscope 不注入 conversation_id（WB/raccoon 私有字段，严格 OpenAI 端点 400 风险）");
+  const msKeep = msAd.rewriteBody("deepseek-ai/DeepSeek-V4.1-Flash", { model: "deepseek-ai/DeepSeek-V4.1-Flash", messages: [], prompt_cache_key: "KEEP" }, { uid: "u" });
+  assert(msKeep.prompt_cache_key === "KEEP", "modelscope 已有 prompt_cache_key 不覆盖");
+  const msNoAcc = msAd.rewriteBody("deepseek-ai/DeepSeek-V4.1-Flash", { model: "deepseek-ai/DeepSeek-V4.1-Flash", messages: [{ role: "user", content: "hi" }] });
+  assert(typeof msNoAcc.prompt_cache_key === "string", "modelscope account 缺失降级注入不抛错");
+  const msNonStream = msAd.rewriteBody("deepseek-ai/DeepSeek-V4.1-Flash", { model: "deepseek-ai/DeepSeek-V4.1-Flash", messages: [{ role: "user", content: "hi" }], stream: false }, { uid: "u" });
+  assert(msNonStream.stream_options === undefined, "modelscope 非流式不注入 stream_options");
+  // 头分面：推理面单令牌（chatHeaders），控制面三头同发防风控（apiHeaders）——两端点族形态不同
+  const msh = msAd.chatHeaders("ms-token-x");
+  assert(msh.authorization === "Bearer ms-token-x" && msh["content-type"] === "application/json", "modelscope chatHeaders 推理面单令牌");
+  const msah = msAd.apiHeaders("ms-token-x");
+  assert(msah.authorization === "Bearer ms-token-x" && msah["OpenAPI-Token"] === "ms-token-x" && msah["X-Modelfun-Token"] === "ms-token-x" && msah["user-agent"], "modelscope apiHeaders 控制面三头 + 浏览器上下文");
+  // 星标族凭据判别：OAuth 令牌不算（该族 401），Cookie / ms- 才算
+  assert(msAd.hasStarCredential({ token: "ms_oauthXXXX" }) === false, "modelscope OAuth 令牌不算星标凭据");
+  assert(msAd.hasStarCredential({ token: "ms-abc123" }) === true, "modelscope ms- 令牌算星标凭据");
+  assert(msAd.hasStarCredential({ meta: { [msAd.cfg().cookieMetaKey]: "sessionid=x" } }) === true, "modelscope Cookie 算星标凭据");
+  console.log("modelscope adapter ok");
 
   // 6. 统计链路
   store.insertUsage({ reqId: "r1", keyId: k.id, keyName: "自测", channel: "trae", accountId: aid, accountName: "测试号", model: "deepseek-v4-flash", promptTokens: 10, completionTokens: 20, ttftMs: 100, latencyMs: 500, status: 200 });

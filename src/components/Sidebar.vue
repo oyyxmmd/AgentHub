@@ -10,11 +10,13 @@ import { useMemoryStore } from "../stores/memory";
 import { useSyncStore } from "../stores/sync";
 import { useUsageStore } from "../stores/usage";
 import * as syncApi from "../api/sync";
-import { formatToken, formatCost, timeAgo } from "../composables/useFormat";
+import { formatToken, formatCost, formatInteger, timeAgo } from "../composables/useFormat";
+import { fmtBalance, balanceUnit } from "../views/proxy/format";
 import type { DeviceMeta } from "../types/sync";
 import type { ModuleKey } from "../types";
 import * as api from "../api/ipc";
 import { coalesceAsync } from "../utils/timing";
+import ProxyUpstreamDialog from "./ProxyUpstreamDialog.vue";
 import logoUrl from "../assets/logo.png";
 
 const app = useAppStore();
@@ -155,10 +157,10 @@ const billingOn = computed(() => !!usageApp.config.billing?.enabled);
 const currency = computed(() => usageApp.config.billing?.displayCurrency || "CNY");
 
 // ===== 模块卡片的运行状态与统计（全部真实数据，无 mock） =====
-const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "warn"; stats: { v: string; label: string }[] }>>(() => {
+const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "warn"; stats: { v: string; label: string; unit?: string }[] }>>(() => {
   const sk = skillsStats.value;
-  const syncStats: { v: string; label: string }[] = [
-    { v: String(usage.devices.length), label: "机器" },
+  const syncStats: { v: string; label: string; unit?: string }[] = [
+    { v: String(usage.devices.length), label: "机器", unit: "台" },
   ];
   if (billingOn.value && syncTodayCost.value !== null) {
     syncStats.push({ v: formatCost(syncTodayCost.value, 2, currency.value), label: "今日费用" });
@@ -169,9 +171,9 @@ const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "w
       state: sk && sk.pendingConflicts > 0 ? `${sk.pendingConflicts} 冲突待裁决` : "运行中",
       level: sk && sk.pendingConflicts > 0 ? "warn" : "ok",
       stats: [
-        { v: sk ? String(sk.skillCount) : "-", label: "已收纳" },
-        { v: sk ? String(sk.pendingConflicts) : "-", label: "待裁决" },
-        { v: sk ? String(sk.toolCount) : "-", label: "接入工具" },
+        { v: sk ? String(sk.skillCount) : "-", label: "已收纳", unit: "个" },
+        { v: sk ? String(sk.pendingConflicts) : "-", label: "待裁决", unit: "个" },
+        { v: sk ? String(sk.toolCount) : "-", label: "接入工具", unit: "个" },
       ],
     },
     sync: {
@@ -183,9 +185,9 @@ const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "w
       state: proxyRunning.value ? "网关运行中" : "网关未启动",
       level: proxyRunning.value ? "ok" : "warn",
       stats: [
-        { v: `:${app.config.proxy.port}`, label: "端口" },
-        { v: String(proxyKeyCount.value), label: "Key" },
-        { v: channels.value.length ? String(channels.value.length) : "-", label: "上游" },
+        { v: String(app.config.proxy.port), label: "端口" },
+        { v: String(proxyKeyCount.value), label: "Key", unit: "个" },
+        { v: channels.value.length ? String(channels.value.length) : "-", label: "已启用上游", unit: "个" },
       ],
     },
     memory: {
@@ -198,8 +200,9 @@ const MODULE_META = computed<Record<ModuleKey, { state: string; level: "ok" | "w
             : "等待 Agent 调用",
       level: memoryOverview.value && memoryOverview.value.pending === 0 && memoryOverview.value.verifiedAgents > 0 ? "ok" : "warn",
       stats: [
-        { v: memoryOverview.value ? String(memoryOverview.value.total) : "-", label: "条记忆" },
-        { v: memoryOverview.value ? `${memoryOverview.value.verifiedAgents}/${memoryOverview.value.agents}` : "-", label: "已连通" },
+        // 普通 = 总量 − 深层 L2；「N 个 Agent 已连通」已在右上状态，这里只报记忆条数
+        { v: memoryOverview.value ? String(Math.max(0, memoryOverview.value.total - memoryOverview.value.l2)) : "-", label: "普通记忆", unit: "条" },
+        { v: memoryOverview.value ? String(memoryOverview.value.l2) : "-", label: "深层记忆", unit: "条" },
       ],
     },
   };
@@ -221,6 +224,9 @@ const fmtDay = (ts: number) => {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 };
+
+// 上游启闭弹窗（渠道级开关：关闭的渠道在反代网关全部页面动态隐藏）
+const upOpen = ref(false);
 
 // 模块图标（线稿 path，复刻 design.html）
 const MODULE_ICONS: Record<ModuleKey, string> = {
@@ -371,8 +377,14 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
           </div>
           <div class="mc-stats">
             <div v-for="s in MODULE_META[mod.key].stats" :key="s.label" class="mc-stat">
-              <b>{{ s.v }}</b><span>{{ s.label }}</span>
+              <b>{{ s.v }}<span v-if="s.unit" class="mc-unit">{{ s.unit }}</span></b><span>{{ s.label }}</span>
             </div>
+            <!-- 上游启闭（仅反代网关卡）：渠道级开关入口，弹窗内各渠道图标 + 名称 + 开关 -->
+            <el-tooltip v-if="mod.key === 'proxy'" content="上游启闭：控制各渠道在反代网关中的启用与可见" placement="top">
+              <button class="mc-up-btn" @click.stop="upOpen = true">
+                <i class="ph ph-plugs-connected"></i>上游启闭
+              </button>
+            </el-tooltip>
           </div>
         </div>
       </nav>
@@ -446,12 +458,12 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
               <div class="ov-row ov-pick" @click="gotoMemory('browse')">
                 <span class="ov-dot" :class="{ off: !memoryOverview.enabled }"></span>
                 <div class="grow">
-                  <div class="ov-name">记忆总量<span class="ov-tag">L2 {{ memoryOverview.l2 }}</span></div>
+                  <div class="ov-name">记忆总量<span class="ov-tag">L2 {{ formatInteger(memoryOverview.l2) }} 条</span></div>
                   <div class="ov-meta">
-                    今日新增 {{ memoryOverview.today }} 条 · {{ memoryOverview.projects }} 个项目
+                    今日新增 {{ formatInteger(memoryOverview.today) }} 条 · {{ formatInteger(memoryOverview.projects) }} 个项目
                   </div>
                 </div>
-                <b class="ov-num">{{ memoryOverview.total }}</b>
+                <b class="ov-num">{{ formatInteger(memoryOverview.total) }}<span class="ov-unit">条</span></b>
               </div>
             </el-tooltip>
 
@@ -465,7 +477,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
                   </div>
                   <div class="ov-meta">事实失效 / 归类 / 去重</div>
                 </div>
-                <b class="ov-num">{{ memoryOverview.pending }}</b>
+                <b class="ov-num">{{ formatInteger(memoryOverview.pending) }}<span class="ov-unit">项</span></b>
               </div>
             </el-tooltip>
 
@@ -484,7 +496,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
                   <div class="ov-name">{{ p.name }}</div>
                   <div class="ov-meta">最近 {{ timeAgo(p.latest) }}</div>
                 </div>
-                <b class="ov-num">{{ p.count }}</b>
+                <b class="ov-num">{{ formatInteger(p.count) }}<span class="ov-unit">条</span></b>
               </div>
             </el-tooltip>
             <div v-if="!memoryOverview.topProjects.length" class="ov-row">
@@ -533,7 +545,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
                 {{ c.summary.accountCount ? `${c.summary.onlineCount}/${c.summary.accountCount} 可用` : "空号池" }}<template v-if="c.summary.earliestExpire"> · 最早到期 {{ fmtDay(c.summary.earliestExpire) }}</template>
               </div>
             </div>
-            <b class="ov-num">{{ c.summary.totalCredits.toLocaleString("en-US") }}</b>
+            <b class="ov-num">{{ fmtBalance(c.summary.totalCredits, c.id) }}<span class="ov-unit">{{ balanceUnit(c.id) }}</span></b>
           </div>
           <div v-if="!channels.length" class="ov-row">
             <div class="grow"><div class="ov-meta">号池尚未接入或加载中</div></div>
@@ -565,6 +577,9 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
         </span>
       </div>
     </div>
+
+    <!-- 上游启闭弹窗（渠道级开关）：关闭的渠道在反代网关全部页面动态隐藏，重新打开立即恢复 -->
+    <ProxyUpstreamDialog :open="upOpen" @close="upOpen = false" />
   </aside>
 </template>
 
@@ -760,6 +775,8 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
 }
 .mc-stats {
   display: flex;
+  flex-wrap: wrap; /* 挤不下时「上游启闭」按钮换行右对齐，数字不被压缩 */
+  align-items: flex-end;
   gap: 12px;
   margin-top: 8px;
 }
@@ -769,9 +786,42 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
   font-weight: 600;
   display: block;
 }
+/* 数字后的弱化单位（台/个/条）：与下卡片 .ov-unit 同构的两段式 */
+.mc-unit {
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--text-3);
+  margin-left: 2px;
+  font-family: var(--font-ui);
+}
 .mc-stat span {
   font-size: 9px;
   color: var(--text-3);
+}
+/* 上游启闭小按钮（仅反代网关卡）：弱化 ghost 态，悬停点亮，与免责问号同色系 */
+.mc-up-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 9px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.mc-up-btn .ph {
+  font-size: 10px;
+}
+.mc-up-btn:hover {
+  color: var(--accent-strong);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
 }
 .mc-state {
   position: absolute;
@@ -945,6 +995,14 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
   font-weight: 600;
   color: var(--text-2);
   flex-shrink: 0;
+}
+/* 渠道额度数字后的单位（积分/Tokens/Credits）：弱化小字，与号池页两段式同构 */
+.ov-unit {
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--text-3);
+  margin-left: 3px;
+  font-family: var(--font-ui);
 }
 .ov-tag {
   font-size: 9px;

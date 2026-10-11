@@ -5,8 +5,9 @@ import type {
   ReportRow, ToolRow, TrashRow, UpdateStatus, ProbeRow, RemoveToolPlan,
   WebDavStatus, RemoteDevice, WebDavLog, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
-  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy,
+  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy, ProxyCostTier,
   ProxyCheckinRow, ProxyGrowthRow, ProxyGrowthLogEntry, CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, ZcodeDeviceStatusResult, ZcodeClaimModeResult,
+  ProxyOpLogList,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
   MemoryAgentCard, MemoryAgentVerify, MemoryBridgeStatus, MemoryConfigEnvelope, MemoryStatusEnvelope,
   MemoryToolRow,
@@ -17,8 +18,9 @@ export type {
   ReportRow, ToolRow, TrashRow, UpdateStatus, UpdateEvent, ProbeRow, RemoveToolPlan,
   WebDavStatus, RemoteDevice, WebDavLog, WebDavEvent, HubExtraRow, WatchStatus,
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
-  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy,
+  ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy, ProxyCostTier,
   ProxyAccountStatus, ProxyEvent, ProxyCheckinRow, ProxyGrowthRow, ProxyGrowthLogEntry, CcSwitchStatus, CcSwitchRegisterResult,
+  ProxyOpLogList, ProxyOpLogRow,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
   MemoryAgentCard, MemoryAgentVerify, MemoryBridgeStatus, MemoryConfigEnvelope, MemoryStatusEnvelope,
   MemoryToolRow, MemoryEvent,
@@ -220,16 +222,23 @@ export const proxyRestart = () => call<{ ok: boolean; port?: number; message?: s
 
 // ===== 反代网关：API Keys =====
 export const proxyKeysList = () => call<ProxyKeyRow[]>("proxy_keys_list");
-export const proxyKeyCreate = (opts: { name: string; route: ProxyRoute; dailyQuota: number; rateLimit?: number }) =>
+export const proxyKeyCreate = (opts: { name: string; route: ProxyRoute; routeOrder?: string; dailyQuota: number; rateLimit?: number }) =>
   call<ProxyKeyRow & { secret: string }>("proxy_key_create", opts as unknown as Record<string, unknown>);
-export const proxyKeyUpdate = (id: string, patch: Partial<Pick<ProxyKeyRow, "name" | "route" | "dailyQuota" | "rateLimit" | "enabled">>) =>
+export const proxyKeyUpdate = (id: string, patch: Partial<Pick<ProxyKeyRow, "name" | "route" | "routeOrder" | "dailyQuota" | "rateLimit" | "enabled">>) =>
   call<{ ok: boolean; message?: string }>("proxy_key_update", { id, ...patch });
 export const proxyKeyDelete = (id: string) => call<{ ok: boolean; message?: string }>("proxy_key_delete", { id });
 
 // ===== 反代网关：号池 / 凭据接入 =====
 export const proxyPool = () => call<ProxyChannelView[]>("proxy_pool");
+/** 渠道启闭（「上游启闭」弹窗）：list = 全量含已关闭渠道（带 enabled）；toggle = 写配置 + 广播事件即时生效 */
+export const proxyChannelList = () => call<ProxyChannelView[]>("proxy_channel_list");
+export const proxyChannelToggle = (channel: ProxyChannelId | string, enabled: boolean) =>
+  call<{ ok: boolean; channel?: string; enabled?: boolean; message?: string }>("proxy_channel_toggle", { channel, enabled });
 export const proxyPoolStrategy = (channel: ProxyChannelId, strategy: ProxyPoolStrategy) =>
   call<{ ok: boolean; message?: string }>("proxy_pool_strategy", { channel, strategy });
+/** 渠道成本档（cost-first 路由排序的标注来源） */
+export const proxyPoolTier = (channel: ProxyChannelId, tier: ProxyCostTier) =>
+  call<{ ok: boolean; message?: string }>("proxy_pool_tier", { channel, tier });
 export const proxyAccountAdd = (opts: { channel: ProxyChannelId; name?: string; token: string; refreshToken?: string; uid?: string }) =>
   call<{ ok: boolean; id?: string; message?: string }>("proxy_account_add", opts as unknown as Record<string, unknown>);
 export const proxyAccountRemove = (id: string) => call<{ ok: boolean; message?: string }>("proxy_account_remove", { id });
@@ -266,6 +275,12 @@ export const proxyGrowthRun = (action: "travel" | "cat" | "activity" | "school",
   call<{ ok: boolean; action: string; total: number; okCount: number; rows: ProxyGrowthRow[]; message?: string }>("proxy_growth_run", { action, accountId }, 0);
 /** 积分任务执行日志（环形 300 条落盘持久化，新的在前；手动与自动调度都记录） */
 export const proxyGrowthLog = () => call<{ ok: boolean; rows: ProxyGrowthLogEntry[] }>("proxy_growth_log");
+/** 按渠道设置自动签到（号池页「自动签到」弹窗）：时间/抖动写整体配置，保存即生效；读源在 proxy_pool 视图 */
+export const proxyCheckinAutoSet = (opts: { channel: ProxyChannelId; enabled: boolean; time: string; jitterMin: number }) =>
+  call<{ ok: boolean; channel: ProxyChannelId; enabled: boolean; time: string; jitterMin: number; message?: string }>(
+    "proxy_checkin_auto_set",
+    opts as unknown as Record<string, unknown>
+  );
 /** 扫描本机已装软件的登录态（凭据不出主进程，只回候选信息） */
 export const proxyScan = () => call<ProxyScanCandidate[]>("proxy_scan");
 /** 导入本机候选；file/uid 用于身份核对（两次扫描之间文件变化时不至于导错账号） */
@@ -307,7 +322,7 @@ export interface IdeSwitchProbe {
  *  预检判定「切不了」时直接回 ok:false，不弹框。确认后关客户端等退出时长不可控，故关闭看门狗） */
 export const proxyIdeSwitch = (accountId: string, confirmAck?: boolean) =>
   call<{ ok: boolean; channel?: string; file?: string; backup?: string; needConfirm?: boolean; probe?: IdeSwitchProbe; relaunched?: boolean; message?: string }>("proxy_ide_switch", { accountId, confirmAck }, 0);
-export const proxyIdeStatus = () => call<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; zcodeInstalled?: boolean; qoderInstalled?: boolean; qoderIntlInstalled?: boolean; currentUid: string }>("proxy_ide_status");
+export const proxyIdeStatus = () => call<{ workbuddyInstalled: boolean; workbuddyAiInstalled?: boolean; traeInstalled?: boolean; raccoonInstalled?: boolean; modelscopeInstalled?: boolean; lobsterInstalled?: boolean; zcodeInstalled?: boolean; qoderInstalled?: boolean; qoderIntlInstalled?: boolean; currentUid: string }>("proxy_ide_status");
 /** zcode 切号回滚（切出问题 / 远程连接异常时一键还原最近一次切前状态） */
 export const proxyZcodeSwitchRollback = () =>
   call<{ ok: boolean; message?: string }>("proxy_zcode_switch_rollback");
@@ -333,6 +348,22 @@ export const proxyStatsTop = (dim: "channel" | "model" | "key" | "account", days
 export const proxyStatsDetail = (opts: { page?: number; pageSize?: number; channel?: string; keyId?: string; model?: string }) =>
   call<ProxyStatsDetail>("proxy_stats_detail", opts as Record<string, unknown>);
 export const proxyRecent = (limit?: number) => call<ProxyUsageRow[]>("proxy_recent", { limit });
+
+// ===== 反代网关：操作日志（「日志」页签） =====
+export interface ProxyOpLogFilter {
+  /** 毫秒时间戳区间（视图层由日期串换算），空/0 = 不限 */
+  from?: number | null;
+  to?: number | null;
+  level?: string;
+  op?: string;
+  limit?: number;
+  offset?: number;
+}
+export const proxyOpLogList = (filter: ProxyOpLogFilter) => call<ProxyOpLogList>("proxy_oplog_list", filter as Record<string, unknown>);
+export const proxyOpLogOps = () => call<string[]>("proxy_oplog_ops");
+/** 导出 Excel（.xlsx 落 downloads，文件名含毫秒时间戳）；导出当前筛选全集（无分页） */
+export const proxyOpLogExport = (filter: Omit<ProxyOpLogFilter, "limit" | "offset">) =>
+  call<{ ok: boolean; path?: string; count?: number; message?: string }>("proxy_oplog_export", filter as Record<string, unknown>);
 export const proxyRulesList = () => call<ProxyRuleFile[]>("proxy_rules_list");
 export const proxyOpenRulesDir = () => call<{ ok: boolean }>("proxy_open_rules_dir");
 export const proxyOpenDataDir = () => call<{ ok: boolean }>("proxy_open_data_dir");
@@ -401,6 +432,9 @@ export const memoryProjectSuggest = () =>
   call<{ items: { id: string; slug: string; name: string; score: number; candidate: string; memoryId: string; title: string; path: string }[] }>("memory_project_suggest");
 export const memoryProjectConfirm = (id: string, slug: string | null) =>
   call<{ ok: boolean; memoryId: string; slug: string | null }>("memory_project_confirm", { id, slug });
+/** 关联本地目录到既有项目卡：补全远程地址与本地路径（非 Git 目录只记路径） */
+export const memoryProjectAttach = (slug: string, dir: string) =>
+  call<{ ok: boolean; message?: string; isRepo?: boolean; addedRemotes?: string[]; localPath?: string }>("memory_project_attach", { slug, dir });
 
 // ===== 记忆中枢：索引 / 检索 =====
 export const memoryIndexStatus = () => call<MemoryIndexStatus>("memory_index_status");
@@ -472,6 +506,9 @@ export const memoryGatewayList = () =>
 export const memoryProviderSave = (input: Record<string, unknown>) =>
   call<{ ok: boolean; id: string }>("memory_provider_save", input as Record<string, unknown>);
 export const memoryProviderDelete = (id: string) => call<{ ok: boolean; removedModels: number }>("memory_provider_delete", { id });
+// 供应商启用/停用：列表行内开关即时生效（独立通道，不走 save 的 Key 改道防护）
+export const memoryProviderToggle = (id: string, enabled: boolean) =>
+  call<{ ok: boolean; enabled: boolean }>("memory_provider_toggle", { id, enabled });
 // 三级连通测试 / 拉模型 / 真实试调：真实网络调用，主进程 llm client 自带超时但三级连测可能超 45s，豁免
 export const memoryProviderTest = (id: string, modelId?: string) =>
   call<{

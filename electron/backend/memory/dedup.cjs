@@ -99,10 +99,11 @@ class DedupEngine {
   checkSync({ title, body, tags, project, hash, type }) {
     const cfg = this.flat();
     if (cfg["dedup.enabled"] === false) return { action: "add" };
-    const db = this.service.index.db;
 
     if (cfg["dedup.l1.enabled"] !== false && hash) {
-      const hit = db.prepare("SELECT id, dup_index, title FROM mem WHERE hash = ? AND (valid_to IS NULL OR valid_to > ?) LIMIT 1").get(hash, Date.now());
+      // 复用 indexer 的常驻语句（findByHashActive）：这条检查在 writeMemory 的写入路径上，
+      // 每条写入都会跑一次，原地 prepare 等于每次重新编译 SQL（indexer._prepare 的同款问题）
+      const hit = this.service.index.findByHashActive(hash);
       if (hit) {
         // 「允许同身份多条目」判的是本条记忆的类别（duplicateIdentityTypes 是类别白名单），
         // 不是白名单里是否含 "daily" 字面量——原写法恒为 true，L1 命中永远不跳过。
@@ -135,27 +136,39 @@ class DedupEngine {
   }
 
   candidateByBm25(text, project, k) {
-    const db = this.service.index.db;
     const tokens = tokenizeList(text).slice(0, 12);
     if (!tokens.length) return [];
     const match = tokens.map((t) => `"${t}"`).join(" OR ");
     const ftsTable = this.flat()["index.dualIndex"] !== false ? "mem_fts_w" : "mem_fts";
-    const where = [`${ftsTable} MATCH ?`, "(m.valid_to IS NULL OR m.valid_to > " + Date.now() + ")"];
-    const params = [match];
-    if (project) {
-      where.push("m.project = ?");
-      params.push(project);
-    }
+    // 参数顺序必须与 _bm25Stmt 里 WHERE 占位符一致：MATCH → valid_to → [project] → LIMIT
+    const params = [match, Date.now()];
+    if (project) params.push(project);
     params.push(Math.max(1, Math.min(Number(k || 8), 30)));
     try {
-      return db.prepare(`
-        SELECT m.id, m.title, m.summary, m.hash, m.tags, m.created, m.project, rank
-        FROM ${ftsTable} JOIN mem m ON m.rowid = ${ftsTable}.rowid
-        WHERE ${where.join(" AND ")} ORDER BY rank LIMIT ?
-      `).all(...params);
+      return this._bm25Stmt(ftsTable, project ? 1 : 0).all(...params);
     } catch {
       return [];
     }
+  }
+
+  /** 候选查询的常驻语句（indexer._prepare 同款原则）：valid_to 的时间戳此前内联在 SQL 里，
+      语句每毫秒都独一无二、永远无法缓存；改成绑定参数后 SQL 只剩 fts 表×是否按项目过滤
+      4 个变体。checkSync L2 在写入热路径上（每条带标题的记忆都跑），备好后不再每次编译。 */
+  _bm25Stmt(ftsTable, byProject) {
+    if (!this._bm25Stmts) this._bm25Stmts = new Map();
+    const key = `${ftsTable}|${byProject}`;
+    let stmt = this._bm25Stmts.get(key);
+    if (!stmt) {
+      const where = [`${ftsTable} MATCH ?`, "(m.valid_to IS NULL OR m.valid_to > ?)"];
+      if (byProject) where.push("m.project = ?");
+      stmt = this.service.index.db.prepare(`
+        SELECT m.id, m.title, m.summary, m.hash, m.tags, m.created, m.project, rank
+        FROM ${ftsTable} JOIN mem m ON m.rowid = ${ftsTable}.rowid
+        WHERE ${where.join(" AND ")} ORDER BY rank LIMIT ?
+      `);
+      this._bm25Stmts.set(key, stmt);
+    }
+    return stmt;
   }
 
   /** L4：LLM 四操作判定；返回 judgements */
@@ -225,17 +238,19 @@ class DedupEngine {
     // 学习表本轮不会变化（scanAll 内不调用 _learn），在循环外读一次即可：
     // 放进循环会让每行都 JSON.parse 一次最长 500 条的数组，几万条巡检退化成 O(N×M)
     const learned = this._learnedPairs();
+    // 每行至少执行一次的标记语句：巡检热路径上原地 prepare 等于每行重新编译 SQL，循环外备好
+    const markDone = db.prepare("UPDATE mem SET dedup_status = 'done' WHERE id = ?");
     for (const row of pending) {
       scanned++;
       if (onProgress && (scanned % 5 === 0 || scanned === pending.length)) onProgress(scanned, pending.length);
       const cand = this.candidateByBm25(row.title, row.project, cfg["dedup.l3.topK"] || 8).filter((c) => c.id !== row.id && !isLocalOnly(c));
       if (!cand.length) {
-        db.prepare("UPDATE mem SET dedup_status = 'done' WHERE id = ?").run(row.id);
+        markDone.run(row.id);
         continue;
       }
       const usable = cand.filter((c) => !learned.includes([row.hash, c.hash].sort().join("|")));
       if (!usable.length) {
-        db.prepare("UPDATE mem SET dedup_status = 'done' WHERE id = ?").run(row.id);
+        markDone.run(row.id);
         continue;
       }
       // FTS5 rank 越负越相似（与 search.cjs 的 -rank 口径一致）：强匹配要进 L4，弱匹配跳过。
@@ -243,7 +258,7 @@ class DedupEngine {
       const topScore = Math.min(1, -(usable[0].rank || 0) / 10);
       const minScore = Number(cfg["dedup.l4.minCandidateScore"] ?? 0.62);
       if (isLocalOnly(row) || !opts.useModel || cfg["dedup.l4.enabled"] === false || topScore < minScore) {
-        db.prepare("UPDATE mem SET dedup_status = 'done' WHERE id = ?").run(row.id);
+        markDone.run(row.id);
         continue;
       }
       let judgements = [];
@@ -286,7 +301,7 @@ class DedupEngine {
           queued++;
         }
       }
-      db.prepare("UPDATE mem SET dedup_status = 'done' WHERE id = ?").run(row.id);
+      markDone.run(row.id);
     }
     this.emit({ type: "dedup", scanned, merged, queued, tokens: this.tokensUsed });
     return { scanned, merged, queued, acted: merged + queued, tokens: this.tokensUsed };
@@ -359,7 +374,14 @@ class DedupEngine {
   async resolveQueue(id, action, payload) {
     const row = this.service.index.db.prepare("SELECT * FROM review_queue WHERE id = ?").get(id);
     if (!row) return { ok: false, message: "队列项不存在" };
-    const data = JSON.parse(row.payload || "{}");
+    // 与 service.confirmSuggestion 同口径：payload 损坏时显式失败，不冒英文异常
+    let data;
+    try {
+      data = JSON.parse(row.payload || "{}");
+    } catch {
+      return { ok: false, message: "队列项数据损坏，无法解析" };
+    }
+    if (!data || typeof data !== "object") return { ok: false, message: "队列项数据损坏，无法解析" };
     const svc = this.service;
     if (action === "adoptNew") {
       // DELETE 也需人工确认才会走到这，两臂同处理：采纳新记忆 = 把旧记忆标失效

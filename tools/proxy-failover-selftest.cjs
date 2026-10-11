@@ -25,6 +25,8 @@ async function main() {
   const rules = require("../electron/backend/proxy/rules.cjs");
   const pool = require("../electron/backend/proxy/pool.cjs");
   const server = require("../electron/backend/proxy/server.cjs");
+  // T6 用它推导「拥有该模型的渠道集合」，避免硬编码渠道数/顺序（渠道会持续新增）
+  const adapters = require("../electron/backend/proxy/adapters.cjs");
 
   store.open();
   rules.init();
@@ -45,6 +47,18 @@ async function main() {
         return;
       }
       hits[channel]++;
+      if (mode[channel] === "gate400") {
+        // 渠道身份校验拒绝（issue #78）：正文点名校验阶段与客户端身份
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end('{"error":{"code":"400","message":"Provider rejected this client (HTTP 400): channel-verification failed for unapproved client fingerprint"}}');
+        return;
+      }
+      if (mode[channel] === "param400") {
+        // 真参数类 400：与渠道校验无关，必须继续按 fatal 透传（回归守卫）
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end('{"error":{"code":"400","message":"litellm.BadRequestError: Custom_raccoonException - 该模型始终思考，不支持关闭思考；请使用 low、high 或 max。 (type: ) (request_id: chatcmpl-b20a87f9a12d438fbbe1715962597379)"}}');
+        return;
+      }
       if (mode[channel] === "boom") {
         res.writeHead(500, { "content-type": "application/json" });
         res.end('{"error":{"message":"upstream 5xx boom"}}');
@@ -84,7 +98,9 @@ async function main() {
   rules.reload("headers.json");
 
   // ===== 种子：trae 余额最高（半开回切时 auto 打分回到它），wba 次之；wb/zcode 无账号 =====
-  const t1 = store.addAccount({ channel: "trae", uid: "ft1", name: "T主号", token: "t-token", source: "paste", expiresAt: Date.now() + 7200000 });
+  // trae 账号刻意用**邮箱名**：失败轨迹会把账号名带回客户端，邮箱必须被脱敏
+  // （issue #74 的轨迹增强引入了账号名，脱敏是本自测要守住的隐私红线）
+  const t1 = store.addAccount({ channel: "trae", uid: "ft1", name: "tester@example.com", token: "t-token", source: "paste", expiresAt: Date.now() + 7200000 });
   const w1 = store.addAccount({ channel: "workbuddy_ai", uid: "fw1", name: "WBA备号", token: "w-token", source: "paste", expiresAt: Date.now() + 7200000 });
   store.updateAccount(t1, { credits: 1000, creditsAt: Date.now() });
   store.updateAccount(w1, { credits: 900, creditsAt: Date.now() });
@@ -220,14 +236,56 @@ async function main() {
   cfg.routeStrategy = "smart";
   cfg.channelFailover = true;
 
-  // ===== T6 全渠道耗尽：报错带完整渠道轨迹（zcode 无账号 poolEmpty 也计入轨迹） =====
+  // ===== T6 全渠道耗尽：报错带完整渠道轨迹（无账号的渠道 poolEmpty 也计入轨迹） =====
   mode.wba = "boom";
   await sleep(1700); // 等 T5b 的 1500ms 降级过期
   rr = await call({ model: "glm-5.3", stream: false, messages: bodyMsg });
   assert(rr.status >= 500, "T6 全渠道失败报错: " + rr.status);
   const t6err = (await rr.json()).error.message;
-  assert(/已尝试 3 个渠道/.test(t6err), "T6 轨迹渠道数: " + t6err);
-  assert(/trae→workbuddy_ai→zcode/.test(t6err), "T6 轨迹渠道顺序: " + t6err);
+  // 轨迹断言**不硬编码渠道名/条数**：轨迹长度由 channelFailoverMax 预算决定（此处 3），
+  // 内容取决于当时「拥有该模型且被路由到」的渠道。原先写死 "已尝试 3 个渠道" +
+  // "trae→workbuddy_ai→zcode"，每新增一个拥有 glm-5.3 的渠道就误报
+  // （实测：新增 lobster 后轨迹从 trae→workbuddy_ai→zcode 变为 trae→workbuddy_ai→lobster）。
+  // 现改为断言**语义不变量**：条数=预算上限、以主渠道 trae 开头、真实打过且失败的两个渠道
+  // 相对有序、无账号渠道也计入轨迹（poolEmpty 不静默）。
+  const m6 = /已尝试 (\d+) 个渠道（([^）]+)）/.exec(t6err);
+  assert(m6, "T6 轨迹格式应含「已尝试 N 个渠道（…）」: " + t6err);
+  // 轨迹项形如 `chan(账号A,账号B)`；无可用账号时括号内为「无可用账号」（issue #74：渠道名 ≠ 账号名，
+  // 只报渠道名会让用户误以为「我停用的账号怎么还在用」）。这里剥离括号取渠道名做顺序/条数断言，
+  // 并单独断言「每项都带账号括号」这一新文案契约。
+  const trailItems = m6[2].split(" → ");
+  const trail = trailItems.map((s) => String(s).replace(/\(.*$/, ""));
+  assert(
+    trailItems.every((s) => /\([^)]*\)$/.test(s)),
+    "T6 轨迹每一项都应带账号括号（渠道名(账号…)）: " + m6[2]
+  );
+  // 轨迹必须真的带出「用过的账号名」（不只括号存在）——这是 issue #74 修复的实质内容
+  const traeItem = trailItems.find((s) => s.startsWith("trae(")) || "";
+  assert(/\(.+\)$/.test(traeItem), "T6 trae 轨迹应带账号名: " + traeItem);
+  // 隐私红线：账号名是邮箱时必须脱敏，绝不能原样透出（消息会回到 API 客户端并落日志）
+  assert(!t6err.includes("tester@example.com"), "T6 轨迹不得原样带出邮箱账号名: " + t6err);
+  assert(/te····@example\.com/.test(t6err), "T6 邮箱账号名应按 maskAccountName 脱敏: " + t6err);
+  assert(
+    trail.length === cfg.channelFailoverMax,
+    `T6 轨迹条数应等于 channelFailoverMax 预算（${cfg.channelFailoverMax}），实际 ${trail.length}：${trail.join("/")}`
+  );
+  assert(trail[0] === "trae", "T6 轨迹以主渠道 trae 开头: " + trail.join("→"));
+  assert(
+    trail.includes("trae") && trail.includes("workbuddy_ai") &&
+      trail.indexOf("trae") < trail.indexOf("workbuddy_ai"),
+    "T6 轨迹含真实打过的 trae→workbuddy_ai 且相对有序: " + trail.join("→")
+  );
+  // 无账号的渠道（poolEmpty）也必须计入轨迹，不得静默
+  const accountChannels = new Set(["trae", "workbuddy_ai"]);
+  assert(
+    trail.some((c) => !accountChannels.has(c)),
+    "T6 无账号渠道（poolEmpty）也应计入轨迹: " + trail.join("→")
+  );
+  // 轨迹里的渠道必须都真的拥有该模型（防串到无关渠道）
+  const owners6 = new Set(adapters.modelOwners("glm-5.3"));
+  for (const c of trail) {
+    assert(owners6.has(c), `T6 轨迹渠道 ${c} 应拥有该模型（owners=${[...owners6].join("/")}）`);
+  }
 
   // ===== T7 恢复后成功：回切主渠道 + 清零；无账号且目录无此模型的渠道从未被打 =====
   mode.trae = "ok";
@@ -244,6 +302,51 @@ async function main() {
   assert(!snap.trae, "T7 trae 成功清零: " + JSON.stringify(snap));
   assert(hits.wb === 0, "T7 无账号且目录无此模型的渠道从未被打");
 
+  // ===== T8 渠道身份拒绝（issue #78）：400 + 客户端校验锚点 → 跳备选渠道、不罚号、不做同渠道换号 =====
+  {
+    mode.trae = "ok";
+    mode.wba = "gate400";
+    pool.noteSuccess(t1);
+    pool.noteSuccess(w1);
+    store.updateAccount(t1, { status: "online", coolUntil: 0, coolReason: "" });
+    store.updateAccount(w1, { status: "online", coolUntil: 0, coolReason: "" });
+    store.updateKey(k.id, { route: "workbuddy_ai" }); // 主渠道刻意钉在会被拒的那个
+    const h8 = { ...hits };
+    rr = await call({ model: "glm-5.3", stream: false, messages: bodyMsg });
+    const b8 = await rr.text();
+    assert(rr.status === 200, "T8 渠道身份拒绝应跳备选成功: " + rr.status + " " + b8.slice(0, 200));
+    assert(hits.wba === h8.wba + 1 && hits.trae === h8.trae + 1, "T8 被拒渠道打一次 + 备选打一次: " + JSON.stringify(hits));
+    const acc8 = store.getAccount(w1);
+    assert(!acc8.coolUntil && !acc8.coolReason, `T8 被拒渠道的账号不得被罚冷却: coolUntil=${acc8.coolUntil} reason=${acc8.coolReason}`);
+    row = store.recentRequests(1)[0];
+    assert(/failover:workbuddy_ai→trae/.test(row.error || ""), "T8 轨迹如实记 failover:workbuddy_ai→trae: " + row.error);
+    store.updateKey(k.id, { route: "auto" });
+  }
+
+  // ===== T9 真参数类 400（无校验锚点）→ 仍按 fatal 透传，不得跳备选白绕一圈 =====
+  {
+    mode.trae = "param400";
+    mode.wba = "ok";
+    store.updateAccount(t1, { status: "online", coolUntil: 0, coolReason: "" });
+    store.updateKey(k.id, { route: "trae" });
+    const h9 = { ...hits };
+    rr = await call({ model: "glm-5.3", stream: false, messages: bodyMsg });
+    const b9 = await rr.text();
+    assert(rr.status === 400, "T9 真参数 400 必须原样透传: " + rr.status + " " + b9.slice(0, 200));
+    assert(hits.wba === h9.wba, "T9 参数类错误不得跳备选（白绕一圈多烧额度）: " + JSON.stringify(hits));
+    assert(/不支持关闭思考/.test(b9), "T9 文案应带上游原文: " + b9.slice(0, 240));
+    assert(/request_id=chatcmpl-/.test(store.recentRequests(1)[0].error || ""), "T9 记账要留 request_id（200 字截断会切掉它）: " + store.recentRequests(1)[0].error);
+    store.updateKey(k.id, { route: "auto" });
+    mode.trae = "ok";
+  }
+
+  // ===== T10 反向映射不再把备选集合收窄成映射里写的渠道（issue #78）=====
+  {
+    const ownersRev = adapters.modelOwners("glm-5.3", { modelReverseAliases: { "glm-5.3": { raccoon: "sn-glm-5-3-flash" } } });
+    assert(ownersRev[0] === "raccoon", "T10 反向映射命中的渠道排最前: " + ownersRev.join("/"));
+    assert(ownersRev.length >= 2, "T10 反向映射不得收窄备选（实际 " + ownersRev.join("/") + "）");
+  }
+
   // ===== 收尾：恢复规则文件，关服务与假上游，清种子 =====
   fs.writeFileSync(headersPath, headersBackup);
   rules.reload("headers.json");
@@ -252,7 +355,7 @@ async function main() {
   store.deleteKey(k.id);
   store.removeAccount(t1);
   store.removeAccount(w1);
-  console.log("FAILOVER SELFTEST OK（跨渠道跳转 / 降级避让 / fixed 跳备选 / 半开翻倍 / 成功回切清零 / 开关 / 全渠道轨迹）");
+  console.log("FAILOVER SELFTEST OK（跨渠道跳转 / 降级避让 / fixed 跳备选 / 半开翻倍 / 成功回切清零 / 开关 / 全渠道轨迹 / 渠道身份拒绝自救不罚号 / 真参数 400 不放宽 / 反向映射不收窄备选）");
 }
 
 main()

@@ -211,9 +211,18 @@ export const SETTINGS_TABS: { key: SettingsTab; name: string; icon: string; desc
 
 export interface AppConfig {
   theme: Theme;
-  /** 界面动效开关（仅展示层）：默认关闭，用户在设置里开启后本机记住；
+  /** 界面动效总开关（仅展示层）：默认开启，用户在设置里关闭后本机记住；
       false 时恢复系统鼠标指针并停用装饰动画，业务逻辑不受影响 */
   fx: boolean;
+  /** 粒子尘场（界面动效的子开关，默认关闭）：最底层 canvas 尘粒，
+      持续重绘并驱动毛玻璃重新采样，是背景层最吃性能的一项 */
+  fxParticles: boolean;
+  /** 光池追随（界面动效的子开关，默认关闭）：鼠标互动光影——
+      两团跟随光标游走的光斑、玻璃壳随光标的反光、卡片悬停聚光与液态背景的光标视差 */
+  fxPools: boolean;
+  /** 个性化鼠标样式（界面动效的子开关，默认开启）：液滴光标 + 点击涟漪；
+      关闭后恢复系统指针，业务逻辑不受影响 */
+  fxCursor: boolean;
   moduleOrder: ModuleKey[];
   tools: Record<string, { enabled: boolean; paths: string[]; name?: string; icon?: string }>;
   customDirs: string[];
@@ -265,6 +274,8 @@ export interface ProxyConfig {
   routeStrategy: "smart" | "fixed";
   /** fixed 策略下的优先渠道（渠道 id；渠道可扩充，故为字符串） */
   fixedChannel: string;
+  /** 渠道成本感知排序：score=按打分（现状）/ cost-first=按成本档升序（免费→低成本→普通，组内按打分） */
+  routeOrder: "score" | "cost-first";
   rateLimitPerMin: number;
   concurrency: number;
   creditsRefreshMin: number;
@@ -295,10 +306,14 @@ export interface ProxyConfig {
   channelCooldownMs: number;
   /** 渠道降级指数退避封顶（毫秒） */
   channelCooldownCapMs: number;
-  /** 定时自动签到（默认关）：每天到点自动跑全渠道签到/领加油包 */
+  /** 定时自动签到总闸（默认开）：托盘面板与号池页「自动开/关」写它，关闭则全部渠道的自动签到停摆 */
   checkinAuto: boolean;
-  /** 每日自动签到时间（HH:mm） */
+  /** 全局自动签到时间（HH:mm）：无任何启用的按渠道规则时的兜底时刻 */
   checkinAutoTime: string;
+  /** 按渠道自动签到：{ [渠道 id]: 规则 }，号池页各渠道工具栏各自设置（默认全关） */
+  checkinAutoRules: Record<string, ProxyCheckinAutoRule>;
+  /** 渠道启闭（「上游启闭」弹窗）：{ [渠道 id]: true|false }，缺省 = 启用；关闭的渠道全部页面动态隐藏 */
+  channelEnabled: Record<string, boolean>;
   /** 积分任务·猫猫旅行自动派/领（仅 WB CN，15 分钟轮询状态机） */
   growthTravelAuto: boolean;
   /** 积分任务·夜猫子自动领（仅 WB CN，23:00~08:00 窗口） */
@@ -311,19 +326,34 @@ export interface ProxyConfig {
   ccSwitchModel: string;
 }
 
+/** 按渠道自动签到规则（proxy.checkinAutoRules 的值；号池页「自动签到」弹窗读写） */
+export interface ProxyCheckinAutoRule {
+  enabled: boolean;
+  /** 每日执行时间 HH:mm */
+  time: string;
+  /** 抖动分钟数：到点后随机延迟 0~jitterMin 分钟执行（当天内固定，默认 0 = 不抖） */
+  jitterMin: number;
+}
+
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
 
-export type ProxyChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "zcode" | "qoder" | "qoder_intl";
+export type ProxyChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "modelscope" | "lobster" | "zcode" | "catpaw" | "qoder" | "qoder_intl";
 /** Key 路由：auto 或任一渠道 id（渠道后续扩充即为普通字符串，保留字面量仅为补全提示） */
 export type ProxyRoute = "auto" | ProxyChannelId | (string & {});
 export type ProxyAccountStatus = "online" | "cooling" | "exhausted" | "relogin" | "disabled";
 export type ProxyPoolStrategy = "expire_first" | "credit_first" | "round_robin";
+/** 渠道成本档（cost-first 路由排序用；'' = 未标注按 normal 解释） */
+export type ProxyCostTier = "free" | "low" | "normal";
+/** per-key 路由策略（'' = 跟随全局） */
+export type ProxyRouteOrder = "" | "score" | "cost-first";
 
 export interface ProxyKeyRow {
   id: string;
   name: string;
   mask: string;
   route: ProxyRoute;
+  /** per-key 路由策略覆盖（'' = 跟随全局默认） */
+  routeOrder: ProxyRouteOrder;
   dailyQuota: number;
   rateLimit: number;
   enabled: boolean;
@@ -376,6 +406,8 @@ export interface ProxyAccount {
   coolReason: string;
   /** 最近一次上游错误（号池状态气泡展示用；只留最新一条，无则为 null） */
   lastError?: { at: number; message: string } | null;
+  /** 今日签到结果（行内按钮三态与详情弹窗数据源；只留当天一条，跨天按 day 判为过期） */
+  checkin?: ProxyCheckinRecord | null;
   /** 生效中的模型级负缓存（6004/11102 只罚"账号×模型"不落账号状态；空数组 = 无） */
   modelCool?: { model: string; until: number; reason: string }[];
   source: "scan" | "oauth" | "paste";
@@ -415,10 +447,16 @@ export interface ProxyChannelView {
   display: string;
   domain: string;
   poolStrategy: ProxyPoolStrategy;
+  /** 成本档（cost-first 路由排序用；空串 = 未标注按 normal） */
+  costTier: ProxyCostTier | "";
+  /** 该渠道的自动签到规则（读源；写走 proxy_checkin_auto_set） */
+  checkinAuto: ProxyCheckinAutoRule;
   summary: ProxyPoolSummary;
   accounts: ProxyAccount[];
   /** 降级状态：null = 正常 */
   health: ProxyChannelHealth | null;
+  /** 渠道启闭（「上游启闭」弹窗）：缺省/true = 启用；false = 已关闭（全部页面动态隐藏） */
+  enabled?: boolean;
 }
 
 export interface ProxyGatewayStatus {
@@ -466,6 +504,27 @@ export interface ProxyStatsDetail {
   page: number;
   pageSize: number;
   rows: ProxyUsageRow[];
+}
+
+/** 反代网关操作日志（proxy_oplog_list / proxy_oplog_export 的行；op_logs 表） */
+export interface ProxyOpLogRow {
+  id: number;
+  ts: number;
+  /** info = 成功/常规；warn = 降级/需人工/4xx；error = 失败/5xx/网络 */
+  level: string;
+  /** 操作分类（代理请求 / 签到 / 网关启停 / API Key / 号池账号 / 网关配置 / OAuth 登录 / 模型目录 / 切换账号 / 生态接入 / 号池同步 / 自动签到 / 冷却与风控） */
+  op: string;
+  message: string;
+  channel: string;
+  /** 对象（账号名 / Key 名 / uid 等业务主体） */
+  target: string;
+  /** 详情（上游错误轨迹等，列表里 tooltip 展示） */
+  detail: string;
+}
+
+export interface ProxyOpLogList {
+  rows: ProxyOpLogRow[];
+  total: number;
 }
 
 export interface ModelCustomEntry {
@@ -592,6 +651,31 @@ export interface ZcodeClaimModeResult {
   anchorMid?: string;
   /** 客户端是否已自动重启 */
   relaunched?: boolean;
+  message?: string;
+}
+
+/** 账号今日签到记录（主进程 meta.checkin 持久化）：号池行内按钮三态 + 详情弹窗的数据源 */
+export interface ProxyCheckinRecord {
+  /** 记录所属日期 YYYY-MM-DD（本地时区）：与今天不一致即视为过期，按钮回到待签到 */
+  day: string;
+  /** 记录时刻（毫秒时间戳） */
+  at: number;
+  /** 执行的动作：checkin=签到 / trial=加油包 */
+  action: "checkin" | "trial";
+  ok: boolean;
+  /** 已签到 / 已领取过（幂等成功） */
+  already?: boolean;
+  /** 服务对该账号不开放（视为完成，不是失败） */
+  unavailable?: boolean;
+  /** zcode 领取奖励需人机校验（自动 tick 跳过，视为失败待人工） */
+  needCaptcha?: boolean;
+  /** zcode 1004：设备指纹本周已被消耗 */
+  deviceBurned?: boolean;
+  /** 本次获得积分/Credits */
+  credit?: number;
+  /** 连续签到天数 */
+  streakDays?: number;
+  /** 结果说明 / 失败原因（截 400 字） */
   message?: string;
 }
 
@@ -738,6 +822,7 @@ export const MODULES: ModuleDef[] = [
       { id: "stats", name: "用量统计" },
       { id: "poolsync", name: "号池同步" },
       { id: "ccswitch", name: "生态接入" },
+      { id: "proxylog", name: "日志" },
     ],
   },
   {
@@ -845,6 +930,8 @@ export type MemoryProjectCard = {
   slug: string;
   name: string;
   remotes: string[];
+  /** 完整 git 地址（host/owner/repo，来自 origin 探测；老卡可能为空） */
+  gitUrl?: string;
   aliases: string[];
   localPaths: string[];
   origin: string;

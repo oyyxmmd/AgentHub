@@ -64,6 +64,12 @@ async function setUiTabs(page, sleep, wanted) {
     if (sub) sub.click();
   });
   await sleep(800);
+  // v1.29.0 起配置项按 tier 折叠：ui.tabs 属高级项，得先展开「高级项」按钮它才会渲染
+  await page(() => {
+    const btn = [...document.querySelectorAll("button")].find((b) => b.textContent.includes("展开调优"));
+    if (btn) btn.click();
+  });
+  await sleep(600);
   const adjusted = await page((wantedJson) => {
     const wantedSet = new Set(JSON.parse(wantedJson));
     const field = [...document.querySelectorAll(".mem-field")].find((f) => ((f.querySelector(".f-label") || {}).textContent || "").includes("显示的页签"));
@@ -201,6 +207,15 @@ async function main() {
   const joined = (sidebar.rows || []).join(" | ");
   check("出现记忆专属行（记忆总量 / 待确认 / 索引健康）", /记忆总量/.test(joined) && /待确认/.test(joined) && /索引健康/.test(joined), joined.slice(0, 220));
   check("不再显示反代网关渠道行", !/空号池|渠道/.test(joined), joined.slice(0, 160));
+  // 数字后必须带单位（与渠道额度的「积分/Tokens」两段式同构）：没有单位就只能靠猜
+  const totalRow = (sidebar.rows || []).find((r) => r.includes("记忆总量")) || "";
+  const pendingRow = (sidebar.rows || []).find((r) => r.includes("待确认")) || "";
+  check("记忆总量末尾数字带「条」单位", /条$/.test(totalRow), totalRow);
+  check("待确认末尾数字带「项」单位", /项$/.test(pendingRow), pendingRow);
+  // 单位改动是两处口径（末尾数字 + L2 徽标 + 项目行），只断言末尾会漏掉徽标/项目行的回归
+  check("L2 徽标带「条」单位（L2 N 条）", /L2\s*[\d,]+\s*条/.test(totalRow), totalRow);
+  const projectRows = (sidebar.rows || []).filter((r) => /最近/.test(r));
+  check("项目行数字带「条」单位", projectRows.length > 0 && projectRows.every((r) => /条$/.test(r)), JSON.stringify(projectRows));
 
   console.log("[3] 各页小问号与提示气泡");
   const marks = {};
@@ -214,6 +229,26 @@ async function main() {
   }
   check("九个页签都能点到（全量勾回后）", Object.values(marks).every((n) => n >= 0), JSON.stringify(marks));
   check("每页小问号数量达标（各页 ≥3）", Object.entries(marks).every(([, n]) => n >= 3), JSON.stringify(marks));
+
+  // 趁九个页签还都勾着，验一眼导入页的新渠道卡片（Trae / Antigravity 两个来源）
+  console.log("[3b] 导入与去重：新渠道来源卡片");
+  const importCards = await page(() => {
+    const target = [...document.querySelectorAll(".tabs button.tab")].find((b) => b.textContent.includes("导入与去重"));
+    if (!target) return { ok: false, reason: "no-tab" };
+    target.click();
+    return new Promise((resolve) => setTimeout(() => {
+      const tiles = [...document.querySelectorAll(".memory-scope .mem-tile")].map((t) => t.textContent.replace(/\s+/g, " ").trim());
+      if (!tiles.length) return resolve({ ok: false, reason: "no-tiles" });
+      resolve({
+        ok: true,
+        trae: tiles.find((t) => t.includes("Trae 系会话")) || "",
+        antigravity: tiles.find((t) => t.includes("Antigravity 会话")) || "",
+      });
+    }, 900));
+  });
+  check("导入页渲染出 Trae 系来源卡片", !!importCards.trae, JSON.stringify(importCards).slice(0, 240));
+  check("Trae 卡片标明「加密会话库 + 自动解密」", /加密会话库/.test(importCards.trae || "") && /SQLCipher/.test(importCards.trae || ""), (importCards.trae || "").slice(0, 200));
+  check("导入页渲染出 Antigravity 来源卡片（格式为会话日志）", /Antigravity 会话日志/.test(importCards.antigravity || ""), (importCards.antigravity || "").slice(0, 200));
 
   // 逐页检查完毕，把页签显隐恢复成默认 5 个核心页（不污染探针环境以外的配置）
   await setUiTabs(page, sleep, DEFAULT_TAB_NAMES);
@@ -510,7 +545,9 @@ async function main() {
             snap[names[i]] = {
               rows: dlg.querySelectorAll(".switch-row").length,
               switches: dlg.querySelectorAll(".switch-row .switch").length,
-              selects: dlg.querySelectorAll(".switch-row select.f-select").length,
+              // v1.38.3 起原生 select 全换成了 Element 组件（class 为 f-el-select），
+              // 断言只认 select.f-select 会永远数到 0——两种都算，别再让测试跟丢产品形态
+              selects: dlg.querySelectorAll(".switch-row select.f-select, .switch-row .f-el-select").length,
               inputs: dlg.querySelectorAll(".switch-row input.f-input").length,
             };
             i++;

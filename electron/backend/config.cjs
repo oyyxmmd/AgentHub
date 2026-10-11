@@ -80,6 +80,12 @@ function configPath() {
 function defaultConfig() {
   return {
     theme: "dark",
+    // 界面动效总开关（装饰层，默认开启）；粒子尘场 / 光池追随是它的两个独立子开关，默认关闭
+    // （两者是背景层最吃性能的两项，开启前设置页会给性能提示）；个性化鼠标样式默认开启
+    fx: true,
+    fxParticles: false,
+    fxPools: false,
+    fxCursor: true,
     // 左栏四大模块的显示顺序（用户在「设置 · 个性化」中调整）
     moduleOrder: ["skills", "sync", "proxy", "memory"],
     // ===== 技能仓库 =====
@@ -146,6 +152,8 @@ function defaultConfig() {
       restoreOnLaunch: false,    // 网关开关的上次状态：启动应用时是否随之启动（默认关，由用户自行开启）
       routeStrategy: "smart",   // smart=智能路由（健康度×余额打分）/ fixed=指定渠道优先
       fixedChannel: "trae",     // fixed 策略下的优先渠道
+      routeOrder: "score",      // 渠道成本感知排序：score=按打分（现状）/ cost-first=按成本档升序
+                                // （免费→低成本→普通，组内仍按打分）；Key 可单独覆盖
       rateLimitPerMin: 120,     // 单 Key 令牌桶限速（次/分钟，Key 可单独覆盖）
       concurrency: 8,           // 上游并发上限
       creditsRefreshMin: 30,    // 额度自动刷新周期（分钟）
@@ -166,6 +174,10 @@ function defaultConfig() {
       channelCooldownCapMs: 900000,  // 渠道降级指数退避封顶（15 分钟）
       checkinAuto: true,        // 定时自动签到（默认开）：每天到点自动跑全渠道签到/领加油包
       checkinAutoTime: "09:00", // 每日自动签到时间（HH:mm）
+      checkinAutoRules: {},     // 按渠道自动签到：{ [渠道 id]: { enabled, time:"HH:mm", jitterMin } }，
+                                // 号池页各渠道工具栏各自设置（时间/抖动独立；默认全关）
+      channelEnabled: {},       // 渠道启闭（「上游启闭」弹窗）：{ [渠道 id]: true|false }，缺省 = 启用。
+                                // 关闭的渠道在反代网关全部页面隐藏，路由/调用/调度也不再使用，重新打开立即恢复
       growthTravelAuto: true,   // 积分任务·猫猫旅行自动派/领（仅 WB CN，15 分钟轮询状态机）
       growthCatAuto: true,      // 积分任务·夜猫子自动领（仅 WB CN，23:00~08:00 窗口）
       growthActivityAuto: true, // 积分任务·活跃地图自动跑（仅 WB CN，每日 ≥10 点一次：上报+连登奖励链）
@@ -198,6 +210,35 @@ function normalizeModuleOrder(order) {
   const list = (Array.isArray(order) ? order : []).filter((k) => known.includes(k));
   for (const k of known) if (!list.includes(k)) list.push(k);
   return list;
+}
+
+// ===== 按渠道自动签到规则（proxy.checkinAutoRules）：号池页每个渠道一套时间/抖动 =====
+
+/** HH:mm 归一化：格式或数值越界（h>23 / m>59）一律回落 09:00（配置可能被手改，下游 tick 不必再判合法性） */
+function normalizeHm(v) {
+  const m = /^(\d{1,2}):(\d{1,2})$/.exec(String(v || "").trim());
+  if (!m) return "09:00";
+  const h = Number(m[1]);
+  const mi = Number(m[2]);
+  if (h > 23 || mi > 59) return "09:00";
+  return `${String(h).padStart(2, "0")}:${String(mi).padStart(2, "0")}`;
+}
+
+/** 抖动分钟数归一化：0~180 整数（到点后随机延迟 0~N 分钟执行） */
+function normalizeJitter(v) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.min(180, Math.max(0, n)) : 0;
+}
+
+/** 按渠道规则归一化：剔除畸形项，逐渠道收敛为 { enabled, time, jitterMin } 三键 */
+function normalizeCheckinRules(rules) {
+  const out = {};
+  if (!rules || typeof rules !== "object" || Array.isArray(rules)) return out;
+  for (const [id, r] of Object.entries(rules)) {
+    if (!r || typeof r !== "object") continue;
+    out[id] = { enabled: r.enabled === true, time: normalizeHm(r.time), jitterMin: normalizeJitter(r.jitterMin) };
+  }
+  return out;
 }
 
 // ===== 统一 WebDAV 服务器（webdavShared）：三套同步共用一套凭据，根目录各自隔离 =====
@@ -335,6 +376,11 @@ function loadConfig() {
   // 迁移：旧版 proxy.autoStart 是「永远自启」的开关且默认 true，不是用户选择；
   // 新语义是 restoreOnLaunch「记住上次开关」，所以旧值一律丢弃，改完存盘即不再出现
   if (merged.proxy && "autoStart" in merged.proxy) delete merged.proxy.autoStart;
+  // 迁移：上游 v1.45 起自动签到改为按渠道规则（proxy.checkinAutoRules）。fork 保留全局
+  // 总闸 checkinAuto（托盘面板 / 号池页「自动开/关」在用）与 checkinAutoTime：tick 在
+  // 「无任何启用规则」时按 checkinAutoTime 每天跑一次全渠道，旧配置行为不变，故不删字段、
+  // 也不搬运成规则——一旦搬运，无规则兜底分支永不生效，且全渠道会被铺满 enabled 规则
+  merged.proxy.checkinAutoRules = normalizeCheckinRules(merged.proxy.checkinAutoRules);
   if (merged.theme !== "dark" && merged.theme !== "light") merged.theme = "dark";
   merged.moduleOrder = normalizeModuleOrder(merged.moduleOrder);
   merged.webdav.password = decryptSecret(merged.webdav.password);
@@ -424,4 +470,5 @@ module.exports = {
   dataDir, configPath, hubDir, ensureHub, loadConfig, saveConfig, defaultConfig,
   getUpdateNotified, setUpdateNotified, isPortable, encryptSecret, decryptSecret, applyAutoStart,
   loadSharedWebdav, saveSharedWebdav, maskedSharedWebdav, moduleWebdav, PASSWORD_MASK,
+  normalizeHm, normalizeJitter,
 };

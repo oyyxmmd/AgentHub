@@ -10,16 +10,24 @@
 // 结构照搬 usage-scheduler.cjs（可行性复核 §4.1 已验证的五个设计）。
 "use strict";
 
+// 休眠唤醒守卫：唤醒后静默窗内跳过本轮（见 backend/wakeGuard.cjs 的实测说明）。
+// 与「时间回拨保护」的区别：那个防的是系统时间被调**早**；睡眠是时间**前进**，抓不到。
+const wakeGuard = require("../wakeGuard.cjs");
+
 const TASK_DEFS = [
   { id: "extract", name: "抽取结构化信息", needsModel: true, defaultInterval: 30, estimate: "每批 20 条约 800 token" },
   { id: "summarize", name: "生成摘要", needsModel: true, defaultInterval: 30, estimate: "每批 20 条约 600 token" },
   { id: "tag", name: "自动打标签", needsModel: true, defaultInterval: 30, estimate: "每批 20 条约 400 token" },
   { id: "classify", name: "项目归类建议", needsModel: false, defaultInterval: 60, estimate: "0（本地算法）" },
-  { id: "supersede", name: "失效判定", needsModel: true, daily: "23:00", estimate: "每组约 1,500 token" },
-  { id: "distill", name: "L2 蒸馏", needsModel: true, daily: "23:30", estimate: "每项目约 3,000 token" },
-  { id: "consolidate", name: "去重合并", needsModel: true, weekly: 0, weeklyTime: "02:00", estimate: "每轮约 5,000 token" },
-  { id: "profile", name: "人格 / 偏好画像", needsModel: true, weekly: 0, weeklyTime: "03:00", estimate: "每次约 8,000 token" },
+  // 按天/按周的重任务默认排在白天错峰执行（2026-10-08 起，均在 11:00~12:00 窗口内依次跑）：
+  //   失效判定 → L2 蒸馏 → 异常记忆清理：11:00 / 11:10 / 11:20；去重合并 → 人格画像：周一 11:00 / 11:10
+  { id: "supersede", name: "失效判定", needsModel: true, daily: "11:00", estimate: "每组约 1,500 token" },
+  { id: "distill", name: "L2 蒸馏", needsModel: true, daily: "11:10", estimate: "每项目约 3,000 token" },
+  { id: "consolidate", name: "去重合并", needsModel: true, weekly: 1, weeklyTime: "11:00", estimate: "每轮约 5,000 token" },
+  { id: "profile", name: "人格 / 偏好画像", needsModel: true, weekly: 1, weeklyTime: "11:10", estimate: "每次约 8,000 token" },
   { id: "index-scan", name: "索引自愈扫描", needsModel: false, defaultInterval: 360, estimate: "0（本地扫描）" },
+  // 每天清理：回收站到期彻底删除（恒定执行）+ 按五个清理开关删除异常记忆（开关默认全关）
+  { id: "cleanup", name: "异常记忆清理", needsModel: false, daily: "11:20", estimate: "0（本地扫描）" },
 ];
 
 const TICK_MS = 60000;
@@ -73,11 +81,11 @@ class MemoryScheduler {
     const ranInSameCycle = (d) => !!last && new Date(last).toDateString() === d.toDateString();
     if (t.weekly != null) {
       const d = new Date();
-      const [hh, mm] = String(t.weeklyTime || "03:00").split(":").map(Number);
+      const [hh, mm] = String(t.weeklyTime || "11:00").split(":").map(Number);
       const candidate = new Date(d);
       const diff = (t.weekly - d.getDay() + 7) % 7;
       candidate.setDate(d.getDate() + diff);
-      candidate.setHours(hh || 3, mm || 0, 0, 0);
+      candidate.setHours(hh || 11, mm || 0, 0, 0);
       if (candidate.getTime() <= now || ranInSameCycle(candidate)) candidate.setDate(candidate.getDate() + 7);
       return candidate.getTime();
     }
@@ -85,7 +93,7 @@ class MemoryScheduler {
       const d = new Date();
       const [hh, mm] = String(t.daily).split(":").map(Number);
       const candidate = new Date(d);
-      candidate.setHours(hh || 23, mm || 0, 0, 0);
+      candidate.setHours(hh || 11, mm || 0, 0, 0);
       if (candidate.getTime() <= now || ranInSameCycle(candidate)) candidate.setDate(candidate.getDate() + 1);
       return candidate.getTime();
     }
@@ -132,6 +140,15 @@ class MemoryScheduler {
           successRate: stats.successRate,
           runs: stats.runs,
           tokens: stats.tokens,
+          // 出厂节奏（取自 TASK_DEFS 原始定义，不被用户配置覆盖）：
+          // 「恢复默认时间」按钮的唯一数据源 —— 行内上面那组是被用户配置合并后的生效值，
+          // 用户改过节奏后就分不清默认值是什么了
+          default: {
+            intervalMin: d.defaultInterval || null,
+            daily: d.daily || null,
+            weekly: d.weekly != null ? d.weekly : null,
+            weeklyTime: d.weeklyTime || null,
+          },
         };
       }),
     };
@@ -266,6 +283,13 @@ class MemoryScheduler {
   async _tickInner() {
     const cfg = this.getConfig();
     if (cfg["auto.enabled"] === false) return;
+    // 唤醒守卫（见 backend/wakeGuard.cjs）：
+    //   B. 先做时间跳跃检测——不依赖电源事件的兜底（必须**先于** A 判定调用）
+    //   A. 静默窗内跳过本轮：睡眠期间定时器不触发、唤醒后立刻到期，
+    //      此时跳过可避免与签到、额度刷新在唤醒瞬间一起收敛。
+    // 跳过的代价为零：各任务按自身 lastRun 判到期，下一轮 tick 自会补上。
+    wakeGuard.noteTick("memory-sched", TICK_MS);
+    if (!wakeGuard.periodicAllowed()) return;
     const now = Date.now();
     if (this.paused) {
       if (this.pausedUntil && now >= this.pausedUntil) this.resume();
@@ -313,8 +337,8 @@ class MemoryScheduler {
     if (t.weekly != null) {
       const d = new Date(now);
       if (d.getDay() !== Number(t.weekly)) return false;
-      const [hh, mm] = String(t.weeklyTime || "03:00").split(":").map(Number);
-      const todayTarget = new Date(d).setHours(hh || 3, mm || 0, 0, 0);
+      const [hh, mm] = String(t.weeklyTime || "11:00").split(":").map(Number);
+      const todayTarget = new Date(d).setHours(hh || 11, mm || 0, 0, 0);
       if (now < todayTarget) return false;
       const lastDate = last ? new Date(last).toDateString() : "";
       return lastDate !== d.toDateString();
@@ -322,7 +346,7 @@ class MemoryScheduler {
     if (t.daily) {
       const d = new Date(now);
       const [hh, mm] = String(t.daily).split(":").map(Number);
-      if (now < new Date(d).setHours(hh || 23, mm || 0, 0, 0)) return false;
+      if (now < new Date(d).setHours(hh || 11, mm || 0, 0, 0)) return false;
       const lastDate = last ? new Date(last).toDateString() : "";
       return lastDate !== d.toDateString();
     }
@@ -426,7 +450,7 @@ class MemoryScheduler {
       // 记账（mem_sched_<id>）决定"下次什么时候到期"：
       //   自动执行无论成败都推进 —— 否则失败的任务下一 tick 立刻重试，形成每 60 秒一次的报错风暴；
       //   手动「立即执行」只在成功时推进 —— 否则一次失败的试跑会把当天还没到点的按天任务顶掉
-      //   （蒸馏手动失败后当天 23:30 不再跑，L2 白等一天）。
+      //   （蒸馏手动失败后当天 11:10 不再跑，L2 白等一天）。
       if (record.ok || opts.auto) this.service.index.setMeta(`mem_sched_${id}`, String(Date.now()));
       this.pruneHistory();
       this.service.index.setMeta("mem_sched_history", JSON.stringify(this.history.slice(-200)));
@@ -454,6 +478,8 @@ class MemoryScheduler {
         return tasks.runProfile({});
       case "index-scan":
         return Promise.resolve(this._runIndexScan());
+      case "cleanup":
+        return this._runCleanup();
       default:
         throw new Error(`任务 ${id} 未实现`);
     }
@@ -493,6 +519,50 @@ class MemoryScheduler {
     const caseFixed = this.service.normalizeCase(onDisk);
     const stat = this.service.index.selfCheck();
     return { processed: files.length, updated: fixed, tokens: 0, detail: `扫描 ${files.length} 个文件，补索引 ${fixed} 条，清失效 ${pruned} 条，大小写归一 ${caseFixed} 条${stat.rebuilt ? "，并重建了 FTS" : ""}` };
+  }
+
+  /**
+   * 异常记忆清理：按五个清理开关删除异常记忆（一律先进回收站，保留期内可恢复），
+   * 并把回收站里到期的文件彻底删除。
+   *
+   * 回收站彻底删除不受开关影响 —— 保留期到期是删除的最终形态，每天都该收口；
+   * 五个开关全关时不做全库扫描（扫描要逐个读文件，白花磁盘 IO）。
+   * 冲突类删除后把对应同步冲突记录一并移除（否则同步页永远挂着指向已删文件的冲突）。
+   */
+  async _runCleanup() {
+    if (this.service.index.readOnly) {
+      return { processed: 0, updated: 0, tokens: 0, detail: "索引库只读模式，跳过清理" };
+    }
+    const days = Math.max(1, Number(this.getConfig()["storage.trashKeepDays"] || 30));
+    this.progress(5, "清理回收站到期文件");
+    const purged = this.service.trashPurge(days).removed;
+    const flags = this.service.cleanupFlags();
+    const anyKind = flags.superseded || flags.missing || flags.error || flags.conflict || flags.invalid;
+    if (!anyKind) {
+      return {
+        processed: 0, updated: 0, tokens: 0,
+        detail: `五类清理开关均未开启；回收站彻底删除 ${purged} 个到期文件（保留 ${days} 天）`,
+      };
+    }
+    // 未裁决的同步冲突路径（同步模块未装载时按空处理）
+    let conflictPaths = [];
+    if (flags.conflict && this.syncer && typeof this.syncer.conflictsList === "function") {
+      try { conflictPaths = this.syncer.conflictsList().map((c) => c && c.path).filter(Boolean); } catch { conflictPaths = []; }
+    }
+    this.progress(20, "扫描异常记忆");
+    const r = await this.service.cleanupRun({ conflictPaths });
+    if (!r.ok) return { processed: 0, updated: 0, tokens: 0, detail: r.message || "清理失败" };
+    // 冲突记录收口：被删除的冲突记忆不再挂在同步页的冲突队列里
+    let droppedConflicts = 0;
+    if (flags.conflict && (r.conflictPaths || []).length && this.syncer && typeof this.syncer.dropConflicts === "function") {
+      try { droppedConflicts = this.syncer.dropConflicts(r.conflictPaths); } catch { /* 忽略 */ }
+    }
+    const rm = r.removed;
+    const detail = `清理：失效 ${rm.superseded} · 不存在 ${rm.missing} · 报错 ${rm.error} · 冲突 ${rm.conflict} · 无效 ${rm.invalid}（先进回收站）；`
+      + `回收站彻底删除 ${purged} 个到期文件（保留 ${days} 天）`
+      + (r.skipped && r.skipped.conflict ? `；跳过 daily 多节冲突文件 ${r.skipped.conflict} 个` : "")
+      + (droppedConflicts ? `；清掉 ${droppedConflicts} 条同步冲突记录` : "");
+    return { processed: r.total, updated: r.total, tokens: 0, detail };
   }
 
   /** 自动定时同步：sync.auto + sync.intervalMin（此前只有手动按钮，配置项是"假旋钮"） */

@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const config = require("../config.cjs");
+const { redact } = require("./redact.cjs");
 
 // 驱动与用量同步模块一致：Node 22 内置 node:sqlite 优先（纯 JS 无原生编译依赖）；
 // 老运行时没有 node:sqlite 时回退 better-sqlite3（方案选型，接口对齐）
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS keys (
   key_prefix TEXT NOT NULL DEFAULT '',
   key_suffix TEXT NOT NULL DEFAULT '',
   route TEXT NOT NULL DEFAULT 'auto',
+  route_order TEXT NOT NULL DEFAULT '',
   daily_quota INTEGER NOT NULL DEFAULT 0,
   rate_limit INTEGER NOT NULL DEFAULT 0,
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -51,6 +53,7 @@ CREATE TABLE IF NOT EXISTS agents (
   display TEXT NOT NULL DEFAULT '',
   domain TEXT NOT NULL DEFAULT '',
   pool_strategy TEXT NOT NULL DEFAULT 'expire_first',
+  cost_tier TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS accounts (
@@ -113,6 +116,17 @@ CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_requests(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_key ON usage_requests(key_id, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_channel ON usage_requests(channel, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model, ts);
+CREATE TABLE IF NOT EXISTS op_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  level TEXT NOT NULL DEFAULT 'info',
+  op TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL DEFAULT '',
+  channel TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_oplog_ts ON op_logs(ts);
 `;
 
 /**
@@ -120,6 +134,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model, ts);
  * Qoder 双区：CN 与 INTL 各自独立接入（账号与额度池互不相通）。
  * INTL 免费额度不含 DeepSeek-Flash / GLM-5.3-Flash 等（需充值/额度覆盖才有可用模型），
  * 界面提示已注明；其签名器依赖本机安装的国际版客户端。
+ * costTier = 成本档种子默认（cost-first 路由排序用）：free=免费额度渠道 / low=签到白送类 /
+ * 不带=未标注（运行时按 normal 解释）。仅收有把握的两条，宁缺勿滥——错标 free 会把付费渠道排前面烧钱。
  */
 const QODER_INTL_ENABLED = true;
 
@@ -128,7 +144,17 @@ const CHANNELS = [
   { id: "workbuddy", display: "WorkBuddy CN", domain: "copilot.tencent.com" },
   { id: "workbuddy_ai", display: "WorkBuddy AI", domain: "www.workbuddy.ai" },
   { id: "raccoon", display: "商汤小浣熊", domain: "xiaohuanxiong.com" },
+  // LobsterAI（网易有道龙虾）：原生 OpenAI 兼容 + 每日签到 100 积分 + 19 个模型。
+  // 登录走应用内回环 OAuth（127.0.0.1/auth/callback），无需本机安装官方客户端。
+  // ModelScope（魔搭 · 阿里）：官方 OpenAI 兼容网关 + 魔粒每日任务（登录 200/日 + 绑云 50/日
+  // + 点赞 40/日）。唯一**官方公开 API** 型渠道：无客户端、无签名、无逆向。
+  { id: "modelscope", display: "ModelScope（魔搭）", domain: "api-inference.modelscope.cn", costTier: "free" },
+  { id: "lobster", display: "LobsterAI（有道）", domain: "lobsterai-server.youdao.com", costTier: "low" },
   { id: "zcode", display: "ZCode（智谱）", domain: "zcode.z.ai" },
+  // CatPaw（美团）：上游是**有状态会话协议**（round → event → turn → event），适配器声明
+  // stateful 走会话式转发；凭据是桌面端会话 Cookie 值（X-Passport-Token）+ user-uid 独立头，
+  // 无签到、无刷新接口（过期只能在客户端重新登录）。成本档暂不标注（套餐口径未实测）
+  { id: "catpaw", display: "CatPaw（美团）", domain: "ai.catpaw.meituan.com" },
   // Qoder CN：账号与额度池与 INTL 互不相通，各自独立接入。
   // 注意：该渠道签名依赖本机安装的客户端（wasm 提取），凭据可导入但未装客户端时不可调用。
   { id: "qoder", display: "Qoder CN", domain: "gateway.qoder.com.cn" },
@@ -163,22 +189,37 @@ function open() {
   try {
     db.exec("ALTER TABLE usage_requests ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0");
   } catch { /* 已存在 */ }
-  const ins = db.prepare("INSERT OR IGNORE INTO agents (id, display, domain, pool_strategy, updated_at) VALUES (?,?,?,?,?)");
+  // 在线迁移：keys.route_order（per-key 路由策略覆盖，''=跟随全局）/ agents.cost_tier（渠道成本档，''=未标注按 normal）
+  try {
+    db.exec("ALTER TABLE keys ADD COLUMN route_order TEXT NOT NULL DEFAULT ''");
+  } catch { /* 已存在 */ }
+  try {
+    db.exec("ALTER TABLE agents ADD COLUMN cost_tier TEXT NOT NULL DEFAULT ''");
+  } catch { /* 已存在 */ }
+  const ins = db.prepare("INSERT OR IGNORE INTO agents (id, display, domain, pool_strategy, cost_tier, updated_at) VALUES (?,?,?,?,?,?)");
   const updDisplay = db.prepare("UPDATE agents SET display = ? WHERE id = ?");
+  // 存量行成本档回填：INSERT OR IGNORE 不触碰已存在的行，这里只给「从未标注过」的行补种子默认
+  // （守卫 cost_tier=''，用户手动改过的档位永不覆盖）
+  const updTier = db.prepare("UPDATE agents SET cost_tier=? WHERE id=? AND cost_tier=''");
   for (const c of CHANNELS) {
-    ins.run(c.id, c.display, c.domain, "expire_first", Date.now());
+    ins.run(c.id, c.display, c.domain, "expire_first", c.costTier || "", Date.now());
     updDisplay.run(c.display, c.id);
+    if (c.costTier) updTier.run(c.costTier, c.id);
   }
   gc();
   return db;
 }
 
-/** 流水保留 90 天，启动时 GC；余额历史同步清理 */
+/** 流水保留 90 天，启动时 GC；余额历史同步清理；操作日志 30 天 + 5 万行上限 */
 function gc() {
   const cutoff = Date.now() - 90 * 86400000;
   db.prepare("DELETE FROM usage_requests WHERE ts < ?").run(cutoff);
   const dayCut = dayStr(cutoff);
   db.prepare("DELETE FROM credits_history WHERE day < ?").run(dayCut);
+  // 操作日志：30 天 + 行数上限（每条代理请求一条，量级同 usage_requests；超限删最老）
+  const logCut = Date.now() - 30 * 86400000;
+  db.prepare("DELETE FROM op_logs WHERE ts < ?").run(logCut);
+  db.prepare("DELETE FROM op_logs WHERE id NOT IN (SELECT id FROM op_logs ORDER BY id DESC LIMIT 50000)").run();
 }
 
 function dayStr(ts) {
@@ -198,12 +239,17 @@ function routeOk(route) {
   return route === "auto" || CHANNELS.some((c) => c.id === route);
 }
 
-function createKey({ name, route, dailyQuota, rateLimit }) {
+/** per-key 路由策略白名单：''=跟随全局；非法值一律按跟随全局处理 */
+function routeOrderOk(order) {
+  return order === "" || order === "score" || order === "cost-first";
+}
+
+function createKey({ name, route, routeOrder, dailyQuota, rateLimit }) {
   open();
   const secret = "sk-" + crypto.randomBytes(24).toString("hex"); // 48 hex
   const id = crypto.randomUUID();
   db.prepare(
-    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, daily_quota, rate_limit, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,1,?)"
+    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, route_order, daily_quota, rate_limit, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?)"
   ).run(
     id,
     String(name || "").slice(0, 64) || "未命名 Key",
@@ -212,6 +258,7 @@ function createKey({ name, route, dailyQuota, rateLimit }) {
     secret.slice(0, 7),
     secret.slice(-4),
     routeOk(route) ? route : "auto",
+    routeOrderOk(routeOrder) ? routeOrder : "",
     Math.max(0, Number(dailyQuota) || 0),
     Math.max(0, Number(rateLimit) || 0),
     Date.now()
@@ -233,6 +280,7 @@ function listKeys() {
     mask: `${r.key_prefix}····${r.key_suffix}`,
     secret: r.key_enc ? config.decryptSecret(r.key_enc) : "",
     route: r.route,
+    routeOrder: r.route_order || "",
     dailyQuota: r.daily_quota,
     rateLimit: r.rate_limit,
     enabled: !!r.enabled,
@@ -240,6 +288,42 @@ function listKeys() {
     todayReq: (umap.get(r.id) || {}).req || 0,
     todayTokens: (umap.get(r.id) || {}).tokens || 0,
   }));
+}
+
+/**
+ * 从别的设备导入一把 API Key（号池 WebDAV 同步用）。
+ *
+ * 与 createKey 的区别：createKey 自己生成密钥，这里用**给定的明文密钥**入库——
+ * 跨设备同步要求同一个 sk- 在各设备都能用，所以只能沿用原密钥。
+ * 落库时按本机能力重新加密（Windows 走 DPAPI、无 safeStorage 的环境走明文降级），
+ * 所以不直接搬运对端的 key_enc（跨平台解不开）。
+ *
+ * 幂等：同 id 或同 key_hash 已存在则跳过，返回 {ok:false, reason}。
+ */
+function importKey({ id, name, secret, route, routeOrder, dailyQuota, rateLimit, enabled, createdAt }) {
+  open();
+  const s = String(secret || "").trim();
+  if (!s) return { ok: false, reason: "empty-secret" };
+  const hash = hashKey(s);
+  const dup = db.prepare("SELECT id FROM keys WHERE key_hash = ? OR id = ?").get(hash, String(id || ""));
+  if (dup) return { ok: false, reason: "exists" };
+  db.prepare(
+    "INSERT INTO keys (id, name, key_hash, key_enc, key_prefix, key_suffix, route, route_order, daily_quota, rate_limit, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+  ).run(
+    String(id || crypto.randomUUID()),
+    String(name || "").slice(0, 64) || "未命名 Key",
+    hash,
+    config.encryptSecret(s),
+    s.slice(0, 7),
+    s.slice(-4),
+    routeOk(route) ? route : "auto",
+    routeOrderOk(routeOrder) ? routeOrder : "",
+    Math.max(0, Number(dailyQuota) || 0),
+    Math.max(0, Number(rateLimit) || 0),
+    enabled === false ? 0 : 1,
+    Number(createdAt) || Date.now()
+  );
+  return { ok: true };
 }
 
 function dayStartMs(day) {
@@ -254,7 +338,7 @@ function findKeyBySecret(secret) {
   const r = db.prepare("SELECT * FROM keys WHERE key_hash = ?").get(hashKey(secret));
   if (!r) return null;
   return {
-    id: r.id, name: r.name, route: r.route, dailyQuota: r.daily_quota,
+    id: r.id, name: r.name, route: r.route, routeOrder: r.route_order || "", dailyQuota: r.daily_quota,
     rateLimit: r.rate_limit, enabled: !!r.enabled,
   };
 }
@@ -265,11 +349,12 @@ function updateKey(id, patch) {
   if (!cur) return false;
   const name = patch.name != null ? String(patch.name).slice(0, 64) : cur.name;
   const route = patch.route != null && routeOk(patch.route) ? patch.route : cur.route;
+  const routeOrder = patch.routeOrder != null && routeOrderOk(patch.routeOrder) ? patch.routeOrder : cur.route_order;
   const quota = patch.dailyQuota != null ? Math.max(0, Number(patch.dailyQuota) || 0) : cur.daily_quota;
   const rate = patch.rateLimit != null ? Math.max(0, Number(patch.rateLimit) || 0) : cur.rate_limit;
   const enabled = patch.enabled != null ? (patch.enabled ? 1 : 0) : cur.enabled;
-  db.prepare("UPDATE keys SET name=?, route=?, daily_quota=?, rate_limit=?, enabled=? WHERE id=?")
-    .run(name, route, quota, rate, enabled, cur.id);
+  db.prepare("UPDATE keys SET name=?, route=?, route_order=?, daily_quota=?, rate_limit=?, enabled=? WHERE id=?")
+    .run(name, route, routeOrder, quota, rate, enabled, cur.id);
   return true;
 }
 
@@ -290,7 +375,7 @@ function keyTodayReq(keyId) {
 function listAgents() {
   open();
   return db.prepare("SELECT * FROM agents ORDER BY rowid").all().map((r) => ({
-    id: r.id, display: r.display, domain: r.domain, poolStrategy: r.pool_strategy,
+    id: r.id, display: r.display, domain: r.domain, poolStrategy: r.pool_strategy, costTier: r.cost_tier || "",
   }));
 }
 
@@ -298,6 +383,14 @@ function setPoolStrategy(channel, strategy) {
   open();
   if (!["expire_first", "credit_first", "round_robin"].includes(strategy)) return false;
   db.prepare("UPDATE agents SET pool_strategy=?, updated_at=? WHERE id=?").run(strategy, Date.now(), String(channel));
+  return true;
+}
+
+/** 渠道成本档（cost-first 路由排序用）：free=免费额度 / low=签到白送 / normal=普通（''也是 normal） */
+function setAgentCostTier(channel, tier) {
+  open();
+  if (!["free", "low", "normal"].includes(tier)) return false;
+  db.prepare("UPDATE agents SET cost_tier=?, updated_at=? WHERE id=?").run(tier, Date.now(), String(channel));
   return true;
 }
 
@@ -357,6 +450,10 @@ function accountView(r) {
     coolReason,
     /** 最近一次上游错误（气泡展示用；只留最新一条） */
     lastError,
+    /** 今日签到结果（号池行内按钮三态与详情弹窗数据源；只留当天一条，跨天由前端按 day 判为过期） */
+    checkin: meta.checkin && typeof meta.checkin === "object" ? meta.checkin : null,
+    /** 首登奖励结算台账（小浣熊一次性新手福利；key → 结算时刻，落了即「已领取」） */
+    onboardingGrants: meta.onboardingGrants && typeof meta.onboardingGrants === "object" ? meta.onboardingGrants : null,
     source: r.source,
     lastUsed: r.last_used,
     todayReq: r.today_day === dayStr() ? r.today_req : 0,
@@ -393,11 +490,17 @@ function getAccount(id) {
   return r || null;
 }
 
-/** 取解密后的凭据（仅主进程内部使用，绝不外传渲染层） */
+/** 取解密后的凭据（仅主进程内部使用，绝不外传渲染层）
+ *  meta：一并带出账号元数据（Cookie 等会话凭据存在 meta 里，值本身已由 encryptSecret 加密）。
+ *  适配器需要 meta 才能按账号取 Cookie（/api/v1 族专用），故在此统一解密并透传。 */
 function accountSecrets(r) {
+  const meta = parseMeta(r && r.meta);
+  // Cookie 值以 meta.msCookie 存放，落库前经 config.encryptSecret（DPAPI），此处解回明文
+  if (meta && meta.msCookie) meta.msCookie = config.decryptSecret(meta.msCookie);
   return {
     token: config.decryptSecret(r.token_enc),
     refreshToken: config.decryptSecret(r.refresh_enc),
+    meta,
   };
 }
 
@@ -425,6 +528,20 @@ function addAccount({ channel, uid, name, token, refreshToken, source, expiresAt
   return id;
 }
 
+/** meta 白名单（凭据不走 meta 明文）：token/refreshToken 等凭据一律走独立加密列
+ *  （token_enc/refresh_enc），msCookie 在写入前已过 encryptSecret 加密。
+ *  这里剥离敏感形态的键（历史版本或外部同步可能带进明文凭据），正常业务键
+ *  （lastError/checkin/onboardingGrants/domain/enterpriseId/provider/email 等）不受影响 */
+const META_SENSITIVE_RE = /token|secret|password|apikey|api[-_]key|jwt|credential/i;
+function stripSensitiveMeta(meta) {
+  const out = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (META_SENSITIVE_RE.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 function updateAccount(id, patch) {
   open();
   const cur = getAccount(id);
@@ -445,7 +562,7 @@ function updateAccount(id, patch) {
   if (patch.lastUsed != null) put("last_used", Number(patch.lastUsed) || 0);
   if (patch.token != null) put("token_enc", config.encryptSecret(patch.token));
   if (patch.refreshToken != null) put("refresh_enc", config.encryptSecret(patch.refreshToken));
-  if (patch.meta != null && typeof patch.meta === "object") put("meta", JSON.stringify(patch.meta));
+  if (patch.meta != null && typeof patch.meta === "object") put("meta", JSON.stringify(stripSensitiveMeta(patch.meta)));
   // 维护 updated_at：明确传入或当修改了重要字段时自动刷新
   const nextUpdatedAt = patch.updatedAt != null ? Number(patch.updatedAt) : Date.now();
   put("updated_at", nextUpdatedAt);
@@ -456,9 +573,10 @@ function updateAccount(id, patch) {
 }
 
 /** 记录账号最近一次上游错误（号池状态气泡展示用；只留最新一条，message 截 400 字）。
- *  渠道级拦截（11128/WAF）不冷却账号，这类错误只有落在这里才看得见 */
+ *  渠道级拦截（11128/WAF）不冷却账号，这类错误只有落在这里才看得见。
+ *  落库前过脱敏（redact.cjs）：上游报错回显的 Bearer/JWT 不进 meta 与日志页气泡 */
 function noteError(id, message) {
-  const msg = String(message || "").trim();
+  const msg = redact(String(message || "").trim());
   if (!id || !msg) return;
   open();
   const cur = getAccount(id);
@@ -476,6 +594,102 @@ function clearError(id) {
   const meta = parseMeta(cur.meta);
   delete meta.lastError;
   updateAccount(id, { meta });
+}
+
+/** 记录账号今日签到结果（meta.checkin）：号池行内按钮「已签到 / 签到失败 + 详情弹窗」的数据源。
+ *  只留当天最新一条（同日重跑即覆盖）；跨天不做清理，由前端按 day 判为过期 */
+function noteCheckin(id, result, action) {
+  if (!id) return;
+  open();
+  const cur = getAccount(id);
+  if (!cur) return;
+  const r = result || {};
+  const meta = {
+    ...parseMeta(cur.meta),
+    checkin: {
+      day: dayStr(),
+      at: Date.now(),
+      action: action === "trial" ? "trial" : "checkin",
+      ok: r.ok === true,
+      already: r.already === true,
+      unavailable: r.unavailable === true,
+      needCaptcha: r.needCaptcha === true,
+      deviceBurned: r.deviceBurned === true,
+      credit: Number(r.credit || 0) || 0,
+      streakDays: Number(r.streakDays || 0) || 0,
+      message: String(r.message || "").slice(0, 400),
+    },
+  };
+  updateAccount(id, { meta });
+}
+
+/**
+ * 记录小浣熊账号一次首登奖励（onboarding）的结算时刻（meta.onboardingGrants，key → 结算时刻）。
+ * settled 只含本轮探测成功的增量（granted true/false 都算落定）；合并进已有台账，永不覆盖旧键。
+ * 落了台账的 key 后续签到恒跳过（「后续不再领取」）；失败不落，下轮自然重试（「直到领取成功」）。
+ */
+function noteOnboardingGrant(id, settled) {
+  if (!id || !settled || typeof settled !== "object") return;
+  open();
+  const cur = getAccount(id);
+  if (!cur) return;
+  const meta = { ...parseMeta(cur.meta) };
+  const ledger = meta.onboardingGrants && typeof meta.onboardingGrants === "object" ? meta.onboardingGrants : {};
+  meta.onboardingGrants = { ...ledger, ...settled };
+  updateAccount(id, { meta });
+}
+
+// ===== 操作日志（op_logs：反代网关各项操作一条一条落库；写入永不抛错由 oplog.cjs 兜） =====
+
+/** 记一条操作日志（字段截断防脏数据撑爆行；ts 用当前时刻） */
+function insertOpLog(row) {
+  open();
+  db.prepare("INSERT INTO op_logs (ts, level, op, message, channel, target, detail) VALUES (?,?,?,?,?,?,?)").run(
+    Date.now(),
+    String(row.level || "info"),
+    String(row.op || "").slice(0, 32),
+    String(row.message || "").slice(0, 500),
+    String(row.channel || "").slice(0, 32),
+    String(row.target || "").slice(0, 120),
+    String(row.detail || "").slice(0, 1000)
+  );
+}
+
+/** 操作日志筛选（与列表同一套 where）：from/to 毫秒区间、level、op */
+function opLogWhere(filter) {
+  const where = [];
+  const vals = [];
+  if (Number(filter.from) > 0) { where.push("ts >= ?"); vals.push(Number(filter.from)); }
+  if (Number(filter.to) > 0) { where.push("ts <= ?"); vals.push(Number(filter.to)); }
+  if (filter.level) { where.push("level = ?"); vals.push(String(filter.level)); }
+  if (filter.op) { where.push("op = ?"); vals.push(String(filter.op)); }
+  return { clause: where.length ? ` WHERE ${where.join(" AND ")}` : "", vals };
+}
+
+/** 分页列表（时间倒序；limit 1~200 封顶） */
+function listOpLogs(filter) {
+  open();
+  const { clause, vals } = opLogWhere(filter || {});
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM op_logs${clause}`).get(...vals).n;
+  const rows = db.prepare(`SELECT * FROM op_logs${clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`).all(
+    ...vals,
+    Math.max(1, Math.min(200, Number(filter.limit) || 50)),
+    Math.max(0, Number(filter.offset) || 0)
+  );
+  return { rows, total };
+}
+
+/** 操作类型下拉（去重后按字母序；空表返回空数组） */
+function listOpLogOps() {
+  open();
+  return db.prepare("SELECT DISTINCT op FROM op_logs ORDER BY op").all().map((r) => r.op).filter(Boolean);
+}
+
+/** 导出全集（与列表同一套筛选，无分页；2 万行上限防一次性拉爆） */
+function exportOpLogRows(filter) {
+  open();
+  const { clause, vals } = opLogWhere(filter || {});
+  return db.prepare(`SELECT * FROM op_logs${clause} ORDER BY ts DESC, id DESC LIMIT 20000`).all(...vals);
 }
 
 /** 记录账号一次消耗的滚动计数（跨天自动清零） */
@@ -659,9 +873,10 @@ module.exports = {
   CHANNELS,
   QODER_INTL_ENABLED,
   channelDisplay: (id) => (CHANNELS.find((c) => c.id === id) || {}).display || String(id),
-  createKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
-  listAgents, setPoolStrategy,
-  listAccounts, getAccount, accountSecrets, addAccount, updateAccount, bumpAccountUsage, removeAccount, noteError, clearError,
+  createKey, importKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
+  listAgents, setPoolStrategy, setAgentCostTier,
+  listAccounts, getAccount, accountSecrets, addAccount, updateAccount, bumpAccountUsage, removeAccount, noteError, clearError, noteCheckin, noteOnboardingGrant,
+  insertOpLog, listOpLogs, listOpLogOps, exportOpLogRows,
   listModelCooldowns, upsertModelCooldown, deleteModelCooldowns,
   snapshotCredits,
   insertUsage, statsToday, statsTrend, statsTop, statsDetail, recentRequests,

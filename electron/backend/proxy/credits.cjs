@@ -6,6 +6,8 @@ const pool = require("./pool.cjs");
 const adapters = require("./adapters.cjs");
 const util = require("./util.cjs");
 const events = require("./events.cjs");
+// 休眠唤醒守卫：唤醒后静默窗内跳过本轮（见 backend/wakeGuard.cjs）
+const wakeGuard = require("../wakeGuard.cjs");
 
 let timer = null;
 let refreshing = false;
@@ -87,6 +89,8 @@ async function refreshAccount(id) {
 /** 单渠道逐账号批量刷新（号池页「刷新当前渠道」用），每渠道并发 ≤2；单账号失败不影响其余 */
 async function refreshChannel(channel) {
   if (refreshing) return { ok: false, message: "刷新进行中" };
+  // 关闭的渠道不刷（上游启闭：调用类操作对它一律不存在）
+  if (!adapters.channelOn(channel)) return { ok: false, message: "该渠道已关闭" };
   refreshing = true;
   try {
     const ids = store
@@ -115,6 +119,8 @@ async function refreshAll() {
     const byChannel = new Map();
     for (const acc of store.listAccounts()) {
       if (acc.status === "disabled" || !acc.hasToken) continue;
+      // 关闭的渠道不刷（上游启闭：定时全量刷新不碰它，避免无谓的上游请求）
+      if (!adapters.channelOn(acc.channel)) continue;
       if (!byChannel.has(acc.channel)) byChannel.set(acc.channel, []);
       byChannel.get(acc.channel).push(acc.id);
     }
@@ -137,11 +143,25 @@ async function refreshAll() {
 /** 定时刷新（周期可配，默认 30min；设置改动经 restartScheduler 生效） */
 function startScheduler(getIntervalMin) {
   stopScheduler();
-  const tick = () => {
-    refreshAll().catch(() => {});
-    timer = setTimeout(tick, Math.max(1, getIntervalMin() || 30) * 60000);
+  const intervalMs = () => Math.max(1, getIntervalMin() || 30) * 60000;
+  const scheduleNext = () => {
+    timer = setTimeout(tick, intervalMs());
   };
-  timer = setTimeout(tick, Math.max(1, getIntervalMin() || 30) * 60000);
+  const tick = () => {
+    // 唤醒守卫（见 backend/wakeGuard.cjs）：
+    //   B. 先做时间跳跃检测——不依赖电源事件的兜底（必须**先于** A 判定调用）
+    //   A. 静默窗内跳过本轮：睡眠期间 setTimeout 不触发，唤醒后本 tick 立刻到期；
+    //      若此时开跑，会与签到、记忆中枢任务在同一刻收敛。
+    // 跳过的仅是**本轮**——照常排下一轮，不影响正常节奏。
+    wakeGuard.noteTick("credits-refresh", intervalMs());
+    if (!wakeGuard.periodicAllowed()) {
+      scheduleNext();
+      return;
+    }
+    refreshAll().catch(() => {});
+    scheduleNext();
+  };
+  scheduleNext();
 }
 
 function stopScheduler() {

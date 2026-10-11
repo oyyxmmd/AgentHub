@@ -13,7 +13,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const { MemoryStore, newId, sha256, normalizeForHash, estimateTokens, contentHash, parseFrontmatter, parseDailySections, isIndexableRel } = require("./store.cjs");
+const { MemoryStore, newId, sha256, normalizeForHash, estimateTokens, contentHash, parseFrontmatter, parseDailySections, renderDailyFile, isIndexableRel } = require("./store.cjs");
 const { MemoryIndex, startOfToday } = require("./indexer.cjs");
 const { MemorySearch } = require("./search.cjs");
 const layout = require("./layout.cjs");
@@ -102,11 +102,24 @@ class MemoryService {
   _hydrate(row) {
     const text = this.store.read(row.path);
     let body = "";
+    let files = [];
+    let cwd = "";
     if (text != null) {
       const parsed = parseFrontmatter(text);
+      if (parsed.fm) {
+        if (parsed.fm.cwd) cwd = String(parsed.fm.cwd);
+        if (Array.isArray(parsed.fm.files)) {
+          files = parsed.fm.files;
+        } else if (typeof parsed.fm.files === "string") {
+          files = parsed.fm.files.split(",").map((x) => x.trim()).filter(Boolean);
+        }
+      }
       if (row.type === "daily" && row.anchor) {
         const sec = parseDailySections(parsed.body).find((s) => s.id === row.anchor);
         body = sec ? sec.body : "";
+        if (sec && sec.meta && sec.meta.files) {
+          files = Array.isArray(sec.meta.files) ? sec.meta.files : String(sec.meta.files).split(",").map((x) => x.trim()).filter(Boolean);
+        }
       } else {
         body = parsed.body.trim();
       }
@@ -124,6 +137,36 @@ class MemoryService {
       dedupStatus: row.dedup_status, aiProcessed: !!row.ai_processed,
       body,
       bodyMissing: text == null,
+      files, cwd,
+    };
+  }
+
+  _checkFreshness(m) {
+    if (!m || !Array.isArray(m.files) || !m.files.length) {
+      return { isStale: false, staleFiles: [] };
+    }
+    const baseDir = m.cwd || (this.registry.get(m.project) || {}).path || process.cwd();
+    const staleFiles = [];
+    for (const item of m.files) {
+      if (!item || typeof item !== "string") continue;
+      const anchor = parseFileAnchor(item);
+      const relPath = anchor.file;
+      const recordedMtime = anchor.mtime;
+      const absPath = path.isAbsolute(relPath) ? relPath : path.resolve(baseDir, relPath);
+      try {
+        if (!fs.existsSync(absPath)) {
+          staleFiles.push(`${relPath} (已删除/重命名)`);
+        } else if (recordedMtime > 0) {
+          const stat = fs.statSync(absPath);
+          if (stat.mtimeMs - recordedMtime > 2000) {
+            staleFiles.push(`${relPath} (代码已更新)`);
+          }
+        }
+      } catch { /* 忽略 stat 异常 */ }
+    }
+    return {
+      isStale: staleFiles.length > 0,
+      staleFiles,
     };
   }
 
@@ -304,6 +347,36 @@ class MemoryService {
       // 造成同一 id 两条 path（界面显示两遍、删一条留幽灵）
       const rel = this.store.canonicalRel(layout.memoryRelPath({ slug: cls.slug, layer, agent, type, dateStr, id }));
       const projectName = cls.name;
+
+      // 关联文件与修改时间戳锚定（用于时效性过时检测）
+      let anchoredFiles = [];
+      const baseDir = input.cwd || (this.registry.get(cls.slug) || {}).path || process.cwd();
+      if (Array.isArray(input.files)) {
+        for (const f of input.files) {
+          if (!f || typeof f !== "string") continue;
+          const trimmed = f.trim();
+          if (parseFileAnchor(trimmed).mtime > 0) {
+            anchoredFiles.push(trimmed); // 已是「路径@时间戳」锚定串，原样保留
+          } else {
+            const abs = path.isAbsolute(trimmed) ? trimmed : path.resolve(baseDir, trimmed);
+            try {
+              if (fs.existsSync(abs)) {
+                const stat = fs.statSync(abs);
+                const displayRel = path.isAbsolute(trimmed) ? path.relative(baseDir, abs).replace(/\\/g, "/") : trimmed.replace(/\\/g, "/");
+                anchoredFiles.push(`${displayRel}@${Math.floor(stat.mtimeMs)}`);
+              } else {
+                anchoredFiles.push(trimmed.replace(/\\/g, "/"));
+              }
+            } catch {
+              anchoredFiles.push(trimmed.replace(/\\/g, "/"));
+            }
+          }
+        }
+      }
+
+      const fileRefs = anchoredFiles.map((x) => `file:${parseFileAnchor(x).file}`);
+      const mergedRefs = Array.from(new Set((Array.isArray(input.refs) ? input.refs : []).concat(fileRefs)));
+
       const fm = {
         id, type, layer,
         title: finalTitle,
@@ -320,9 +393,12 @@ class MemoryService {
         tags,
         importance: clampInt(input.importance, 1, 5, 3),
         summary,
-        refs: Array.isArray(input.refs) ? input.refs : [],
+        refs: mergedRefs,
+        files: anchoredFiles.length ? anchoredFiles : undefined,
         cwd: input.cwd || "",
-        git: cls.origin === "git" ? (this.registry.get(cls.slug) || {}).remotes?.[0] || "" : "",
+        // git 元数据不再以「归类来源是否 git」为条件：显式项目在带 cwd 时同样会探测到远程，
+        // 卡住条件的写法会让这类项目永远写不出 git 字段，存量自愈也无据可依
+        git: (this.registry.get(cls.slug) || {}).remotes?.[0] || "",
         pinned: !!input.pinned,
         starred: !!input.starred,
       };
@@ -335,7 +411,7 @@ class MemoryService {
       if (type === "daily") {
         await this.store.withLock(rel, () => {
           this.store.appendDaily(rel, { agent, project: cls.slug || "", projectName: projectName || "", date: dateStr },
-            { id, time: hhmm(now), title: finalTitle, meta: { importance: fm.importance, tags, session: input.session || "" }, body }, writeOpts);
+            { id, time: hhmm(now), title: finalTitle, meta: { importance: fm.importance, tags, session: input.session || "", files: anchoredFiles.length ? anchoredFiles : undefined }, body }, writeOpts);
         });
       } else {
         await this.store.withLock(rel, () => {
@@ -537,7 +613,8 @@ class MemoryService {
   }
 
   // 已在写队列内的删除（writeMemory / 去重裁决复用，避免 withWrite 重入自等待）
-  async _deleteMemoryLocked(id, { purge = false } = {}) {
+  // silent：批量清理时压制逐条 deleted 事件（几千条会把前端事件流淹没），改由清理任务发一条汇总
+  async _deleteMemoryLocked(id, { purge = false, silent = false } = {}) {
     const row = this.index.getById(id);
     if (!row) return { ok: false, message: "记忆不存在" };
     if (row.type === "daily" && row.anchor) {
@@ -557,7 +634,7 @@ class MemoryService {
       this.store.moveToTrash(row.path);
     }
     this.index.removeOne(id, row.path);
-    this.onEvent({ type: "deleted", id, path: row.path });
+    if (!silent) this.onEvent({ type: "deleted", id, path: row.path });
     return { ok: true, id, purged: !!purge };
   }
 
@@ -632,9 +709,342 @@ class MemoryService {
     });
   }
 
-  trashPurge(keepDays) { return { removed: this.store.purgeTrash(keepDays || this.flat()["storage.trashKeepDays"] || 90) }; }
+  trashPurge(keepDays) { return { removed: this.store.purgeTrash(keepDays || this.flat()["storage.trashKeepDays"] || 30) }; }
+
+  // ---------- 记忆清理（五类异常记忆的自动删除；删除一律先入回收站，可恢复） ----------
+
+  /** 五类清理开关（配置页「清理」组；默认全关——自动删除是危险动作，必须显式开启） */
+  cleanupFlags() {
+    const cfg = this.flat();
+    return {
+      superseded: cfg["cleanup.autoDeleteSuperseded"] === true,
+      missing: cfg["cleanup.autoDeleteMissing"] === true,
+      error: cfg["cleanup.autoDeleteError"] === true,
+      conflict: cfg["cleanup.autoDeleteConflict"] === true,
+      invalid: cfg["cleanup.autoDeleteInvalid"] === true,
+    };
+  }
+
+  /**
+   * 扫描五类待清理项（只读，不修改任何东西）。
+   * 判据全部基于索引与磁盘事实，不做猜测：
+   *   superseded 失效：被取代（superseded_by）或有效期已过（valid_to <= now）——与检索口径一致
+   *   missing    不存在：索引里有行、磁盘上没有文件（外部删除/watcher 漏看留下的孤儿行）
+   *   error      报错：文件在、但读不出来（权限/损坏），索引行永远指向空内容
+   *   conflict   冲突：同步冲突记录指向的记忆（本地与远端同时变过、尚未裁决）——路径由调用方传
+   *   invalid    无效：文件存在但解析后是空壳（无 id、无 daily 节、正文为空）——迁移/删除后的
+   *              残骸，正是 reindexFile 判「empty」拒绝索引的那批；有内容的正常文件绝不误伤
+   * @param {{ kinds?: object, conflictPaths?: string[] }} opts kinds 覆盖开关（不传按配置）；仅用于测试
+   */
+  cleanupScan({ kinds, conflictPaths } = {}) {
+    const enabled = kinds ? { ...this.cleanupFlags(), ...kinds } : this.cleanupFlags();
+    const now = Date.now();
+    const items = { superseded: [], missing: [], error: [], conflict: [], invalid: [] };
+
+    const rows = this.index.db.prepare(
+      "SELECT id, path, anchor, type, superseded_by, valid_to FROM mem",
+    ).all();
+    const files = this.store.walkMemoryFiles();
+    // 按索引 path 聚合：一个 daily 文件可能对应多节（多行），删除要按整份文件处理。
+    // 存在性用 store.exists 现场判定（而不是 walk 出来的文件清单）：路径被换成目录/链接时
+    // walk 看不见它，会把它误判成「不存在」——但那是「读不出」（error），不是「不见了」（missing）
+    const perPath = new Map();
+    for (const r of rows) {
+      const key = String(r.path);
+      const g = perPath.get(key);
+      if (g) g.rows.push(r);
+      else perPath.set(key, { rows: [r] });
+      if (enabled.superseded && (r.superseded_by || (r.valid_to != null && r.valid_to <= now))) {
+        items.superseded.push({ id: r.id, path: r.path, anchor: r.anchor, type: r.type });
+      }
+    }
+
+    // error 与 invalid 共用一次读取（readCache）：全库读文件是重活，别读两遍
+    const readCache = new Map();
+    const readOnce = (rel) => {
+      if (!readCache.has(rel)) readCache.set(rel, this.store.read(rel));
+      return readCache.get(rel);
+    };
+
+    for (const [path, g] of perPath) {
+      if (!this.store.exists(path)) {
+        if (enabled.missing) items.missing.push({ path, ids: g.rows.map((r) => r.id) });
+        continue;
+      }
+      if (enabled.error && readOnce(path) == null) {
+        items.error.push({ path, ids: g.rows.map((r) => r.id) });
+      }
+    }
+
+    if (enabled.conflict && conflictPaths && conflictPaths.length) {
+      const wanted = new Set(conflictPaths.map((p) => String(p || "").toLowerCase()).filter(Boolean));
+      for (const [path, g] of perPath) {
+        if (wanted.has(String(path).toLowerCase())) items.conflict.push({ path, ids: g.rows.map((r) => r.id) });
+      }
+    }
+
+    if (enabled.invalid) {
+      for (const rel of files) {
+        if (!isIndexableRel(rel)) continue;
+        if (this._isEmptyShell(rel, readOnce)) items.invalid.push(rel);
+      }
+    }
+
+    const counts = {
+      superseded: items.superseded.length,
+      missing: items.missing.length,
+      error: items.error.length,
+      conflict: items.conflict.length,
+      invalid: items.invalid.length,
+    };
+    const sample = (arr) => arr.slice(0, 5).map((x) => (typeof x === "string" ? x : x.path));
+    return {
+      counts,
+      enabled,
+      items,
+      samples: {
+        superseded: sample(items.superseded),
+        missing: sample(items.missing),
+        error: sample(items.error),
+        conflict: sample(items.conflict),
+        invalid: sample(items.invalid),
+      },
+    };
+  }
+
+  /** 空壳文件判定：解析后无 id、无 daily 节、正文为空（与 reindexFile 判 empty 的规则一字不差）。
+   *  读不出（文本为 null）或解析抛错的都返回 false —— 那是 error 类的活，避免把异常文件误删。 */
+  _isEmptyShell(rel, readOnce) {
+    let text;
+    try { text = readOnce ? readOnce(rel) : this.store.read(rel); } catch { return false; }
+    if (text == null) return false;
+    try {
+      const parsed = parseFrontmatter(text);
+      const haveId = parsed.fm && parsed.fm.id;
+      const body = String(parsed.body || "");
+      return !haveId && !parseDailySections(body).length && !body.trim();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 执行清理（按开关；删除一律先进回收站，回收站到期后由调度任务彻底删除）。
+   * 只在写队列内跑：与写入/搬家互斥，不会删到正在写一半的文件（写盘本身是原子的）。
+   * @param {{ conflictPaths?: string[] }} opts 同步冲突记录的路径列表（由调度器从同步状态取）
+   */
+  async cleanupRun({ conflictPaths } = {}) {
+    if (this.index.readOnly) {
+      return { ok: false, message: "索引库来自更新版本的 AgentHub，当前处于只读模式：请升级应用后再清理" };
+    }
+    return this.withWrite(async () => {
+      const scan = this.cleanupScan({ conflictPaths });
+      const removed = { superseded: 0, missing: 0, error: 0, conflict: 0, invalid: 0 };
+      const skipped = { conflict: 0 };
+
+      // ① 失效：走标准删除路径（daily 多节文件只摘失效的那节；单节文件整份进回收站）
+      for (const it of scan.items.superseded) {
+        const r = await this._deleteMemoryLocked(it.id, { purge: false, silent: true });
+        if (r && r.ok) removed.superseded++;
+      }
+      // ② 不存在：文件已丢，只剩索引行 → 清行（没有可入回收站的内容）
+      for (const it of scan.items.missing) {
+        this.index.removeByPath(it.path);
+        removed.missing += it.ids.length;
+      }
+      // ③ 报错：文件在但读不出 → 是文件就整份进回收站（回收站要求可读可还原），
+      //    是目录/连 stat 都失败这类移不进去的，只清索引行（不破坏磁盘上的东西）
+      for (const it of scan.items.error) {
+        try {
+          if (fs.statSync(this.store.abs(it.path)).isFile()) this.store.moveToTrash(it.path);
+        } catch { /* 移不进回收站：仅清索引行 */ }
+        this.index.removeByPath(it.path);
+        removed.error += it.ids.length;
+      }
+      // ④ 冲突：与未裁决的同步冲突同名的记忆整份进回收站；daily 多节文件保守跳过
+      //    （冲突记录是文件级的，摘不了具体节，整份删会连带无关节）
+      const conflictDeleted = [];
+      for (const it of scan.items.conflict) {
+        if (it.ids.length > 1) { skipped.conflict++; continue; }
+        try { this.store.moveToTrash(it.path); } catch { /* 忽略单文件失败 */ }
+        this.index.removeByPath(it.path);
+        removed.conflict += it.ids.length;
+        conflictDeleted.push(it.path);
+      }
+      // ⑤ 无效：空壳文件整份进回收站（保留残骸，用户可在回收站核对被清掉的是什么）
+      for (const rel of scan.items.invalid) {
+        try { this.store.moveToTrash(rel); } catch { /* 忽略单文件失败 */ }
+        this.index.removeByPath(rel);
+        removed.invalid++;
+      }
+
+      const total = removed.superseded + removed.missing + removed.error + removed.conflict + removed.invalid;
+      // 汇总事件（替代逐条 deleted）：浏览页收到后刷新列表与统计
+      if (total) this.onEvent({ type: "cleanup", removed, skipped });
+      return { ok: true, removed, skipped, counts: scan.counts, total, conflictPaths: conflictDeleted };
+    });
+  }
 
   // ---------- 项目 ----------
+
+  /**
+   * 存量项目元数据自愈：从已落盘的记忆 frontmatter 里回收 cwd/git，补回项目台账。
+   *
+   * 为什么需要：显式项目名写入（早期实现）提前返回、不探测 Git，于是项目卡永久缺远程与本地路径；
+   * 而 frontmatter 里其实存过 cwd/git（写入时记下的）。这些信息不该要求用户手改 JSON 找回。
+   *
+   * 远程或本地路径**任一缺失**都尝试补（只补远程会漏掉「有远程但没路径」的卡）；
+   * 每个项目最多读 limitPerProject 个文件，够用即停。主进程专用：索引重建跑在 worker 里，
+   * 在那里写台账会与主进程竞争同一文件。
+   *
+   * 同时**纠正**：记忆里混进过浅路径（家目录/盘符根/家目录下的通用目录）时予以剔除——
+   * 这类路径不是项目根，留在卡上只会误导。剔除用 setMeta（覆盖式），因为 upsert 是并集、
+   * 只增不减，清不掉已写入的无效值。
+   */
+  reconcileProjectMetadata({ limitPerProject = 50 } = {}) {
+    if (this.index.readOnly) return { healed: 0, skipped: "read-only" };
+    // 先做 Git 归类：同一仓库的多张卡统一显示名、互相补全远程（含 gitUrl）；
+    // 之后的身份判定必须基于「已归类」的台账，组内继承来的远程才不会被误当污染清掉
+    const grouped = this.registry.regroup();
+    const cfg = this.flat();
+    const gitPreferred = cfg["classify.gitPreferred"] !== false;
+    let healed = 0;
+    let pruned = 0;
+    // 远程证据计数：同一远程被多张卡持有 ⇒ 组内相互印证（regroup 继承来的值属此类，
+    // 它们有事实来源，不能以「本项目路径探测不到 origin」为由清空）
+    const remoteHolders = new Map();
+    for (const e of this.registry.list()) {
+      for (const r of e.remotes || []) {
+        const k = String(r || "").trim().toLowerCase();
+        if (k) remoteHolders.set(k, (remoteHolders.get(k) || 0) + 1);
+      }
+    }
+    for (const p of this.registry.list()) {
+      const hadRemotes = (p.remotes || []).filter(Boolean);
+      const hadPathsRaw = (p.localPaths || []).filter(Boolean);
+      const manual = new Set((p.manualPaths || []).filter(Boolean));
+      // 台账里的路径**不天然可信**：历史版本写入时没做归属校验，脏值（会话 cwd 里的无关目录）
+      // 就是这么进来的。可信的只有两类：
+      //   ① manualPaths —— 用户手动关联过（显式断言，永不自愈删除）
+      //   ② 能通过归属证明的（目录名匹配项目名，或该仓库 origin 与项目远程一致）
+      // 其余一律按「未验证」处理，证明不了就剔除。
+      const hadPaths = hadPathsRaw.filter((x) => layout.isProjectDirCandidate(x));
+      let rows = [];
+      try {
+        rows = this.index.db.prepare(
+          "SELECT path FROM mem WHERE project = ? AND path IS NOT NULL ORDER BY created DESC LIMIT ?",
+        ).all(String(p.slug).toLowerCase(), limitPerProject);
+      } catch {
+        continue;
+      }
+      const remotes = new Set(hadRemotes);
+      const candidates = new Set();
+      for (const r of rows) {
+        const text = this.store.read(r.path);
+        if (text == null) continue;
+        let fm;
+        try { fm = parseFrontmatter(text).fm || {}; } catch { continue; }
+        if (fm.git) remotes.add(String(fm.git));
+        if (fm.cwd) {
+          const cwd = String(fm.cwd);
+          candidates.add((gitPreferred && layout.findGitRoot(cwd)) || cwd);
+        }
+      }
+      // 用「已记录路径 + 候选」一起探远程补全身份（fork/上游），再据此判定归属
+      if (gitPreferred) {
+        for (const dir of [...new Set([...hadPaths, ...candidates])]) {
+          for (const d of layout.displayRemotesFor(dir)) remotes.add(d);
+        }
+      }
+      const identity = { slug: p.slug, name: p.name, aliases: p.aliases || [], remotes: [...remotes] };
+      const keep = (x) => manual.has(x) || layout.isPathForProject(x, identity);
+      const finalPaths = [...new Set([...hadPaths.filter(keep), ...[...candidates].filter(keep)])];
+      // 身份纠正：无 origin 的项目不得留着远程（历史写入可能已污染）
+      const identityRemotes = new Set();
+      for (const dir of finalPaths) for (const d of layout.displayRemotesFor(dir)) identityRemotes.add(d);
+      // 身份判据：本项目路径探测到 origin，或该远程被组内其它卡片独立持有（归类的继承值）
+      const hasOrigin = identityRemotes.size > 0
+        || hadRemotes.some((r) => (remoteHolders.get(String(r).trim().toLowerCase()) || 0) > 1);
+      const finalRemotes = hasOrigin ? [...remotes] : [];
+      // 幂等判据比对「存储值 vs 最终值」：候选路径每轮都会从 frontmatter 被重新发现，
+      // 若拿中间集合判定就会永远「有变化」，自愈每轮写一次台账（实测踩过）。
+      const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+      // 完整 git 地址：从已确认路径里的 origin 取（host/owner/repo），供界面悬停显示。
+      // 已有值不覆盖（避免把早前探测到的地址抹成空）
+      let gitUrl = String(p.gitUrl || "").trim();
+      if (!gitUrl && gitPreferred) {
+        for (const dir of finalPaths) {
+          const origin = layout.detectGitRemote(dir);
+          if (origin && origin.url) { gitUrl = origin.url; break; }
+        }
+      }
+      const sameGitUrl = gitUrl === String(p.gitUrl || "").trim();
+      if (sameSet(finalRemotes, hadRemotes) && sameSet(finalPaths, hadPathsRaw) && sameGitUrl) continue;
+      const prunedSomething = hadPathsRaw.some((x) => !finalPaths.includes(x)) || hadRemotes.some((x) => !finalRemotes.includes(x));
+      this.registry.setMeta(p.slug, {
+        remotes: finalRemotes,
+        localPaths: finalPaths,
+        manualPaths: [...manual],
+        ...(gitUrl ? { gitUrl } : {}),
+      });
+      if (prunedSomething) pruned++;
+      healed++;
+    }
+    // 结尾再归一次组：本轮刚探测到的 gitUrl/remotes 要立刻同步给同仓库的其它卡片
+    // （开头那次归组时它们还都是空值，靠这一趟补齐；幂等，无变化不落盘）
+    const regrouped = this.registry.regroup();
+    return { healed, pruned, grouped: grouped.changed + regrouped.changed };
+  }
+
+  /**
+   * 正式关联入口：把一个本地目录关联到既有项目卡（不新建卡、不改 slug）。
+   *
+   * 供「项目归档」卡片的维护菜单调用，替代「让用户手改台账」：
+   * 目录存在即记录本地路径；是 Git 仓库则额外补上全部远程地址。
+   * 非 Git 目录、未装 Git 都按「只关联路径」成功返回，不阻断用户。
+   */
+  projectAttachPath(slug, dir) {
+    const entry = this.registry.get(slug);
+    if (!entry) return { ok: false, message: "项目不存在" };
+    const target = String(dir || "").trim();
+    if (!target) return { ok: false, message: "未选择目录" };
+    let st;
+    try { st = fs.statSync(target); } catch { return { ok: false, message: "目录不存在或不可访问" }; }
+    if (!st.isDirectory()) return { ok: false, message: "请选择目录而不是文件" };
+    const cfg = this.flat();
+    const gitPreferred = cfg["classify.gitPreferred"] !== false;
+    const root = gitPreferred ? layout.findGitRoot(target) : null;
+    // 身份口径与归类一致：有 origin 才记远程（只挂 upstream 的目录不算本项目身份）
+    const remotes = gitPreferred ? layout.displayRemotesFor(target) : [];
+    const localPath = root || target;
+    // 过浅的目录（家目录/盘符根/家目录下的通用目录）不是项目根：明确拒绝并说明，
+    // 而不是默默记下一条没意义的路径（用户手选也照样挡，语义上它不成立）
+    if (!layout.isProjectDirCandidate(localPath)) {
+      return { ok: false, message: "该目录过浅（家目录或盘符根），不是项目根目录：请选择具体项目所在的文件夹" };
+    }
+    this.registry.upsert({
+      slug: entry.slug,
+      // 卡片名保持原值（upsert 对空值有保护）；关联目录不该顺手改项目名
+      name: entry.name,
+      remotes,
+      gitUrl: gitPreferred ? ((layout.detectGitRemote(target) || {}).url || "") : "",
+      localPaths: [localPath],
+      // 标记为用户手动关联：这是可信断言，自愈不得以「缺归属证明」为由清除
+      manualPaths: [localPath],
+    });
+    // 关联后立刻归一次组：同一仓库的其它卡片与本卡统一显示名/补全远程（否则要等下次自愈）
+    this.registry.regroup();
+    const after = this.registry.get(entry.slug) || entry;
+    return {
+      ok: true,
+      project: after,
+      isRepo: !!root,
+      addedRemotes: remotes,
+      localPath,
+      // 是仓库但没有 origin：如实告知，避免用户以为「关联了却没识别到」
+      noOrigin: !!root && remotes.length === 0,
+    };
+  }
 
   projects() {
     const db = this.index.db;
@@ -651,6 +1061,8 @@ class MemoryService {
       const st = bySlug.get(p.slug) || { count: 0, latest: 0, l2: 0, agents: "" };
       return {
         slug: p.slug, name: p.name, remotes: p.remotes || [], aliases: p.aliases || [],
+        // 完整 git 地址（host/owner/repo，悬停提示与维护菜单用；老卡可能没有）
+        gitUrl: p.gitUrl || "",
         localPaths: p.localPaths || [], origin: p.origin, updated: p.updated,
         count: st.count, l2: st.l2, latest: st.latest,
         agents: String(st.agents || "").split(",").filter(Boolean),
@@ -675,8 +1087,14 @@ class MemoryService {
       return { ok: false, message: "索引库来自更新版本的 AgentHub，当前处于只读模式：请升级应用后再操作" };
     }
     return this.withWrite(async () => {
+      // 新建卡片的名字取 slug 反解的仓库名（比整串机器名可读）；已有卡片由 get 命中、名字不动
+      const targetSlug = slug ? layout.sanitizeSlug(slug) : "";
       const target = slug
-        ? this.registry.get(slug) || this.registry.upsert({ slug: layout.sanitizeSlug(slug), name: slug, origin: "manual" })
+        ? this.registry.get(slug) || this.registry.upsert({
+            slug: targetSlug,
+            name: layout.repoNameFromSlug(targetSlug) || targetSlug,
+            origin: "manual",
+          })
         : null;
       let moved = 0;
       for (const id of ids) {
@@ -699,7 +1117,7 @@ class MemoryService {
             const rest = parsed.filter((s) => s.id !== row.anchor);
             rest.preamble = parsed.preamble; // filter 产生新数组，前言要显式带过去
             if (sec) {
-              this.store.writeAtomic(row.path, renderRemaining(fm, rest), { backup: true });
+              this.store.writeAtomic(row.path, renderDailyFile(fm, rest), { backup: true });
               this.store.appendDaily(newRel, {
                 agent: row.agent, project: target ? target.slug : "", projectName: target ? target.name : "", date: isoDate(row.created),
               }, sec, { backup: true });
@@ -718,6 +1136,8 @@ class MemoryService {
         this._afterMove(row.path, newRel);
         moved++;
       }
+      // 归类收口：项目可能与同仓库的其它卡片需要统一显示名（幂等，无变化不写盘）
+      if (target) this.registry.regroup();
       return { ok: true, moved };
     });
   }
@@ -784,7 +1204,7 @@ class MemoryService {
           const rest = parsed.filter((s) => s.id !== row.anchor);
           rest.preamble = parsed.preamble; // filter 产生新数组，前言要显式带过去
           if (sec) {
-            this.store.writeAtomic(row.path, renderRemaining(fm, rest), { backup: true });
+            this.store.writeAtomic(row.path, renderDailyFile(fm, rest), { backup: true });
             this.store.appendDaily(newRel, { agent: row.agent, project: slug, projectName: target.name, date: isoDate(row.created) }, sec, { backup: true });
           }
         } else {
@@ -803,7 +1223,7 @@ class MemoryService {
   /** 搬家收尾：原文件还有别的节就重索引原文件；空了就进回收站；新文件重索引 */
   _afterMove(oldRel, newRel) {
     const remain = this.store.read(oldRel);
-    if (remain == null || !require("./store.cjs").parseFrontmatter(remain).body.trim()) {
+    if (remain == null || !parseFrontmatter(remain).body.trim()) {
       this.index.removeByPath(oldRel);
       if (remain != null) this.store.moveToTrash(oldRel);
     } else {
@@ -816,9 +1236,12 @@ class MemoryService {
 
   projectRename(slug, name, aliases) {
     const entry = this.registry.upsert({
-      slug, name: name || slug, aliases: Array.isArray(aliases) ? aliases : [],
+      // nameManual：人工命名优先级最高，自动归类（regroup）与写入裁决都不得覆盖
+      slug, name: name || slug, aliases: Array.isArray(aliases) ? aliases : [], nameManual: true,
     });
-    return { ok: true, project: entry };
+    // 同一仓库的其它卡片跟着改名：用户改一次名，同类项目一起对齐（这是「归类」的语义）
+    this.registry.regroup();
+    return { ok: true, project: this.registry.get(slug) || entry };
   }
 
   projectSuggestions() {
@@ -837,14 +1260,20 @@ class MemoryService {
       return { ok: false, message: "待确认项数据损坏，无法解析" };
     }
     if (!payload || typeof payload !== "object") return { ok: false, message: "待确认项数据损坏，无法解析" };
-    if (slug) this.registry.upsert({ slug, name: slug, origin: "manual" });
+    if (slug) {
+      // 新建卡片的名字取 slug 反解的仓库名（比整串机器名可读）；已有卡片的真名由裁决保住
+      const name = layout.resolveWriteName(this.registry.get(slug), layout.repoNameFromSlug(String(slug)) || String(slug));
+      this.registry.upsert({ slug, name, origin: "manual" });
+      // 归类收口：确认归入后立刻与同仓库的其它卡片统一显示名
+      this.registry.regroup();
+    }
     this.index.reviewResolve(queueId, slug ? `assign:${slug}` : "dismiss");
     return { ok: true, memoryId: payload.memoryId, slug: slug || null };
   }
 
   // ---------- 索引维护 ----------
 
-  reindexFile(rel, legacyRows) {
+  reindexFile(rel, legacyRows, opts = {}) {
     // 入口先归一为磁盘真实大小写：watcher 拿到的是目录真名（projects/AgentHub/…），
     // 而 slug 小写路径（projects/agenthub/…）也会走到这里。两者若不归一，
     // 同一文件会在索引里留下两条只差大小写的 path（同 id 双 path）。
@@ -876,10 +1305,15 @@ class MemoryService {
     // 重建前先按 id 捞出旧行继承，否则一次外部编辑/重建就把用户状态全部抹掉
     // （ai_processed 归零会让 tasks._pending 把它们当成没处理过，重复烧模型）。
     // legacyRows：rebuildIndex 清表前下发的旧行快照——清表后这里查库恒空，继承会静默失效
-    const oldById = legacyRows || new Map(
+    //
+    // 重建模式（opts.legacyReady）下不再回库兜底：调用方已经把「该 path 的全部旧行」按 id 装进
+    // legacyRows 传下来了，快照里没有就是「确实没有旧行」。原先写成 `legacyRows || 查库`，
+    // 对每个「快照里没有的文件」（新文件、或清表后空库首建）都会回库 prepare + all 查一次——
+    // 实测 4751 个文件里绝大部分都走了这条空查询，是重建耗时里排名第二的浪费。
+    const oldById = opts.legacyReady ? (legacyRows || new Map()) : (legacyRows || new Map(
       this.index.db.prepare("SELECT id, pinned, starred, device, session, dup_index, ai_processed, created, hash, dedup_status FROM mem WHERE path = ?").all(rel)
         .map((r) => [r.id, r])
-    );
+    ));
     if (fm.type === "daily" || (!fm.id && sections.length)) {
       const rows = [];
       for (const sec of sections) {
@@ -910,14 +1344,21 @@ class MemoryService {
         });
       }
       // 删旧 + 插新放同一事务：中途抛错不会留下残缺索引
-      this.index.db.exec("BEGIN");
-      try {
-        this.index.removeByPath(rel);
+      // 重建模式下这两项都省掉：rebuildIndex 开头已清空全表（removeByPath 查的删的全是空），
+      // 且外层已开一个大事务（逐文件再开事务 = 每次提交刷一遍 WAL，实测占重建耗时 29%）
+      if (opts.skipRemove && opts.skipTx) {
         for (const row of rows) this.index.upsertOne(row, cfg);
-        this.index.db.exec("COMMIT");
-      } catch (e) {
-        this.index.db.exec("ROLLBACK");
-        throw e;
+      } else {
+        const own = !opts.skipTx;
+        if (own) this.index.db.exec("BEGIN");
+        try {
+          if (!opts.skipRemove) this.index.removeByPath(rel);
+          for (const row of rows) this.index.upsertOne(row, cfg);
+          if (own) this.index.db.exec("COMMIT");
+        } catch (e) {
+          if (own) this.index.db.exec("ROLLBACK");
+          throw e;
+        }
       }
       return { sections: true, count: rows.length };
     }
@@ -935,9 +1376,11 @@ class MemoryService {
     const old = oldById.get(rowId);
     // 不信任文件里的 fm.hash（导出/导入可能带脏值）：内容指纹永远现场重算
     const hash = contentHash({ title: fmTitle || "", body, tags: fm.tags, level: cfg["dedup.l1.normalizeLevel"] });
-    this.index.db.exec("BEGIN");
+    // 与 daily 分支同口径：重建模式下跳过空转的 removeByPath 与逐文件事务（见该处注释）
+    const ownTx = !opts.skipTx;
+    if (ownTx) this.index.db.exec("BEGIN");
     try {
-      this.index.removeByPath(rel);
+      if (!opts.skipRemove) this.index.removeByPath(rel);
       this.index.upsertOne({
       id: rowId, path: rel, anchor: null, type: fm.type || "note", layer: fm.layer || "l1",
       title: fmTitle || firstLine(body) || path.basename(rel), summary: fm.summary || body.slice(0, 240),
@@ -961,14 +1404,26 @@ class MemoryService {
       aiProcessed: old ? (old.hash === hash ? !!old.ai_processed : false) : false,
       body: body + "\n" + (fmTitle || ""),
       }, cfg);
-      this.index.db.exec("COMMIT");
+      if (ownTx) this.index.db.exec("COMMIT");
     } catch (e) {
-      this.index.db.exec("ROLLBACK");
+      if (ownTx) this.index.db.exec("ROLLBACK");
       throw e;
     }
     return { ok: true };
   }
 
+  /**
+   * 全量重建索引（同步版）。
+   *
+   * 性能要点（实测 44s → 目标 12~15s，4751 文件）：
+   *  - 整个逐文件循环包在**一个大事务**里：原先每文件一对 BEGIN/COMMIT，每次提交都刷 WAL，
+   *    实测占重建耗时约 29%；
+   *  - 重建期间**摘掉 mem_ai 触发器**：末尾本来就要 rebuildFts() 全量重灌，逐行维护 FTS 是重复劳动
+   *    （实测再省约 17%）。摘除必须用 try/finally 保证恢复——恢复失败会让后续单文件写入不再进 FTS，
+   *    所以恢复后还要断言触发器确实存在，缺失就用 rebuildFts() 兜底；
+   *  - 逐文件跳过 removeByPath（清表已做过，那一步查的删的全是空）与逐文件事务（见 reindexFile 开关）；
+   *  - 传 legacyReady：快照里没有就是没有，不再回库做必然为空的查询。
+   */
   rebuildIndex(progress) {
     const t0 = Date.now();
     const files = this.store.walkMemoryFiles();
@@ -983,22 +1438,93 @@ class MemoryService {
     }
     db.exec("BEGIN");
     try { db.exec("DELETE FROM mem"); db.exec("DELETE FROM mem_link"); db.exec("COMMIT"); } catch (e) { db.exec("ROLLBACK"); throw e; }
-    let done = 0;
-    // 单个坏文件不能中止整批（此前一遇异常就停在残缺态，搜索静默漏结果）
+
+    // 摘掉 INSERT 触发器（FTS 末尾统一重灌）；DDL 不能进事务，放在大事务之外
+    const hadTrigger = this.index.dropInsertTrigger();
+
     const failed = [];
-    for (const rel of files) {
+    let done = 0;
+    let bodyError = null;
+    try {
+      db.exec("BEGIN");
       try {
-        this.reindexFile(rel, legacyByPath.get(rel));
+        // 批量只读遍历窗口：这些 rel 全部来自 walkMemoryFiles()（自己遍历出来的，天然在 root 内），
+        // 逐文件再往上找祖先做 realpath 逃逸检查是重复劳动——实测 4751 个文件白花 0.7s。
+        // 窗口只覆盖这里的读；写路径（writeMemory/删除）仍走完整检查。
+        this.store.withTrustedWalk(() => {
+          for (const rel of files) {
+            try {
+              // 单个坏文件不能中止整批（此前一遇异常就停在残缺态，搜索静默漏结果）
+              this.reindexFile(rel, legacyByPath.get(rel), { skipRemove: true, skipTx: true, legacyReady: true });
+            } catch (e) {
+              failed.push({ rel, message: String(e.message || e).slice(0, 160) });
+            }
+            done++;
+            if (progress && done % 200 === 0) progress({ done, total: files.length });
+          }
+        });
+        db.exec("COMMIT");
       } catch (e) {
-        failed.push({ rel, message: String(e.message || e).slice(0, 160) });
+        db.exec("ROLLBACK");
+        throw e;
       }
-      done++;
-      if (progress && done % 200 === 0) progress({ done, total: files.length });
+    } catch (e) {
+      bodyError = e;
+    } finally {
+      // 无论如何都要把触发器装回去；装回后校验一次，缺失则全量重灌兜底
+      if (hadTrigger) {
+        try {
+          if (!this.index.restoreInsertTrigger()) this.index.rebuildFts();
+        } catch {
+          try { this.index.rebuildFts(); } catch { /* 兜底失败也不掩盖原始错误 */ }
+        }
+      }
     }
+    if (bodyError) throw bodyError;
+
     this.index.rebuildFts();
     const tookMs = Date.now() - t0;
     this.index.setMeta("lastBuildAt", String(Date.now()));
     return { files: files.length, failed, tookMs };
+  }
+
+  /**
+   * 把旁路库（worker 离线重建好的整库快照）换入当前索引：ATTACH + 单事务。
+   *
+   * 为什么不用「关连接 → 改名替换文件 → 重开」：Windows 上 rename 覆盖已存在文件会失败
+   * （需要两次 rename，中间有非原子窗口，崩在中间就是库缺失）；而 ATTACH 换入是单事务，
+   * 读要么看到旧索引要么看到新索引，且不动 mem_meta（调度记账、同步基线等全保留）。
+   *
+   * 只换 mem / mem_link 两张表并重灌 FTS：meta 由主库自己说了算——旁路库是重建开始时的快照，
+   * 期间调度器可能已往主库写过记账，用快照覆盖会把这段时间的记账抹回去。
+   */
+  swapInRebuiltIndex(sidecarFile) {
+    if (this.index.readOnly) throw new Error("索引库处于只读模式，无法换入");
+    const db = this.index.db;
+    const t0 = Date.now();
+    db.exec(`ATTACH '${String(sidecarFile).replace(/'/g, "''")}' AS rebuilt`);
+    try {
+      db.exec("BEGIN");
+      try {
+        db.exec("DELETE FROM main.mem");
+        db.exec("DELETE FROM main.mem_link");
+        db.exec("INSERT INTO main.mem SELECT * FROM rebuilt.mem");
+        db.exec("INSERT INTO main.mem_link SELECT * FROM rebuilt.mem_link");
+        // FTS5 的 delete-all 命令不接受限定表名（main.mem_fts(main.mem_fts) 会语法错）
+        db.exec("INSERT INTO mem_fts(mem_fts) VALUES('delete-all')");
+        db.exec("INSERT INTO mem_fts_w(mem_fts_w) VALUES('delete-all')");
+        db.exec("INSERT INTO mem_fts(rowid, t_title, t_summary, t_body, t_tags) SELECT rowid, t_title, t_summary, t_body, t_tags FROM main.mem");
+        db.exec("INSERT INTO mem_fts_w(rowid, w_title, t_summary, t_body, t_tags) SELECT rowid, w_title, t_summary, t_body, t_tags FROM main.mem");
+        db.exec("COMMIT");
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
+      }
+    } finally {
+      try { db.exec("DETACH rebuilt"); } catch { /* 事务失败时 DETACH 可能已随回滚失效，忽略 */ }
+    }
+    this.index.setMeta("lastBuildAt", String(Date.now()));
+    return { tookMs: Date.now() - t0 };
   }
 
   diagnose() {
@@ -1109,6 +1635,8 @@ class MemoryService {
     }
     // 台账同批收口：卡片与索引行必须同一时刻归一，否则中间态会出现「一张卡但条数只剩一半」
     this.registry.normalize();
+    // 归类收口：同一 Git 仓库的多张卡统一显示名/互相补全远程（与启动自愈同一逻辑，幂等）
+    this.registry.regroup();
     return fixed;
   }
 
@@ -1246,8 +1774,21 @@ class MemoryService {
     }, cfg);
     const lines = [`检索「${args.query}」命中 ${res.total} 条，返回 ${res.results.length} 条（${res.tookMs}ms）`];
     for (const r of res.results) {
-      lines.push(`[${r.score}] ${r.title}${r.superseded ? "（已失效）" : ""}`);
+      let staleNotice = "";
+      let staleDetail = "";
+      try {
+        const full = this.getById(r.id);
+        const fresh = this._checkFreshness(full);
+        if (fresh.isStale) {
+          staleNotice = " ⚠️[关联代码已更新可能过时]";
+          staleDetail = `    ⚠️ 时效预警：关联文件 ${fresh.staleFiles.join(", ")}，当前代码可能已演进，请以磁盘最新代码为准！`;
+        }
+      } catch { /* 容错 */ }
+      lines.push(`[${r.score}] ${r.title}${r.superseded ? "（已失效）" : ""}${staleNotice}`);
       lines.push(`    ${(r.summary || "").slice(0, 120)}`);
+      if (staleDetail) {
+        lines.push(staleDetail);
+      }
       lines.push(`    id=${r.id} project=${r.project || "-"} agent=${r.agent} date=${isoDate(r.created)}`);
     }
     const text = truncateByTokens(lines.join("\n"), maxTokens);
@@ -1260,13 +1801,21 @@ class MemoryService {
     for (const id of Array.isArray(ids) ? ids.slice(0, 10) : []) {
       const m = this.getById(id);
       if (!m) { out.push({ id, missing: true }); continue; }
+      let fresh = { isStale: false, staleFiles: [] };
+      try { fresh = this._checkFreshness(m); } catch { /* 容错 */ }
+      let rawBody = m.body;
+      if (fresh.isStale) {
+        rawBody = `> ⚠️【时效警示】本记忆关联的代码文件在此记录后已被外部修改（${fresh.staleFiles.join(", ")}）。当前代码可能已演进，本条仅作为历史参考，严禁根据此条旧记忆回退或覆盖现有代码！\n\n${rawBody}`;
+      }
       const remaining = Math.max(400, (maxChars || MAX_BODY_DEFAULT) - used);
-      const body = m.body.length > remaining ? m.body.slice(0, remaining) + "\n…（已截断）" : m.body;
+      const body = rawBody.length > remaining ? rawBody.slice(0, remaining) + "\n…（已截断）" : rawBody;
       used += body.length;
       out.push({
         id: m.id, title: m.title, project: m.project, agent: m.agent, layer: m.layer,
-        created: m.created, tags: m.tags, body, truncated: body.length < m.body.length,
+        created: m.created, tags: m.tags, body, truncated: body.length < rawBody.length,
         path: `${m.path}${m.anchor ? "#" + m.anchor : ""}`,
+        stale: fresh.isStale,
+        staleFiles: fresh.staleFiles,
       });
     }
     const primary = out.find((x) => !x.missing);
@@ -1317,6 +1866,7 @@ class MemoryService {
       agent: agent || "unknown",
       tags: args.tags,
       importance: args.importance,
+      files: args.files,
       supersedes: args.supersedes,
       cwd: args.cwd,
       session: args.session,
@@ -1361,11 +1911,6 @@ function truncateByTokens(text, maxTokens) {
   // CJK≈1 token/字、ASCII≈0.25：按字符预算折算后裁剪
   const budgetChars = Math.max(200, Math.floor(maxTokens / 0.7));
   return text.slice(0, budgetChars) + "\n…（超出 token 上限已截断）";
-}
-
-function renderRemaining(fm, sections) {
-  const { renderDailyFile } = require("./store.cjs");
-  return renderDailyFile(fm, sections);
 }
 
 function firstLine(text) {
@@ -1426,6 +1971,15 @@ function isoDate(ms) {
 function hhmm(ms) {
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** 解析「路径@毫秒时间戳」锚定串：只有末尾 @纯数字 才算时间戳锚定。
+ *  @scope/pkg、assets/icon@2x.png 这类路径本身含 @ 的文件不能被误切——
+ *  写入锚定与时效检查必须共用同一口径，否则会误报「已删除/重命名」或静默漏检。 */
+function parseFileAnchor(item) {
+  const s = String(item || "");
+  const m = /^(.+)@(\d+)$/.exec(s);
+  return m ? { file: m[1], mtime: Number(m[2]) } : { file: s, mtime: 0 };
 }
 
 module.exports = { MemoryService, normalizeTags, buildSummary, isoDate };

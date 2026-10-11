@@ -71,6 +71,86 @@ const DEFAULTS = {
         maxOutputTokens: 80000,
       })),
     },
+    // ModelScope（魔搭 · 阿里）：静态兜底 = 实测 GET /v1/models 的 35 个模型
+    // （2026-10-06 拉取，需 Bearer）。⚠ 清单按社区热度精选，**不是全集**：
+    //   GLM-5.3-Flash 不在清单内但直调 200（已实测）——故清单仅供开箱展示，
+    //   可用性以直调为准。contextLength 取同模型在其它渠道的跨渠道声明值
+    //   （DeepSeek-V4.1-Flash/GLM-5.2 等均为 1M）；上游未声明输出上限者记 0（不编造）。
+    modelscope: {
+      syncedAt: 0,
+      models: [
+        // —— 对话主力（实测可用，含 tier 计费分档）——
+        { id: "deepseek-ai/DeepSeek-V4.1-Flash", name: "DeepSeek-V4.1-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "deepseek-ai/DeepSeek-V4-Flash-0731", name: "DeepSeek-V4-Flash-0731", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "deepseek-ai/DeepSeek-V4-Pro", name: "DeepSeek-V4-Pro", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "deepseek-ai/DeepSeek-V4-Pro-0813", name: "DeepSeek-V4-Pro-0813", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        // 不在 /v1/models 清单但直调 200（2026-10-06 实测，模型名与其它渠道同名模型一致）
+        { id: "ZhipuAI/GLM-5.3-Flash", name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "ZhipuAI/GLM-5.2", name: "GLM-5.2", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "ZhipuAI/GLM-4.7-Flash", name: "GLM-4.7-Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "Qwen/Qwen3.8-Flash-Next", name: "Qwen3.8-Flash-Next", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        // —— 其余清单内模型（开箱可选）——
+        { id: "Qwen/Qwen3.8-27B", name: "Qwen3.8-27B", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "Qwen/Qwen3.5-397B-A17B", name: "Qwen3.5-397B-A17B", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "Qwen/Qwen3.5-122B-A10B", name: "Qwen3.5-122B-A10B", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "Qwen/Qwen3.5-35B-A3B", name: "Qwen3.5-35B-A3B", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "Qwen/Qwen3.5-27B", name: "Qwen3.5-27B", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "MiniMax/MiniMax-M3", name: "MiniMax-M3", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "MiniMax/MiniMax-M1-80k", name: "MiniMax-M1-80k", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 80000, maxOutputTokens: 0 },
+        { id: "meituan-longcat/LongCat-Flash-Lite", name: "LongCat-Flash-Lite", rate: null, capabilities: { images: false, reasoning: false, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "stepfun-ai/Step-3.5-Flash", name: "Step-3.5-Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "stepfun-ai/Step-3.7-Flash", name: "Step-3.7-Flash", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "Shanghai_AI_Laboratory/Intern-S1", name: "Intern-S1", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "Shanghai_AI_Laboratory/Intern-S2-Preview", name: "Intern-S2-Preview", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "mistralai/Mistral-Large-Instruct-2407", name: "Mistral-Large-Instruct-2407", rate: null, capabilities: { images: false, reasoning: false, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "nex-agi/Nex-N2.5-Pro", name: "Nex-N2.5-Pro", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "nex-agi/Nex-N2.5-mini", name: "Nex-N2.5-mini", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+      ],
+    },
+    // LobsterAI（网易有道龙虾）：静态兜底 = **公开端点** GET /api/models/pricing-catalog
+    // 的实测目录（2026-10-05 拉取，HTTP 200 / 37KB，无需鉴权）。这是权威源：
+    // 官方开源仓库 docs/server-integration/2026-08-27-more-models.md 明写该端点 public。
+    // ⚠ 不要用第三方反代项目里的静态表——那份是 2026-08-06 的旧快照且 context_length
+    //   是硬编码占位值（131072），与真实值（多为 1000000）差 8 倍。
+    // contextWindow 为 null 的模型：官方客户端回落 OpenClaw 默认 200k，但按本仓库约定
+    // 「模型上限类字段绝不给编造的默认值」→ 一律记 0（未知），由拉取结果覆盖。
+    lobster: {
+      syncedAt: 0,
+      models: [
+        // —— 限时免费（freeAccess=true）——
+        { id: "deepseek-flash", name: "DeepSeek-V4.1-Flash", rate: 0.05, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro", rate: 0.26, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", rate: 0.05, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek-V4-Flash-Vision-Exp", rate: 0.05, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "glm-5.3-flash", name: "GLM-5.3-Flash", rate: 0.06, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "glm-5.3-flashx", name: "GLM-5.3-FlashX", rate: 0.15, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "MiniMax-M3", name: "MiniMax-M3", rate: 0.24, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        // —— 其余目录（按倍率升序）——
+        { id: "MiniMax-M3.1-Flash-Preview", name: "MiniMax-M3.1-Flash-Preview", rate: 0, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "MiniMax-M2.7", name: "MiniMax-M2.7", rate: 0.24, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "qwen3.5-plus-2026-04-20", name: "Qwen3.5-plus", rate: 0.12, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "qwen3.6-plus", name: "Qwen3.6-Plus", rate: 0.34, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "doubao-seed-2-1-turbo-260628", name: "Doubao-Seed-2.1-Turbo", rate: 0.34, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
+        { id: "kimi-k2.5", name: "Kimi-K2.5", rate: 0.41, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "qwen3.7-plus", name: "Qwen3.7-Plus", rate: 0.53, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "doubao-seed-2-0-code-preview-260215", name: "Doubao-Seed-2.0-Code", rate: 0.54, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "kimi-k2.6", name: "Kimi-K2.6", rate: 0.64, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "glm-5", name: "GLM-5", rate: 0.64, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "doubao-seed-2-1-pro-260915", name: "Doubao-Seed-2.1-Pro", rate: 0.68, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
+        { id: "kimi-k2.8-preview", name: "Kimi-K2.8-Preview", rate: 0.73, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 262144, maxOutputTokens: 0 },
+        { id: "kimi-k2.7-code", name: "Kimi-K2.7-Code", rate: 0.73, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 262144, maxOutputTokens: 0 },
+        { id: "qwen3.8-flash", name: "Qwen3.8-Flash", rate: 0.06, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "qwen3.8-omni-flash", name: "Qwen3.8-Omni-Flash", rate: 0.06, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "qwen3.8-max", name: "Qwen3.8-Max", rate: 0.91, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "glm-5v-turbo", name: "GLM-5V-Turbo", rate: 0.96, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "glm-5.1", name: "GLM-5.1", rate: 1.07, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0 },
+        { id: "glm-5.2", name: "GLM-5.2", rate: 1.08, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "glm-5.3", name: "GLM-5.3", rate: 1.08, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "qwen3.7-max", name: "Qwen3.7-Max", rate: 1.33, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "kimi-k2.7-code-highspeed", name: "Kimi-K2.7-Code-Highspeed", rate: 1.46, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 262144, maxOutputTokens: 0 },
+        { id: "kimi-k3", name: "Kimi-K3", rate: 20, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1048576, maxOutputTokens: 0 },
+      ],
+    },
     // ZCode（智谱 GLM 编码套餐）：pinned 静态兜底（zcode-api 3.11.2 实证目录；
     // billing/balance 的 balances[].capabilities 可在线刷新出真实可用模型）
     zcode: {
@@ -198,6 +278,9 @@ const DEFAULTS = {
       settingUrl: "https://xiaohuanxiong.com/api/web/office/v3/setting_info",
       userInfoUrl: "https://xiaohuanxiong.com/api/web/auth/v1/user_info",
       grantUrl: "https://xiaohuanxiong.com/api/web/desktop/v1/login/points/grant",
+      // 首次手机端登录奖励端点（一次性新手福利，与 desktop 端点互不共享额度、各领一次；
+      // 身份头报 app-android，同一把 Bearer token——示例项目 agent2api 从官方安卓包逆向实测）
+      mobileGrantUrl: "https://xiaohuanxiong.com/api/web/mobile/v1/login/points/grant",
       refreshUrl: "https://xiaohuanxiong.com/api/web/auth/v1/refresh",
       // x-client-* 六头取值（box-agent 链路 platform 带架构 `desktop-windows-x64`；
       // 浏览器/受信域 platform 不带架构，见 adapters.cjs raccoonIdentity/raccoonWebHeaders）
@@ -205,6 +288,140 @@ const DEFAULTS = {
       clientVersion: "1.0.35",
       webClientVersion: "v1.0.35",
       clientChannel: "official",
+    },
+    // ===== LobsterAI（网易有道龙虾）=====
+    // 协议事实（2026-10-05 实测 + 参考实现 lobsterai2api@21c39a4 交叉验证）：
+    // 鉴权 = Bearer JWT（OAuth 授权码换发，回环回调 127.0.0.1/auth/callback）+ 设备 uuid + keyfrom 时间戳。
+    // 关键约束：① 对话上游**只接受 stream=true**（非流式实测 500）；
+    //          ② 签到活动按 clientVersion 门禁——旧版本号返回 slotState=empty（实测 0.1.0 被隐藏、
+    //             2026.9.4+ 可见），故 versionUrl 动态取线上版本，取不到才回落 clientVersion；
+    //          ③ 部分业务错误藏在 HTTP 200 的 SSE 流里（event:error 帧），chat 必须窥探首块。
+    lobster: {
+      // 对话域（原生 OpenAI Chat Completions，SSE；上游为龙虾自有网关）
+      chatUrl: "https://lobsterai-server.youdao.com/api/proxy/v1/chat/completions",
+      // 模型目录（GET，需 Bearer；返回 {code,data:[{modelId,modelName,provider,apiFormat,
+      // supportsImage,supportsThinking,contextWindow,explicitContextCache,thinkingConfig}]}）
+      modelsUrl: "https://lobsterai-server.youdao.com/api/models/available",
+      // 模型目录·公开兜底（**无需鉴权**，官方文档 2026-08-27-more-models.md 明写 public）：
+      // 含真实 contextWindow/supportsImage/costMultiplier/freeAccess + imageModels/videoModels。
+      // 未登录或 Bearer 目录不可用时用它，保证模型清单与真实能力不依赖登录态
+      pricingCatalogUrl: "https://lobsterai-server.youdao.com/api/models/pricing-catalog",
+      // 积分余额（GET /api/user/profile-summary 的 totalCreditsRemaining；
+      // 注意 /api/user/quota 只含 freeCreditsTotal=300，不含活动积分，故不用它）
+      balanceUrl: "https://lobsterai-server.youdao.com/api/user/profile-summary",
+      // 鉴权控制面（授权码换令牌 / 刷新令牌；两者都不需要 Bearer）
+      exchangeUrl: "https://lobsterai-server.youdao.com/api/auth/exchange",
+      refreshUrl: "https://lobsterai-server.youdao.com/api/auth/refresh",
+      // 每日签到活动（client-activities 三段式：slot → context → actions/check_in）
+      activitySlotUrl: "https://lobsterai-server.youdao.com/api/client-activities/slot",
+      activityBaseUrl: "https://lobsterai-server.youdao.com/api/client-activities",
+      // 签到活动所在位置槽（实测活动 activityCode=daily-check-in-evergreen-prod-20260814，
+      // activityType=daily_check_in，rewardCredits=100，常驻至 2126 年）
+      checkinPlacement: "desktop_sidebar",
+      // 客户端版本号来源（签到活动按版本下发；官方更新接口实测返回 2026.9.23）
+      versionUrl: "https://api-overmind.youdao.com/openapi/get/luna/hardware/lobsterai/prod/update",
+      // 登录门户（回环 OAuth 的授权页基址；getlobster.ai 的 DNS 已失效，实际门户在 youdao.com）
+      loginPortal: "https://lobsterai.youdao.com",
+      // 客户端版本兜底（versionUrl 不可用时用；低于 2026.9.4 会看不到签到活动）
+      clientVersion: "2026.9.23",
+      // 上报的客户端身份（UA = LobsterAI/<version>）
+      clientName: "LobsterAI",
+      // 客户端能力头（官方客户端实测值；缺了部分 agent 能力会被降级）
+      clientCapabilities: "kimi-k3-agentic-v1",
+    },
+    // ===== ModelScope（魔搭 · 阿里）=====
+    // 协议事实（2026-10-06 全量实测）：
+    // ① 对话面 = 官方 OpenAI 兼容网关（api-inference.modelscope.cn/v1），原生支持
+    //    stream / tool_calls / reasoning_content，无需签名、无需客户端（与其它渠道本质不同：
+    //    这是**官方公开 API**，非逆向）。
+    // ② 魔粒控制面 = www.modelscope.cn/openapi/v1/magicubes/*，鉴权是**三头同发**
+    //    （Authorization: Bearer + OpenAPI-Token + X-Modelfun-Token）且必须带浏览器
+    //    UA/Origin/Referer——缺头会被风控中间件静默忽略（实测）。
+    // ③ 每日任务实测：daily_active +200/日、aliyun_bindlogin +50/日 为自动发放；
+    //    interaction_like 收藏/喜欢 +2/次（上限 20 次/日）= +40/日 需主动 PUT 星标
+    //    （PUT /api/v1/mcpServers/{path}/{name}/stars，实测 200 → 余额即时 +2）。
+    // ④ 计费分档实测：交易记录带 model_tier，standard=1 魔粒/次、ultra=2 魔粒/次
+    //    （不存在「一律 2/次」——早期口径只对旗舰档成立）。
+    // ⑤ 模型清单 ≠ 全集：/v1/models 只收录按热度精选的模型（实测 35 个），
+    //    GLM-5.3-Flash 不在清单内但直调 200 —— 验证可用性的 ground truth 是直调。
+    modelscope: {
+      // ===== 对话面（OpenAI 兼容） =====
+      chatUrl: "https://api-inference.modelscope.cn/v1/chat/completions",
+      modelsUrl: "https://api-inference.modelscope.cn/v1/models",
+      // ===== 鉴权面（OAuth 2.0 + OIDC，2026-10-06 端到端实测） =====
+      // 官方文档 https://modelscope.cn/docs/accounts/oauth；元数据 /.well-known/openid-configuration
+      // 关键实测：① 动态注册（RFC 7591）POST /oauth/register 只需 client_name+redirect_uris
+      //              即返回 client_id/client_secret，**无需鉴权** → AgentHub 可全自动注册
+      //           ② access_token 前缀 ms_oauth、475 字符、有效期 30 天
+      //           ③ refresh_token **一次性轮换**（用后失效）→ 续期成功必须立即持久化新 refresh
+      //           ④ OAuth 错误以 **HTTP 200 + body.error** 返回（如 invalid_grant）
+      //              → 判成败必须查 body.error，绝不能只看状态码
+      //           ⑤ api-inference scope 实测可调推理（200 + 正常出流 + usage 正常）
+      oauthAuthorizeUrl: "https://www.modelscope.cn/oauth/authorize",
+      oauthTokenUrl: "https://www.modelscope.cn/oauth/token",
+      oauthUserinfoUrl: "https://www.modelscope.cn/oauth/userinfo",
+      oauthRegisterUrl: "https://www.modelscope.cn/oauth/register",
+      oidcMetadataUrl: "https://modelscope.cn/.well-known/openid-configuration",
+      // 申请 scope：openid 必选；profile 取用户信息；api-inference 是调用推理的授权
+      oauthScopes: "openid profile api-inference",
+      // 互联应用信息（动态注册所得）持久化在账号 meta 里，键名如下
+      oauthMetaKeys: { clientId: "oauthClientId", clientSecret: "oauthClientSecret", refreshToken: "oauthRefreshToken" },
+      // 令牌引导页（用户自建令牌入口；粘贴兜底路径的直达链接）
+      tokenPageUrl: "https://modelscope.cn/my/myaccesstoken",
+      // 令牌形态判别：OAuth access_token 以 ms_oauth 开头；用户自建令牌以 ms- 开头
+      oauthTokenPrefix: "ms_oauth",
+      // ===== 魔粒控制面 =====
+      apiBase: "https://www.modelscope.cn",
+      // ===== Cookie 通道（/api/v1 族专用，2026-10-06 实测确立）=====
+      // 为什么必须用 Cookie：魔搭端点分两族，**严格互斥**（实测穷尽四条路径均不通）：
+      //   「OAuth 可用族」推理 /v1/chat + 魔粒 /openapi/v1/magicubes/* + 身份 /oauth/userinfo
+      //   「仅 Cookie/ms- 可用族」点赞 /api/v1/mcpServers/*/stars + 令牌管理 /api/v1/users/tokens*
+      // 实测：OAuth 调点赞 → 401 "oauth token is not supported by this endpoint"
+      //       （改请求头、找 openapi 替代、扩 scope、动态注册声明权限，四条路全失败）
+      // 而 ms- 令牌虽能点赞，但不触发 daily_active —— 参考项目实测注释：
+      //   「Bearer Token 虽能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入日活，daily_active
+      //     每日魔粒不会发放；只有 Web 会话（Cookie）活动才触发奖励」
+      // ⇒ Cookie 是唯一同时覆盖「点赞」与「日活」的凭据。
+      // 做法：OAuth 授权时在应用内窗口捕获 Web Cookie（用户零额外操作）。
+      cookieTouchPaths: ["/my/overview", "/", "/home", "/models", "/datasets", "/my/tasks"],
+      // 前端每次加载都会调的两个登录事件端点（参考项目 HAR 抓包确认）——
+      // daily_active 即「注册并登陆，每日登录即可获取」，必须补这两下触碰
+      cookieLoginEventPaths: ["/api/v1/users/login/info", "/api/v1/users/authorized/check"],
+      // 魔粒激活用的 openapi 轻量端点（Cookie 亦可调，作为日活信号补充）
+      cookieOpenapiPaths: [
+        "/openapi/v1/magicubes/earn/rules",
+        "/openapi/v1/magicubes/balance",
+        "/openapi/v1/models?page_number=1&page_size=10",
+        "/openapi/v1/datasets?page_number=1&page_size=10",
+      ],
+      // Cookie 过滤域名（只存魔搭自己的，不存第三方）
+      cookieDomains: ["modelscope.cn"],
+      // 账号 meta 里存 Cookie 的键名
+      cookieMetaKey: "msCookie",
+      // Cookie 失效判定（上游对未登录返回的业务码/文案）
+      cookieDeadRe: "InvalidAuthentication|user not logged in|not logged in|登录已过期|禁止访问",
+      balancePath: "/openapi/v1/magicubes/balance",
+      earnRulesPath: "/openapi/v1/magicubes/earn/rules",
+      transactionsPath: "/openapi/v1/magicubes/transactions",
+      // 身份端点（uid 来源：OAuth 用 userinfo.sub；令牌用 users/me.username）
+      userInfoPath: "/openapi/v1/users/me",
+      // 点赞任务：列 MCP 服务（PUT + 分页体）→ 逐个 PUT 星标
+      mcpServersPath: "/api/v1/dolphin/mcpServers",
+      starPathPrefix: "/api/v1/mcpServers",
+      // 每日任务规则键（实测值，非猜测）
+      ruleDailyActive: "daily_active",
+      ruleAliyunBind: "aliyun_bindlogin",
+      ruleLike: "interaction_like",
+      // 点赞目标分页大小（实测 30 可一次拿够 20 个未星标目标）
+      mcpPageSize: 30,
+      // 必须带浏览器上下文，否则风控中间件忽略请求（实测）
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      refererPath: "/my/overview",
+      // 点赞间隔（ms）：避免高频被风控，参考实现用 200-400ms，这里取更保守的 400-900ms
+      likeDelayMinMs: 400,
+      likeDelayMaxMs: 900,
+      // 单轮点赞上限（安全阀：即使上游 daily_cap 异常放大也不超此值）
+      likeHardCap: 25,
     },
     // ===== ZCode（智谱 GLM 编码套餐）=====
     // 协议事实：上游是 Anthropic Messages（coding-plan 与 start-plan 统一）；
@@ -264,6 +481,24 @@ const DEFAULTS = {
       refreshPath: "/api/v1/deviceToken/refresh",
       userAgent: "qoder/0.4.3",
       cosyVersion: "0.4.3",
+    },
+    // ===== CatPaw（美团）=====
+    // 有状态会话协议（round → event(running) → turn(SSE) → 工具循环 → event(completed)）。
+    // 客户端身份常量（toolVersion / agentVersion / appKey / source / mode）**必须与真实客户端保持一致**，
+    // 上游按它们解释请求语义与工具形态；客户端升级后改这里即热生效，无需发版。
+    // permissionMode 是本家固定的绕过权限档（参照实现写死在请求体里）。
+    catpaw: {
+      baseUrl: "https://ai.catpaw.meituan.com",
+      source: "CatX",
+      mode: "CATX_APP",
+      toolVersion: "2.0.2",
+      agentVersion: "1.0.1",
+      appKey: "fe_com.sankuai.catpaw.external.front",
+      permissionMode: "unsafeBypassPermissions",
+      // 超时三分档：短请求（round/event/stop，参照实现 30s/3s）、turn 的 SSE 总预算（15min）
+      requestTimeoutMs: 30000,
+      stopTimeoutMs: 3000,
+      sseTimeoutMs: 900000,
     },
   },
 };

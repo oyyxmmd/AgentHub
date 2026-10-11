@@ -5,7 +5,9 @@
   本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
 -->
 <!-- 记忆中枢 · 模型与网关面板：来源优先级（左拖拽小卡 + 右说明与操作的双栏）+ 供应商紧凑列表
-     （名称 / 调用信息 / 模型 / 连接测试·编辑·删除，其余收进「查看更多」弹窗）+ 反代网关列表 + 标签降级链。
+     （名称 / 调用信息 / 模型 / 连接测试·编辑·删除·启用开关）+ 反代网关列表 + 标签降级链。
+     供应商「编辑」弹窗＝连接信息（Base URL / API 格式 / API Key / 备注）+ 模型列表：
+     每行一个模型，右侧连接测试 / 编辑 / 删除图标按钮与启用开关，编辑走二级小弹窗。
      三级测试与真实调用结果均为弹窗；所有下拉/输入框对齐全站控件规范（f-select/f-input）。 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
@@ -15,11 +17,11 @@ import { useAppStore } from "../../stores/app";
 import { useMemoryStore } from "../../stores/memory";
 import * as api from "../../api/ipc";
 import { timeAgo } from "../../composables/useFormat";
+import { fmtCtx } from "../../utils/format";
 import { taskLabel, taskLabelZh, effortLabel } from "./labels";
 import MemHelp from "./MemHelp.vue";
 import MemSelect from "./MemSelect.vue";
 import MemDialog from "./MemDialog.vue";
-import MemProgressDialog from "./MemProgressDialog.vue";
 
 const app = useAppStore();
 const mem = useMemoryStore();
@@ -30,12 +32,15 @@ type Provider = {
   status: string; lastCheck: { at: number; ok: boolean; latencyMs?: number; models?: number } | null;
   modelCount: number; enabledModelCount: number; isGateway: boolean;
 };
+/** 模型能力预判（拉取/添加时按模型名 guessCaps 落盘；旧数据可能没有整块 caps） */
+type ModelCaps = { vision?: boolean; tools?: boolean; stream?: boolean; jsonMode?: boolean; contextWindow?: number };
 type Model = {
   id: string; providerId: string; modelId: string; displayName: string; enabled: boolean;
   reasoning: { enabled: boolean; effort: string; customBudget: number | null };
+  caps?: ModelCaps;
   tags: string[]; priority: number; temperature: number; maxTokens: number;
 };
-type Routing = { task: string; tags: string[]; effort: string; providerId?: string; modelId?: string; modelState?: string; chain: { providerId: string; providerName: string; modelId: string; priority: number; source: string }[] };
+type Routing = { task: string; tags: string[]; effort: string; providerId?: string; modelId?: string; modelState?: string; chain: { providerId: string; providerName: string; modelId: string; priority: number; source: string; fallback?: boolean }[]; tagFallback?: boolean };
 type Gateway = { id: string; name: string; baseUrl: string; available: boolean; urlOverride: string; modelCount: number; enabledModelCount: number; fallbackModel: string };
 type CallResult = { ok: boolean; latencyMs?: number; providerId?: string; modelId?: string; effort?: string; text?: string; message?: string; usage?: unknown };
 /** 路由表里的一条任务级绑定配置（后端 models.routing 的原始条目） */
@@ -61,8 +66,18 @@ const callOpen = ref(false);
 const busy = ref("");
 const drawer = ref(false);
 const form = ref({ id: "", name: "", baseUrl: "", apiFormat: "chat_completions", apiKey: "", note: "", enabled: true, kind: "" });
+/** API Key 明文/掩码切换（编辑弹窗里的眼睛按钮） */
+const keyVisible = ref(false);
 const fetchResult = ref<{ id: string; list: { id: string; tags: string[]; reasoning: { enabled: boolean; effort: string } }[] } | null>(null);
-const selectedModels = ref<string[]>([]);
+/** 模型级二级弹窗（编辑模型）：快照编辑，点保存一次性提交 */
+const modelOpen = ref(false);
+const modelForm = ref({
+  id: "", providerId: "", modelId: "", displayName: "", enabled: true,
+  effort: "minimal", customBudget: null as number | null,
+  tagsText: "", priority: 10, temperature: 0.2, maxTokens: 2048,
+  // 能力预判要随保存一起回传：不传的话后端会按模型名重猜，模型行上的上下文/视觉 chip 会跟着变
+  caps: undefined as ModelCaps | undefined,
+});
 
 const EFFORTS = ["off", "minimal", "low", "medium", "high", "custom"];
 const FORMATS = [
@@ -84,7 +99,9 @@ const sourceDesc = (key: string) => SOURCE_META[key]?.desc || "";
 
 /* 下拉选项清单（全部走 MemSelect = 与「用量统计」同款 el-select）：
    原先散在模板里的 <option v-for> 收在这里，选项的来源逻辑一眼可见 */
-const formatOptions = FORMATS.map((f) => ({ value: f.id, label: f.label }));
+// API 格式选项带端点路径：下拉收起后仍能对上号（详细差异见选中项下方的 desc 行）
+const formatOptions = FORMATS.map((f) => ({ value: f.id, label: `${f.label}（${f.path.replace("POST ", "")}）` }));
+const formatDesc = (id: string) => FORMATS.find((f) => f.id === id)?.desc || "";
 const effortOptions = EFFORTS.map((e) => ({ value: e, label: effortLabel(e) }));
 const routeEffortOptions = ROUTE_EFFORTS.map((e) => ({ value: e, label: effortLabel(e) }));
 const degradeProviderOptions = computed(() => [
@@ -121,6 +138,11 @@ function chainHint(r: Routing) {
   return `没有启用模型带「${r.tags.join(" / ")}」标签 —— 到模型池给某个模型补标签，或在本行「指定模型」里直接选一个（指定优先于标签）`;
 }
 
+/** 兜底链提示：任务现在能用（用启用模型兜底），但提醒换更强模型效果更好 */
+function fallbackHint(r: Routing) {
+  return `没有带「${r.tags.join(" / ")}」标签的启用模型，已用池里全部启用模型兜底，任务照常执行。蒸馏/画像这类任务用更强模型效果更好：到模型池给某个模型补标签可精确指定，或在本行「指定模型」里直接选一个（指定优先于标签）。`;
+}
+
 const HELP = {
   sources: "记忆模块调模型时按这里的顺序找来源：先试自备 Key 的自定义供应商，再试本机网关（零成本但常不开），全都不行就跳过本次 AI 处理（只记 L1，不报错）。拖动左侧小卡调顺序。",
   format: "上游端点的协议形态。选错会一直 404/400：Claude 系与 Claude 中转多是 Anthropic Messages，绝大多数兼容端点与本机网关是 Chat Completions，OpenAI 新接口是 Responses。拿不准就先按默认测一次，三级测试会给建议。",
@@ -130,7 +152,7 @@ const HELP = {
   modelTable: "每行一个模型：关掉开关即从所有任务的选择器里消失；「标签」决定哪些任务能用它；「优先级」越小越先被选中；「思考强度」是模型级默认值（任务与单次调用可覆盖）。",
   effort: "思考强度五档：off 不发思考参数；minimal/low/medium/high 控制推理预算（越高质量越好、越费 token）；custom 手动填预算。判定类任务（去重/分类）用低档，蒸馏/画像用中高档。",
   tags: "用途标签是任务与模型之间的唯一约定：任务声明「我要 heavy、summarize 的模型」，就在带这些标签且已启用的模型里按优先级挑。可以只用一个模型打全部标签，也可以配 10 个模型分多档。",
-  routing: "按标签展开的降级链：先按「绑定网关/供应商」过滤（绑定了就只用它；它名下没有带匹配标签的模型时，用它全部启用模型兜底），再在同标签内按优先级排序逐个尝试；某个模型 401/403 会立刻换下一个，429/5xx 会退避重试。链上没有任何模型时该任务会被跳过并提示（不会静默什么都不做）。",
+  routing: "按标签展开的降级链：先按「绑定网关/供应商」过滤（绑定了就只用它；它名下没有带匹配标签的模型时，用它全部启用模型兜底），再在同标签内按优先级排序逐个尝试；某个模型 401/403 会立刻换下一个，429/5xx 会退避重试。没有带匹配标签的启用模型时，用全部启用模型兜底并提示「换更强模型效果更好」；模型池彻底没有启用模型时该任务才会被跳过并提示（不会静默什么都不做）。",
   routingEdit: "每行都能给任务绑定指定的网关/供应商与模型：绑定后该任务只走它（它挂了就跳过本次，不再试别的来源）；「全部」则按左侧来源优先级在匹配标签的模型里挑。「指定模型」是再进一步——链上把它排最前，失败仍会落到链上后面的模型；它是显式指定，所以即使该模型没带这个任务的标签也照用（标签只决定「没指定时挑谁」）。",
   degrade: "兜底档只在自定义供应商里绑（本机网关不参与兜底）：前面所有来源都失败时，用这里绑定的模型最后试一次。适合绑一个最便宜、最稳的档位。",
   testCall: "用该模型 + 指定思考强度发一次真实小请求，验证端到端可用（含上游不标准参数的自动修正）。结果在弹窗里查看。",
@@ -171,8 +193,13 @@ function openDrawer(p?: Provider) {
   form.value = p
     ? { id: p.id, name: p.name, baseUrl: p.baseUrl, apiFormat: p.apiFormat, apiKey: "", note: p.note, enabled: p.enabled, kind: p.kind }
     : { id: "", name: "", baseUrl: "", apiFormat: "chat_completions", apiKey: "", note: "", enabled: true, kind: "custom" };
+  keyVisible.value = false;
+  fetchResult.value = null;
   drawer.value = true;
 }
+
+/** 弹窗里正在编辑的供应商实体（新建时为 null）：模型列表与拉取/试调都从它取 providerId */
+const editingProvider = computed(() => providers.value.find((x) => x.id === form.value.id) || null);
 
 async function saveProvider() {
   if (!form.value.name.trim() || !form.value.baseUrl.trim()) {
@@ -200,11 +227,33 @@ async function removeProvider(p: Provider) {
   }
   try {
     await api.memoryProviderDelete(p.id);
-    if (detailId.value === p.id) detailId.value = "";
+    if (form.value.id === p.id) drawer.value = false;
     ElMessage.success("已删除");
     await refresh();
   } catch (e) {
     ElMessage.error((e as Error).message || "删除失败");
+  }
+}
+
+/** 列表行内启用/停用（即时生效）。停用的供应商不参与任何模型调用，
+ *  视觉上整行弱化 + 名称旁带「已停用」chip，避免"以为在跑其实早停了"。
+ *  先乐观翻转再落盘：落在路上的时间太长时开关不能"点了没反应"；
+ *  同时串行化（一次只放行一个开关动作），否则往返期间连点两下会按同一份旧状态算，第二次被吞。 */
+const toggling = ref("");
+async function toggleProvider(p: Provider) {
+  if (toggling.value) return;
+  const next = !p.enabled;
+  toggling.value = p.id;
+  p.enabled = next;
+  try {
+    await api.memoryProviderToggle(p.id, next);
+    ElMessage.success(next ? `已启用「${p.name}」` : `已停用「${p.name}」：不再参与模型调用`);
+    await refresh();
+  } catch (e) {
+    p.enabled = !next; // 失败回滚，别把界面停在假状态
+    ElMessage.error((e as Error).message || "切换失败");
+  } finally {
+    toggling.value = "";
   }
 }
 
@@ -247,17 +296,6 @@ async function fetchModels(p: Provider) {
     ElMessage.error((e as Error).message || "拉取失败（该端点可能不提供 /models，改用手动添加）");
   } finally {
     busy.value = "";
-  }
-}
-
-/** 改某个供应商的 API 格式（详情弹窗里的下拉）：保存后立即重拉，掩码与状态跟着刷新 */
-async function setFormat(p: Provider, apiFormat: string) {
-  try {
-    await api.memoryProviderSave({ id: p.id, name: p.name, baseUrl: p.baseUrl, apiFormat, note: p.note, enabled: p.enabled, kind: p.kind });
-    ElMessage.success("格式已更新");
-    await refresh();
-  } catch (e) {
-    ElMessage.error((e as Error).message || "格式更新失败");
   }
 }
 
@@ -362,27 +400,86 @@ async function setPriority(m: Model) {
   }
 }
 
-async function removeModel(m: Model) {
+/** 打开模型级二级弹窗：快照当前模型，改完点保存一次性提交（含温度/maxTokens，
+ *  否则后端 saveModel 会把未传的这两项重置回默认值） */
+function openModelEditor(m: Model) {
+  modelForm.value = {
+    id: m.id,
+    providerId: m.providerId,
+    modelId: m.modelId,
+    displayName: m.displayName || m.modelId,
+    enabled: m.enabled,
+    effort: m.reasoning.effort || "minimal",
+    // custom 档没填过预算时 UI 显示 4096，快照也要取同一个值，否则"显示 4096 却存 null"
+    customBudget: m.reasoning.customBudget ?? (m.reasoning.effort === "custom" ? 4096 : null),
+    tagsText: m.tags.join(", "),
+    priority: m.priority,
+    temperature: m.temperature,
+    maxTokens: m.maxTokens,
+    caps: m.caps,
+  };
+  modelOpen.value = true;
+}
+
+async function saveModelEdit() {
+  const f = modelForm.value;
+  // 数字字段被清空时（v-model.number 给回空串）回落到默认值，避免把 0 当"用户想要的值"写进去
+  const numOr = (v: unknown, def: number) => (v === "" || v == null || !Number.isFinite(Number(v)) ? def : Number(v));
+  busy.value = "model-save";
   try {
-    await api.memoryModelDelete(m.id);
+    await api.memoryModelSave({
+      id: f.id,
+      providerId: f.providerId,
+      modelId: f.modelId,
+      displayName: f.displayName.trim() || f.modelId,
+      enabled: f.enabled,
+      tags: f.tagsText.split(/[,，\s]+/).filter(Boolean),
+      priority: numOr(f.priority, 10),
+      temperature: numOr(f.temperature, 0.2),
+      maxTokens: numOr(f.maxTokens, 2048),
+      // 弹窗里切到 custom 却没碰预算时，UI 显示的就是 4096，落盘也取同一个值
+      reasoning: { enabled: f.effort !== "off", effort: f.effort, customBudget: f.customBudget ?? (f.effort === "custom" ? 4096 : null) },
+      caps: f.caps,
+    });
+    ElMessage.success("模型已更新");
+    modelOpen.value = false;
     await refresh();
   } catch (e) {
-    ElMessage.error((e as Error).message || "删除失败");
+    ElMessage.error((e as Error).message || "保存失败");
+  } finally {
+    busy.value = "";
   }
 }
 
-async function batch(op: "enable" | "disable") {
-  if (!selectedModels.value.length) {
-    ElMessage.info("先勾选模型");
-    return;
-  }
+/** 批量启停（按供应商）：模型池一次拉几十个时，逐个点开关太费事 */
+async function batchModels(providerId: string, op: "enable" | "disable") {
+  const ids = modelsOf(providerId).map((m) => m.id);
+  if (!ids.length) return;
+  busy.value = `batch-${providerId}`;
   try {
-    const r = await api.memoryModelBatch(selectedModels.value, op);
-    ElMessage.success(`已${op === "enable" ? "启用" : "禁用"} ${r.changed} 个`);
-    selectedModels.value = [];
+    const r = await api.memoryModelBatch(ids, op);
+    ElMessage.success(`已${op === "enable" ? "全部启用" : "全部停用"} ${r.changed} 个模型`);
     await refresh();
   } catch (e) {
     ElMessage.error((e as Error).message || "批量操作失败");
+  } finally {
+    busy.value = "";
+  }
+}
+
+async function removeModel(m: Model) {
+  // 图标按钮比文字按钮更容易误点，删模型不可撤销，必须过一道确认
+  try {
+    await ElMessageBox.confirm(`删除模型「${m.modelId}」？只从模型池移除，不影响上游`, "删除模型", { type: "warning" });
+  } catch {
+    return;
+  }
+  try {
+    await api.memoryModelDelete(m.id);
+    ElMessage.success("已删除");
+    await refresh();
+  } catch (e) {
+    ElMessage.error((e as Error).message || "删除失败");
   }
 }
 
@@ -505,13 +602,6 @@ function onDegradeProvider(pid: string) {
   void saveDegrade(patch);
 }
 
-// ---- 供应商「查看更多」弹窗：列表点「查看更多」进详情，模型池按 providerId 过滤，操作与网关弹窗同款 ----
-const detailId = ref("");
-const detailProvider = computed(() => providers.value.find((p) => p.id === detailId.value) || null);
-function openDetail(p: Provider) {
-  detailId.value = p.id;
-}
-
 // ---- 网关详情弹窗：列表点行进详情，模型池按 providerId=gw-local 过滤 ----
 const gwDetail = ref<Gateway | null>(null);
 const gwUrlDraft = ref("");
@@ -593,9 +683,9 @@ const canRetest = computed(() => {
   return !!t && providers.value.some((x) => x.id === t.providerId);
 });
 
-/** 批量勾选（用 el-checkbox 保持多选语义，样式与全局统一） */
-function toggleSelect(id: string, checked: boolean) {
-  selectedModels.value = checked ? [...selectedModels.value, id] : selectedModels.value.filter((x) => x !== id);
+/** 模型行的能力 chips：上下文窗口与视觉能力来自 caps（拉取/添加时按模型名预判，可被能力探测刷新） */
+function ctxLabel(m: Model) {
+  return fmtCtx(m.caps?.contextWindow);
 }
 
 const modelsOf = (providerId: string) => models.value.filter((m) => m.providerId === providerId);
@@ -711,11 +801,11 @@ onMounted(refresh);
       </div>
     </div>
 
-    <!-- 自定义供应商：紧凑列表（名称 / 调用信息 / 模型 / 操作），其余收进「查看更多」 -->
+    <!-- 自定义供应商：紧凑列表（名称 / 调用信息 / 模型 / 连接测试·编辑·删除·启用开关） -->
     <div class="mem-card">
       <div class="mem-card-title">
         自定义供应商
-        <span class="mem-hint">{{ providers.length }} 个 · 「查看更多」里管理模型与思考强度</span>
+        <span class="mem-hint">{{ providers.length }} 个 · 「编辑」里管理模型与思考强度</span>
       </div>
       <div class="mem-table-wrap">
         <table class="mem-table mem-table-list prov-tbl">
@@ -728,13 +818,15 @@ onMounted(refresh);
             </tr>
           </thead>
           <tbody>
-            <tr v-for="p in providers" :key="p.id">
+            <tr v-for="p in providers" :key="p.id" :class="{ 'is-off': !p.enabled }">
               <td>
                 <span class="p-name">
                   <span class="mem-dot" :class="p.status === 'online' ? 'ok' : p.status === 'offline' ? 'bad' : 'warn'"></span>
                   <b>{{ p.name }}</b>
+                  <!-- 停用态必须显式标出：否则"路由里没它"会被当成配置丢了 -->
+                  <span v-if="!p.enabled" class="mem-chip warn">已停用</span>
                 </span>
-                <small class="p-sub">{{ FORMATS.find((f) => f.id === p.apiFormat)?.label || p.apiFormat }}</small>
+                <small class="p-sub">{{ formatLabelOf(p) }}</small>
               </td>
               <td>
                 <span class="p-call">
@@ -753,10 +845,20 @@ onMounted(refresh);
                 </el-tooltip>
               </td>
               <td class="actions">
-                <button class="btn-link" :disabled="busy === p.id" @click="testProvider(p)">{{ busy === p.id ? "测试中…" : "连接测试" }}</button>
-                <button class="btn-link" @click="openDetail(p)">查看更多</button>
+                <el-tooltip :content="HELP.test" placement="top">
+                  <button class="btn-link" :disabled="busy === p.id" @click="testProvider(p)">{{ busy === p.id ? "测试中…" : "连接测试" }}</button>
+                </el-tooltip>
                 <button class="btn-link" @click="openDrawer(p)">编辑</button>
                 <button class="btn-link danger" @click="removeProvider(p)">删除</button>
+                <el-tooltip :content="p.enabled ? '已启用：点击停用，停用后不参与任何模型调用' : '已停用：点击重新启用'" placement="top">
+                  <div
+                    class="switch"
+                    :class="{ on: p.enabled, pending: toggling === p.id }"
+                    role="switch"
+                    :aria-checked="p.enabled"
+                    @click="toggleProvider(p)"
+                  ></div>
+                </el-tooltip>
               </td>
             </tr>
             <tr v-if="!providers.length">
@@ -849,6 +951,11 @@ onMounted(refresh);
               <td>
                 <template v-if="r.chain.length">
                   <span v-for="(c, i) in r.chain" :key="i" class="mem-chip" :class="i === 0 ? 'accent' : ''">{{ i + 1 }}. {{ c.providerName }}/{{ c.modelId }}</span>
+                  <!-- 兜底链：任务能用，但提醒换更强模型效果更好（行内小问号给完整说明） -->
+                  <template v-if="r.tagFallback">
+                    <span class="mem-chip warn" style="margin-left: 6px">已兜底</span>
+                    <MemHelp :text="fallbackHint(r)" />
+                  </template>
                 </template>
                 <!-- 空链要给出路，不能只丢一句「无可用模型」：要么给模型补标签，要么在这一行直接指定模型 -->
                 <el-tooltip v-else :content="chainHint(r)" placement="top">
@@ -862,51 +969,131 @@ onMounted(refresh);
       <div class="mem-hint" style="margin-top: 8px">链怎么看：{{ HELP.routing }}<br />上游不标准时的自动修正：<MemHelp :text="HELP.quirks" /></div>
     </div>
 
-    <!-- 供应商编辑弹窗（MemDialog = 与「设置」弹窗同款玻璃与开合） -->
-    <MemDialog
-      v-model:open="drawer"
-      :title="form.id ? '编辑供应商' : '添加供应商'"
-      sub="自定义供应商走自备 Key；Key 明文存本机配置，界面只显掩码"
-      width="560px"
-    >
-      <div class="mem-col">
-        <div class="mem-section">
-          <div class="s-title">名称</div>
-          <input v-model="form.name" class="f-input" placeholder="如：我的中转站" />
+    <!-- 供应商编辑弹窗：连接信息（Base URL / API 格式 / API Key / 备注）+ 模型列表。
+         模型行的连接测试 / 编辑 / 删除 / 开关都在行内，编辑走二级小弹窗；
+         本弹窗的字段改动统一走底部「保存」（开关也一样，避免"改了一半已生效"的混合语义）。 -->
+    <MemDialog v-model:open="drawer" title="供应商" width="720px">
+      <template #header>
+        <div>
+          <div class="prov-edit-head">
+            <i class="ph ph-cube prov-edit-icon"></i>
+            <input v-model="form.name" class="prov-name-input" placeholder="供应商名称" />
+            <el-tooltip :content="form.enabled ? '已启用：点「保存」后生效为停用' : '已停用：点「保存」后不参与任何模型调用'" placement="top">
+              <div class="switch" :class="{ on: form.enabled }" role="switch" :aria-checked="!!form.enabled" @click="form.enabled = !form.enabled"></div>
+            </el-tooltip>
+          </div>
+          <div class="md-sub">{{ form.id ? "编辑供应商：改动点「保存」生效；模型行的操作即时生效" : "自定义供应商走自备 Key；Key 明文存本机配置，界面只显掩码" }}</div>
         </div>
+      </template>
+      <div class="mem-col">
         <div class="mem-section">
           <div class="s-title">Base URL</div>
           <input v-model="form.baseUrl" class="f-input" placeholder="https://api.example.com（程序自动补 /v1 路径）" />
         </div>
         <div class="mem-section">
-          <div class="s-title">API 格式（三选一）<MemHelp :text="HELP.format" /></div>
-          <div class="mem-seg">
-            <div
-              v-for="f in FORMATS"
-              :key="f.id"
-              class="mem-seg-item"
-              :class="{ active: form.apiFormat === f.id }"
-              @click="form.apiFormat = f.id"
-            >
-              <div class="sg-name">{{ f.label }}</div>
-              <div class="sg-path">{{ f.path }}</div>
-              <div class="sg-path">{{ f.desc }}</div>
-            </div>
-          </div>
-          <div class="mem-hint" style="margin-top: 6px">选错格式会导致 404/400；测试连接会自动校验并提示正确格式。</div>
+          <div class="s-title">API 格式<MemHelp :text="HELP.format" /></div>
+          <MemSelect
+            :model-value="form.apiFormat"
+            width="100%"
+            :options="formatOptions"
+            @change="(v: string | number) => (form.apiFormat = String(v))"
+          />
+          <div class="mem-hint">{{ formatDesc(form.apiFormat) }}。选错会导致 404/400，三级测试会自动校验并提示正确格式。</div>
         </div>
         <div class="mem-section">
-          <div class="s-title">API Key<MemHelp :text="HELP.key" /></div>
-          <input v-model="form.apiKey" type="password" class="f-input" :placeholder="form.id ? '留空则保留原 Key' : '粘贴 Key（明文存本机配置，界面只显掩码）'" />
+          <div class="s-title">
+            API Key<MemHelp :text="HELP.key" />
+            <!-- 掩码不回填输入框（留空＝不动原 Key），但状态要看得见，否则用户以为 Key 丢了 -->
+            <span v-if="editingProvider" class="mem-chip" :class="editingProvider.hasKey ? '' : 'warn'" style="margin-left: 6px; text-transform: none">
+              {{ editingProvider.hasKey ? `已保存 ${editingProvider.apiKeyMasked}` : "未设置" }}
+            </span>
+          </div>
+          <div class="prov-key-row">
+            <input
+              v-model="form.apiKey"
+              :type="keyVisible ? 'text' : 'password'"
+              class="f-input"
+              :placeholder="form.id ? '留空则保留原 Key（界面只显掩码）' : '粘贴 Key（明文存本机配置，界面只显掩码）'"
+            />
+            <el-tooltip :content="keyVisible ? '隐藏 Key' : '显示 Key'" placement="top">
+              <button class="icon-btn" type="button" @click="keyVisible = !keyVisible">
+                <i class="ph" :class="keyVisible ? 'ph-eye-slash' : 'ph-eye'"></i>
+              </button>
+            </el-tooltip>
+          </div>
         </div>
         <div class="mem-section">
           <div class="s-title">备注</div>
           <input v-model="form.note" class="f-input" placeholder="可选" />
         </div>
-        <label class="mem-row" style="gap: 8px">
-          <div class="switch" :class="{ on: form.enabled }" role="switch" :aria-checked="!!form.enabled" @click="form.enabled = !form.enabled"></div>
-          <span class="mem-hint">启用该供应商</span>
-        </label>
+
+        <!-- 模型列表：挂在供应商 id 上，所以新建时还没有（保存后再进来配） -->
+        <template v-if="editingProvider">
+          <div class="prov-models">
+            <div class="pm-head">
+              <span class="pm-title">模型列表</span>
+              <span class="mem-hint">{{ modelsOf(editingProvider.id).length }} 个 · {{ modelsOf(editingProvider.id).filter((m) => m.enabled).length }} 个启用</span>
+              <!-- 拉取一批模型后逐个点开关太费事，超过一个模型就给一键启停 -->
+              <span v-if="modelsOf(editingProvider.id).length > 1" class="pm-bulk">
+                <button class="btn-link" :disabled="busy === `batch-${editingProvider.id}`" @click="batchModels(editingProvider.id, 'enable')">全部启用</button>
+                <button class="btn-link" :disabled="busy === `batch-${editingProvider.id}`" @click="batchModels(editingProvider.id, 'disable')">全部停用</button>
+              </span>
+              <span class="pm-head-ops">
+                <button class="btn btn-ghost" @click="addManual(editingProvider.id)">＋ 添加模型</button>
+                <button class="btn btn-ghost" :disabled="busy === `fetch-${editingProvider.id}`" @click="fetchModels(editingProvider)">
+                  <i class="ph ph-lightning"></i>{{ busy === `fetch-${editingProvider.id}` ? "拉取中…" : "自动拉取模型" }}
+                </button>
+                <MemHelp :text="HELP.fetch" />
+              </span>
+            </div>
+
+            <!-- 拉取结果：逐个点击或一键全部加入模型池 -->
+            <div v-if="fetchResult && fetchResult.id === editingProvider.id" class="pm-fetched">
+              <div class="pm-fetched-head">
+                拉取到 {{ fetchResult.list.length }} 个模型，点名字加入模型池
+                <button class="btn-outline sm" @click="addFetched(fetchResult.list)">全部加入</button>
+                <button class="btn-link" @click="fetchResult = null">关闭</button>
+              </div>
+              <div class="pm-fetched-list">
+                <el-tooltip v-for="fm in fetchResult.list.slice(0, 200)" :key="fm.id" :content="`标签：${fm.tags.join('/')}`" placement="top">
+                  <button class="btn-link" @click="addFetched([fm])">{{ fm.id }}</button>
+                </el-tooltip>
+              </div>
+            </div>
+
+            <div v-if="modelsOf(editingProvider.id).length" class="pm-list">
+              <div v-for="m in modelsOf(editingProvider.id)" :key="m.id" class="pm-row" :class="{ 'is-off': !m.enabled }">
+                <span class="pm-name mem-mono">{{ m.modelId }}</span>
+                <!-- 自定义显示名在列表里也得看得见（与上游 id 不同时才显示，避免重复占位） -->
+                <span v-if="m.displayName && m.displayName !== m.modelId" class="pm-alias">{{ m.displayName }}</span>
+                <span class="pm-caps">
+                  <el-tooltip v-if="ctxLabel(m)" content="上下文窗口（按模型名预判，能力探测会刷新）" placement="top">
+                    <span class="mem-chip">{{ ctxLabel(m) }}</span>
+                  </el-tooltip>
+                  <span v-if="m.caps?.vision" class="mem-chip info">视觉</span>
+                </span>
+                <span class="pm-ops">
+                  <el-tooltip :content="HELP.testCall" placement="top">
+                    <button class="btn-link" :disabled="busy === `call-${editingProvider.id}`" @click="testCall(editingProvider, m)">
+                      <i class="ph ph-plugs-connected pm-ico"></i>
+                    </button>
+                  </el-tooltip>
+                  <el-tooltip content="编辑模型：显示名 / 思考强度 / 标签 / 优先级 / 采样参数" placement="top">
+                    <button class="btn-link" @click="openModelEditor(m)"><i class="ph ph-pencil-simple pm-ico"></i></button>
+                  </el-tooltip>
+                  <el-tooltip content="从模型池删除（不影响上游）" placement="top">
+                    <button class="btn-link danger" @click="removeModel(m)"><i class="ph ph-trash pm-ico"></i></button>
+                  </el-tooltip>
+                  <el-tooltip :content="m.enabled ? '已启用：点击停用（立即生效）' : '已停用：点击启用（立即生效）'" placement="top">
+                    <div class="switch" :class="{ on: m.enabled }" role="switch" :aria-checked="!!m.enabled" @click="toggleModel(m)"></div>
+                  </el-tooltip>
+                </span>
+              </div>
+            </div>
+            <div v-else class="mem-empty">这个供应商还没有模型 —— 「自动拉取模型」或「＋ 添加模型」</div>
+          </div>
+        </template>
+        <div v-else class="mem-hint">保存后重新打开「编辑」，即可拉取与添加模型。</div>
       </div>
       <template #foot>
         <button class="btn btn-cta" :disabled="busy === 'save'" @click="saveProvider">
@@ -916,159 +1103,61 @@ onMounted(refresh);
       </template>
     </MemDialog>
 
-    <!-- 供应商「查看更多」弹窗：连接信息 + 模型池（思考强度/标签/优先级逐项可改） -->
-    <MemDialog
-      :open="!!detailProvider"
-      title="供应商详情"
-      width="760px"
-      @update:open="detailId = ''"
-    >
-      <template v-if="detailProvider" #header>
-        <div>
-          <div class="md-title">
-            <span class="mem-dot" :class="detailProvider.status === 'online' ? 'ok' : detailProvider.status === 'offline' ? 'bad' : 'warn'" style="margin-right: 6px"></span>{{ detailProvider.name }}
-            <span class="mem-chip" style="margin-left: 8px">{{ formatLabelOf(detailProvider) }}</span>
-          </div>
-          <div class="md-sub">连接信息与模型池：逐项可改标签、优先级与思考强度</div>
+    <!-- 模型二级弹窗：编辑单个模型（保存时一并带上温度/maxTokens，避免被后端默认值覆盖） -->
+    <MemDialog v-model:open="modelOpen" :title="`编辑模型 · ${modelForm.modelId}`" width="560px">
+      <div class="mem-col">
+        <div class="mem-section">
+          <div class="s-title">显示名</div>
+          <input v-model="modelForm.displayName" class="f-input" :placeholder="modelForm.modelId" />
         </div>
-      </template>
-      <template v-if="detailProvider">
-        <div class="mem-modal-body">
-          <div class="mem-kv">
-            <span class="k">Base URL</span>
-            <span class="v"><span class="mem-mono">{{ detailProvider.baseUrl }}</span></span>
-            <span class="k">API Key</span>
-            <span class="v">
-              <span class="mem-mono">{{ detailProvider.apiKeyMasked || "（未设置 / 走网关号池）" }}</span>
-              <span class="mem-chip" style="margin-left: 6px">{{ detailProvider.hasKey ? "已保存" : "无" }}</span>
-              <MemHelp :text="HELP.key" />
-            </span>
-            <span class="k">调用信息</span>
-            <span class="v">
-              {{ statusText(detailProvider) }}
-              <template v-if="detailProvider.lastCheck"> · 上次测试 {{ timeAgo(detailProvider.lastCheck.at) }}<template v-if="detailProvider.lastCheck.latencyMs"> · {{ detailProvider.lastCheck.latencyMs }}ms</template></template>
-              <template v-if="detailProvider.note"> · {{ detailProvider.note }}</template>
-            </span>
-          </div>
-          <div class="mem-row" style="gap: 8px">
-            <button class="btn btn-ghost" :disabled="busy === detailProvider.id" @click="testProvider(detailProvider)">{{ busy === detailProvider.id ? "测试中…" : "三级连接测试" }}</button>
-            <MemHelp :text="HELP.test" />
-            <button class="btn btn-ghost" :disabled="busy === `fetch-${detailProvider.id}`" @click="fetchModels(detailProvider)">拉取模型</button>
-            <MemHelp :text="HELP.fetch" />
-            <button class="btn btn-ghost" @click="addManual(detailProvider.id)">＋ 手动添加模型</button>
-            <button class="btn btn-ghost" :disabled="busy === `call-${detailProvider.id}`" @click="testCall(detailProvider)">真实调用一次</button>
-            <MemHelp :text="HELP.testCall" />
-            <span style="margin-left: auto; display: inline-flex; align-items: center; gap: 4px">
-              <MemSelect
-                :model-value="detailProvider.apiFormat"
-                width="180px"
-                :options="formatOptions"
-                @change="(v: string | number) => setFormat(detailProvider!, String(v))"
-              />
-              <MemHelp :text="HELP.format" />
-            </span>
-          </div>
-
-              <div v-if="testResult && testResult.providerId === detailProvider.id" class="mem-card" style="background: var(--mem-soft)">
-                <div class="mem-kv">
-                  <span class="k">① 连通</span><span class="v">{{ testResult.l1.ok ? `✓ ${testResult.l1.latencyMs}ms` : `✗ ${testResult.l1.message}` }}</span>
-                  <span class="k">② 鉴权</span><span class="v">{{ testResult.l2.ok ? `✓ ${testResult.l2.message}` : `✗ ${testResult.l2.message}` }}</span>
-                  <span class="k">③ 格式能力</span><span class="v">{{ testResult.l3.ok ? `✓ ${testResult.l3.message}` : `✗ ${testResult.l3.message}` }}</span>
-                </div>
-                <div v-if="testResult.suggestion" class="mem-banner" style="margin-top: 8px">
-                  ⚠️ {{ testResult.suggestion.reason }}
-                  <button class="btn-outline" @click="applySuggestion(testResult.suggestion.apiFormat)">改为 {{ testResult.suggestion.apiFormat }} 并重测</button>
-                </div>
-              </div>
-
-              <div v-if="fetchResult && fetchResult.id === detailProvider.id" class="mem-card" style="background: var(--mem-soft)">
-                <div class="mem-card-title">
-                  拉取到 {{ fetchResult.list.length }} 个模型
-                  <button class="btn-outline" @click="addFetched(fetchResult.list)">全部加入模型池</button>
-                </div>
-                <div class="mem-row" style="gap: 6px; max-height: 200px; overflow: auto">
-                  <el-tooltip
-                    v-for="m in fetchResult.list.slice(0, 200)"
-                    :key="m.id"
-                    :content="`标签：${m.tags.join('/')}`"
-                    placement="top"
-                  >
-                    <button
-                      class="btn-link"
-                      @click="addFetched([m])"
-                    >
-                      {{ m.id }}
-                    </button>
-                  </el-tooltip>
-                </div>
-              </div>
-
-              <div class="mem-table-wrap" style="margin-top: 4px">
-                <table class="mem-table">
-                  <thead>
-                    <tr>
-                      <th style="width: 34px"></th>
-                      <th>模型 ID</th>
-                      <th>显示名</th>
-                      <th>开关</th>
-                      <th>思考强度 <MemHelp :text="HELP.effort" /></th>
-                      <th>标签 <MemHelp :text="HELP.tags" /></th>
-                      <th>优先级</th>
-                      <th>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="m in modelsOf(detailProvider.id)" :key="m.id">
-                      <td>
-                        <el-checkbox
-                          :model-value="selectedModels.includes(m.id)"
-                          @change="toggleSelect(m.id, $event as boolean)"
-                        />
-                      </td>
-                      <td class="mem-mono">{{ m.modelId }}</td>
-                      <td>{{ m.displayName }}</td>
-                      <td>
-                        <div class="switch" :class="{ on: m.enabled }" role="switch" :aria-checked="!!m.enabled" @click="toggleModel(m)"></div>
-                      </td>
-                      <td>
-                        <MemSelect
-                          :model-value="m.reasoning.effort"
-                          width="150px"
-                          :options="effortOptions"
-                          @change="(v: string | number) => setEffort(m, String(v))"
-                        />
-                        <input
-                          v-if="m.reasoning.effort === 'custom'"
-                          type="number"
-                          class="f-input"
-                          style="width: 96px; margin-top: 4px"
-                          :value="m.reasoning.customBudget || 4096"
-                          @change="setEffort(m, 'custom', Number(($event.target as HTMLInputElement).value))"
-                          placeholder="思考预算"
-                        />
-                      </td>
-                      <td>
-                        <button class="btn-link" @click="setTags(m)">{{ m.tags.join(", ") || "（未打标）" }}</button>
-                      </td>
-                      <td><button class="btn-link" @click="setPriority(m)">{{ m.priority }}</button></td>
-                      <td>
-                        <button class="btn-link" @click="testCall(detailProvider, m)">试调</button>
-                        <button class="btn-link danger" @click="removeModel(m)">删除</button>
-                      </td>
-                    </tr>
-                    <tr v-if="!modelsOf(detailProvider.id).length">
-                      <td colspan="8" class="mem-empty">这个供应商还没有模型 —— 「拉取模型」或「手动添加模型」</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div v-if="modelsOf(detailProvider.id).length" class="mem-row" style="margin-top: 4px">
-            <button class="btn btn-ghost" @click="batch('enable')">批量启用</button>
-            <button class="btn btn-ghost" @click="batch('disable')">批量禁用</button>
-            <span class="mem-count" style="align-self: center">已选 {{ selectedModels.length }} 项</span>
-            <MemHelp :text="HELP.modelTable" />
-          </div>
+        <div class="mem-section">
+          <div class="s-title">思考强度<MemHelp :text="HELP.effort" /></div>
+          <MemSelect
+            :model-value="modelForm.effort"
+            width="200px"
+            :options="effortOptions"
+            @change="(v: string | number) => (modelForm.effort = String(v))"
+          />
+          <input
+            v-if="modelForm.effort === 'custom'"
+            type="number"
+            class="f-input"
+            style="width: 140px"
+            :value="modelForm.customBudget || 4096"
+            placeholder="思考预算"
+            @change="modelForm.customBudget = Number(($event.target as HTMLInputElement).value)"
+          />
         </div>
+        <div class="mem-section">
+          <div class="s-title">用途标签<MemHelp :text="HELP.tags" /></div>
+          <input v-model="modelForm.tagsText" class="f-input" placeholder="逗号分隔，如 heavy, summarize" />
+          <div class="mem-hint">可用标签：{{ sources.tagDefs.join(" / ") }}</div>
+        </div>
+        <div class="mem-row" style="gap: 12px; align-items: flex-end; flex-wrap: wrap">
+          <div class="mem-section" style="width: 110px">
+            <div class="s-title">优先级</div>
+            <input v-model.number="modelForm.priority" type="number" class="f-input" placeholder="10" />
+          </div>
+          <div class="mem-section" style="width: 110px">
+            <div class="s-title">温度</div>
+            <input v-model.number="modelForm.temperature" type="number" step="0.1" class="f-input" placeholder="0.2" />
+          </div>
+          <div class="mem-section" style="width: 130px">
+            <div class="s-title">最大 Tokens</div>
+            <input v-model.number="modelForm.maxTokens" type="number" class="f-input" placeholder="2048" />
+          </div>
+          <span class="mem-hint" style="padding-bottom: 8px">优先级越小越先被选中；标签决定哪些任务能用它</span>
+        </div>
+        <label class="mem-row" style="gap: 8px">
+          <div class="switch" :class="{ on: modelForm.enabled }" role="switch" :aria-checked="!!modelForm.enabled" @click="modelForm.enabled = !modelForm.enabled"></div>
+          <span class="mem-hint">启用该模型（关闭后从所有任务的选择器里消失）</span>
+        </label>
+      </div>
+      <template #foot>
+        <button class="btn btn-cta" :disabled="busy === 'model-save'" @click="saveModelEdit">
+          {{ busy === "model-save" ? "保存中…" : "保存" }}
+        </button>
+        <button class="btn btn-ghost" @click="modelOpen = false">取消</button>
       </template>
     </MemDialog>
 
@@ -1098,7 +1187,8 @@ onMounted(refresh);
               <div class="mem-row" style="margin-top: 10px; gap: 8px">
                 <button class="btn btn-ghost" :disabled="busy === `fetch-${gwDetail.id}` || !gwDetail.available" @click="fetchModels(gwPseudo)">拉取模型</button>
                 <button class="btn btn-ghost" :disabled="!gwDetail.available" @click="addManual(gwDetail.id)">＋ 手动添加模型</button>
-                <button class="btn btn-ghost" :disabled="busy === `call-${gwDetail.id}` || !gwDetail.available" @click="testCall(gwPseudo)">真实调用一次</button>
+                <!-- 「真实调用一次」此前不带模型，后端必返「请指定模型」；要试调请用下方模型行的按钮 -->
+                <span class="mem-hint">试调用模型行上的按钮（需指定模型）</span>
               </div>
 
               <div v-if="fetchResult && fetchResult.id === gwDetail.id" class="mem-card" style="margin-top: 10px; background: var(--mem-soft)">

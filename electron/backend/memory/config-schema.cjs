@@ -22,7 +22,7 @@ const SCHEMA = {
   "storage.backupBeforeWrite": { type: "boolean", def: true,   label: "改写前备份 .bak", group: "存储", hot: true, tier: "basic" },
   "storage.backupKeep":        { type: "number",  def: 5, min: 1, max: 50, label: "备份保留份数", group: "存储", hot: true, tier: "advanced" },
   "storage.maxFileSizeKB":     { type: "number",  def: 512, min: 16, max: 8192, label: "单文件上限 (KB)", group: "存储", hot: true, tier: "internal" },
-  "storage.trashKeepDays":     { type: "number",  def: 90, min: 7, max: 365, label: "回收站保留天数", group: "存储", hot: true, tier: "basic" },
+  "storage.trashKeepDays":     { type: "number",  def: 30, min: 7, max: 365, label: "回收站保留天数", group: "存储", hot: true, tier: "basic", desc: "删除的记忆在回收站留存这么久；每天自动清理任务把到期文件从磁盘彻底删除" },
 
   // ===== 索引与检索 =====
   "index.dualIndex":        { type: "boolean", def: true,        label: "双索引（保真+标题加权）", group: "索引", hot: false, tier: "advanced" },
@@ -48,7 +48,7 @@ const SCHEMA = {
   "classify.pathReverse":       { type: "boolean", def: true, label: "会话目录名反解项目", group: "归类", hot: true, tier: "advanced" },
 
   // ===== Agent 接入 =====
-  "agents.enabled":        { type: "multiselect", def: ["zcode", "codex", "workbuddy", "claude", "dsh", "trae-solo"], options: ["zcode", "codex", "workbuddy", "claude", "dsh", "trae-solo", "cursor", "agents", "qoder", "qoder-cn"], label: "启用的 Agent", group: "Agent 接入", hot: true, tier: "basic" },
+  "agents.enabled":        { type: "multiselect", def: ["zcode", "codex", "workbuddy", "claude", "dsh", "trae-solo", "antigravity"], options: ["zcode", "codex", "workbuddy", "claude", "dsh", "trae-solo", "cursor", "agents", "qoder", "qoder-cn", "antigravity"], label: "启用的 Agent", group: "Agent 接入", hot: true, tier: "basic" },
   "agents.custom":         { type: "list", def: [], label: "自定义 Agent（本机）", group: "Agent 接入", hot: true, tier: "advanced", desc: "名称 + 配置文件路径 + 格式，用于生成接入片段" },
   "agents.autoVerify":     { type: "boolean", def: true, label: "接入后自动校验", group: "Agent 接入", hot: true, tier: "basic" },
   "agents.verifyInterval": { type: "number", def: 300, min: 30, max: 3600, label: "连接巡检间隔（秒）", group: "Agent 接入", hot: true, tier: "advanced" },
@@ -78,11 +78,14 @@ const SCHEMA = {
       summarize: { enabled: false, intervalMin: 30, batchSize: 20 },
       tag: { enabled: false, intervalMin: 30, batchSize: 20 },
       classify: { enabled: true, intervalMin: 60 },
-      supersede: { enabled: false, daily: "23:00", autoApplyConfidence: 0.9 },
-      distill: { enabled: false, daily: "23:30" },
-      consolidate: { enabled: false, weekly: 0, weeklyTime: "02:00" },
-      profile: { enabled: false, weekly: 0, weeklyTime: "03:00" },
+      supersede: { enabled: false, daily: "11:00", autoApplyConfidence: 0.9 },
+      distill: { enabled: false, daily: "11:10" },
+      consolidate: { enabled: false, weekly: 1, weeklyTime: "11:00" },
+      profile: { enabled: false, weekly: 1, weeklyTime: "11:10" },
       "index-scan": { enabled: true, intervalMin: 360 },
+      // 每天清理：回收站到期彻底删除（恒定执行）+ 按下面五个清理开关删除异常记忆。
+      // 五个开关全关时只做回收站清理，不做全库扫描（零额外成本）
+      cleanup: { enabled: true, daily: "11:20" },
     },
     label: "任务开关与节奏",
     desc: "默认开：零/低消耗任务；耗 token 的任务默认关，开启时页面会提示预计消耗",
@@ -90,6 +93,17 @@ const SCHEMA = {
     hot: true,
     tier: "advanced",
   },
+
+  // ===== 清理（异常记忆的自动删除；删除一律先进回收站，可恢复） =====
+  // 五个开关默认全关：自动删除是危险动作，必须用户显式开启。
+  // 档位放 advanced 而非 basic：basic 档要保持「核心常用 ≤20 项」的极简门面，
+  // 而本组开关的主入口在「记忆浏览 · 回收站」页（同屏可见、各带白话解释）
+  "cleanup.autoDeleteSuperseded": { type: "boolean", def: false, label: "自动清理失效记忆", group: "清理", hot: true, tier: "advanced", desc: "被新记忆取代、或有效期已过的记忆：移入回收站（保留期内可恢复）" },
+  "cleanup.autoDeleteMissing":    { type: "boolean", def: false, label: "自动清理不存在记忆", group: "清理", hot: true, tier: "advanced", desc: "索引里还有、磁盘上文件已丢失的记录：清除其索引行（没有内容可入回收站）" },
+  "cleanup.autoDeleteError":      { type: "boolean", def: false, label: "自动清理报错记忆", group: "清理", hot: true, tier: "advanced", desc: "文件存在但读取失败（权限/损坏）的记忆：整份移入回收站" },
+  "cleanup.autoDeleteConflict":   { type: "boolean", def: false, label: "自动清理冲突记忆", group: "清理", hot: true, tier: "advanced", desc: "同步冲突未裁决的记忆：整份移入回收站并清掉冲突记录（每日记录类多节文件保守跳过）" },
+  "cleanup.autoDeleteInvalid":    { type: "boolean", def: false, label: "自动清理无效记忆", group: "清理", hot: true, tier: "advanced", desc: "内容为空壳、进不了索引的文件（迁移/删除后的残骸）：整份移入回收站" },
+
   // 待确认收件箱的自动确认三开关：开启后对应建议入队即按推荐执行，不再进收件箱等人
   "review.autoConfirmSupersede": { type: "boolean", def: false, label: "自动确认事实失效", group: "自动化", hot: true, tier: "advanced", desc: "失效判定建议产生后立即按推荐标记旧事实失效（原文与演化链保留），不再等人工点头" },
   "review.autoConfirmClassify":  { type: "boolean", def: false, label: "自动确认项目归类", group: "自动化", hot: true, tier: "advanced", desc: "归类建议产生后立即按推荐归入对应项目；无推荐项目时直接忽略" },
@@ -138,17 +152,25 @@ const SCHEMA = {
   "import.sensitiveSkip": { type: "boolean", def: true, label: "疑似敏感内容默认跳过", group: "导入", hot: true, tier: "advanced" },
   "import.sources": {
     type: "list",
+    // 本表是配置读取/设置页展示的默认值；import/engine.cjs 的 DEFAULT_SOURCES 是配置整份为空时的兜底。
+    // 两份清单必须逐条一致（id/kind/path/enabled/priority），改一处就要同步另一处。
     def: [
       { id: "zcode-db", name: "ZCode 会话库", kind: "sqlite", path: "~/.zcode/cli/db/db.sqlite", enabled: true, priority: 1 },
       { id: "zcode-tx", name: "ZCode 实时日志（流式增量，与会话库重复）", kind: "jsonl", path: "~/.zcode/cli/agents", enabled: false, priority: 2 },
       { id: "claude", name: "Claude Code 会话", kind: "jsonl", path: "~/.claude/projects", enabled: true, priority: 3 },
       { id: "codex", name: "Codex 会话", kind: "jsonl", path: "~/.codex/sessions", enabled: true, priority: 4 },
       { id: "workbuddy", name: "WorkBuddy 会话", kind: "jsonl", path: "~/.workbuddy-ai", enabled: true, priority: 5 },
+      { id: "dsh", name: "DeepSeek Harness 会话", kind: "jsonl", path: "~/.dsh/sessions", enabled: false, priority: 6 },
       // Qoder 会话转录：与 Claude Code 同构（type/user/assistant/message/uuid），
       // 目录名同样把 cwd 编码进去（如 d--workspace-FOC）。默认关——首次使用建议先跑一次导入预览。
       { id: "qoder-cn", name: "Qoder CN 会话", kind: "jsonl", path: "~/.qoder-cn/projects", enabled: false, priority: 7 },
       { id: "qoder", name: "Qoder 国际版会话", kind: "jsonl", path: "~/.qoder/projects", enabled: false, priority: 8 },
-      { id: "notes-md", name: "Markdown 笔记目录", kind: "md", path: "", enabled: false, priority: 6 },
+      // Trae 系（Trae / Trae CN / TRAE SOLO / SOLO CN）：库是 SQLCipher 整库加密，
+      // 路径填父目录即可，解析器自动识别 <应用>/ModularData/ai-agent/database.db
+      { id: "trae", name: "Trae 系会话（Trae / CN / SOLO）", kind: "trae", path: "%APPDATA%", enabled: true, priority: 9 },
+      // Antigravity 与 Antigravity IDE 的会话日志都在 ~/.gemini 下，一个来源统管
+      { id: "antigravity", name: "Antigravity 会话（Antigravity / IDE）", kind: "antigravity", path: "~/.gemini", enabled: true, priority: 10 },
+      { id: "notes-md", name: "Markdown 笔记目录", kind: "md", path: "", enabled: false, priority: 11 },
     ],
     label: "导入来源清单",
     desc: "路径/格式/启用/优先级/表映射；「Markdown 笔记目录」默认关，选好路径再开",
@@ -184,6 +206,43 @@ const SCHEMA = {
 function cloneDefault(v) {
   if (v === null || typeof v !== "object") return v;
   return JSON.parse(JSON.stringify(v));
+}
+
+// 自动化任务的默认执行时间（调度器与 schema 各写了一份，此处做一致性归口）。
+// 2026-10-08 起默认排在 11:00~12:00 窗口依次跑：失效判定 11:00 → L2 蒸馏 11:10 → 异常清理 11:20；
+// 去重合并/人格画像：周一 11:00 / 11:10。与 scheduler.cjs 的 TASK_DEFS 保持一致。
+const TASK_DEFAULT_TIMES = { supersede: "11:00", distill: "11:10", consolidate: "11:00", profile: "11:10", cleanup: "11:20" };
+const TASK_DEFAULT_WEEKLY = { consolidate: 1, profile: 1 }; // 周一
+
+/**
+ * 存量配置的一次性迁移（默认时间 23:00/23:30/02:00/03:00/04:00 → 11 点档）。
+ * 任务卡保存时会把整个任务对象（含时间）落盘，只改 seed 默认值救不回已写死旧时间的存量配置；
+ * 又不能一刀切全搬 —— 用户手改过的时间（如 cleanup 13:00）必须保留，所以只迁移
+ * 「当前节奏恰好整体等于旧默认值」的项：daily 任务认 daily 字段，weekly 任务认 weekly+weeklyTime 整组。
+ * 幂等：值已是新默认、或用户自定义过（模式切走/时间改过）都不会再命中。原地改写，返回是否有变化。
+ */
+function migrateTaskTimes(tasks) {
+  if (!tasks || typeof tasks !== "object" || Array.isArray(tasks)) return false;
+  const OLD = {
+    supersede: { daily: "23:00" },
+    distill: { daily: "23:30" },
+    cleanup: { daily: "04:00" },
+    consolidate: { weekly: 0, weeklyTime: "02:00" }, // 原默认：周日 02:00
+    profile: { weekly: 0, weeklyTime: "03:00" }, // 原默认：周日 03:00
+  };
+  let changed = false;
+  for (const [id, t] of Object.entries(tasks)) {
+    const o = OLD[id];
+    if (!o || !t || typeof t !== "object") continue;
+    if (o.daily != null) {
+      if (t.daily === o.daily) { t.daily = TASK_DEFAULT_TIMES[id]; changed = true; }
+    } else if (t.weekly === o.weekly && t.weeklyTime === o.weeklyTime) {
+      t.weekly = TASK_DEFAULT_WEEKLY[id];
+      t.weeklyTime = TASK_DEFAULT_TIMES[id];
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function flattenDefaults() {
@@ -249,4 +308,4 @@ function validateValue(meta, value) {
   }
 }
 
-module.exports = { SCHEMA, defaultConfig, flattenDefaults, validateValue, EFFORTS, API_FORMATS };
+module.exports = { SCHEMA, defaultConfig, flattenDefaults, validateValue, EFFORTS, API_FORMATS, migrateTaskTimes, TASK_DEFAULT_TIMES };

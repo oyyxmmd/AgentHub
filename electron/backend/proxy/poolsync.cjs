@@ -17,6 +17,8 @@ const zlib = require("node:zlib");
 const config = require("../config.cjs");
 const store = require("./store.cjs");
 const webdav = require("../webdav.cjs");
+const rules = require("./rules.cjs");
+const oplog = require("./oplog.cjs");
 const zip = require("../zip.cjs");
 const events = require("./events.cjs");
 
@@ -68,9 +70,12 @@ function loadPersisted() {
       keyChangeAt: Number(s.keyChangeAt) || 0, // 统一密码改动时间：早于它的历史包全部重打
       uploadedAnchorHash: typeof s.uploadedAnchorHash === "string" ? s.uploadedAnchorHash : "", // 锚定指纹上传记账（内容未变不重传）
       uploadedAnchorFor: typeof s.uploadedAnchorFor === "string" ? s.uploadedAnchorFor : "",
+      // 共享配置（模型映射 + API Key）记账：appliedAt 做 LWW 判定，hash 做「内容未变不重传」
+      sharedAppliedAt: Number(s.sharedAppliedAt) || 0,
+      sharedHash: typeof s.sharedHash === "string" ? s.sharedHash : "",
     };
   } catch {
-    return { lastSyncAt: 0, uploadedHash: "", uploadedFor: "", merged: {}, keyChangeAt: 0, uploadedAnchorHash: "", uploadedAnchorFor: "" };
+    return { lastSyncAt: 0, uploadedHash: "", uploadedFor: "", merged: {}, keyChangeAt: 0, uploadedAnchorHash: "", uploadedAnchorFor: "", sharedAppliedAt: 0, sharedHash: "" };
   }
 }
 
@@ -218,38 +223,20 @@ function exportPool(channel) {
   return { format: FILE_FORMAT, deviceId: deviceId(), deviceName: deviceName(), exportedAt: Date.now(), channel: channel || "", accounts };
 }
 
-/** 快照 → 加密 zip：JSON → gzip 由 zip deflate 承担，加密用 AES-256-GCM（scrypt 派生密钥） */
+/** 快照 → 加密 zip：JSON → gzip 由 zip deflate 承担，加密用 AES-256-GCM（scrypt 派生密钥）。
+ *  封套本体与共享配置共用 encodeEnvelope（同一 magic/派生参数）：两处各写一份的话，
+ *  改一处忘一处就是「同一个密码，一边打得开一边打不开」 */
 function encodeArchive(snapshot, password) {
-  const plain = Buffer.from(JSON.stringify(snapshot), "utf8");
-  const key = crypto.scryptSync(String(password || ""), KDF_SALT, 32);
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-  const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  // 自描述封套：magic(8) + iv(12) + tag(16) + 密文，解密端先验 magic 再验 GCM
-  const payload = Buffer.concat([Buffer.from("AHPPOOL1", "latin1"), iv, tag, enc]);
-  return zip.createZip([{ name: ZIP_ENTRY, data: payload }]);
+  return encodeEnvelope(snapshot, password);
 }
 
-/** 加密 zip → 快照：结构错误 / 密码不对 / 内容损坏分别给出可读错误 */
+/** 加密 zip → 快照：封套由 decodeEnvelope 解，这里只做号池快照的形状校验与错误归类
+ *  （结构错误 / 密码不对 / 内容损坏分别给出可读错误） */
 function decodeArchive(buf, password) {
-  const entries = zip.readZip(buf);
-  const entry = entries.find((e) => e.name === ZIP_ENTRY);
-  if (!entry) throw new Error("不是号池同步压缩包（缺少 accounts.json）");
-  const d = entry.data;
-  if (d.length < 36 || d.subarray(0, 8).toString("latin1") !== "AHPPOOL1") throw new Error("压缩包封套损坏或版本不识别");
-  const key = crypto.scryptSync(String(password || ""), KDF_SALT, 32);
-  try {
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, d.subarray(8, 20));
-    decipher.setAuthTag(d.subarray(20, 36));
-    const plain = Buffer.concat([decipher.update(d.subarray(36)), decipher.final()]);
-    const snap = JSON.parse(plain.toString("utf8"));
-    if (!snap || snap.format !== FILE_FORMAT || !Array.isArray(snap.accounts)) throw new Error("快照格式不识别");
-    return snap;
-  } catch (e) {
-    if (e && /格式/.test(String(e.message))) throw e;
-    throw new Error("解密失败：WebDAV 密码与打包时不一致，或压缩包已损坏");
-  }
+  // 封套层错误原样抛出（缺条目/封套损坏/解密失败三条文案都已经可读），这里只管号池快照的形状
+  const snap = decodeEnvelope(buf, password);
+  if (!snap || snap.format !== FILE_FORMAT || !Array.isArray(snap.accounts)) throw new Error("快照格式不识别");
+  return snap;
 }
 
 function sha1(buf) {
@@ -443,6 +430,12 @@ async function run(opts) {
   if (!configured()) throw new Error("WebDAV 未配置完整：请先在「设置 · 数据存储」配置统一服务器");
   // 号池压缩包用 WebDAV 密码加密：未设密码时拒绝同步，避免凭据裸奔
   if (!w.password) throw new Error("请先在「设置 · 数据存储」填写 WebDAV 密码（号池压缩包用它加密）");
+  // 弱口令告警（不阻断）：WebDAV 密码既是服务器凭据也是压缩包加密口令（scrypt 派生 AES-256），
+  // 太短的口令打的包在远端可被离线爆破。刻意只 warn 不拒绝——部分用户的 WebDAV 服务器本身
+  // 只支持短密码，阻断会破坏既有同步；密码强度由用户在「设置 · 数据存储」自行权衡
+  if (String(w.password).length < 8) {
+    oplog.log("warn", "号池同步", "WebDAV 密码不足 8 位：号池压缩包用它加密，短口令在远端可被离线爆破，建议改用更长密码");
+  }
 
   state = { ...state, running: true, stage: "connect", detail: "", lastError: "", percent: 0, channel };
   cancelSignal = new AbortController();
@@ -539,11 +532,13 @@ async function run(opts) {
     await webdav.put(remoteUrl(w, POOL_DIR, "devices", `${myId}.json`), w,
       JSON.stringify({ name: myName, appVersion: appVersion(), accountCount: snapshot.accounts.length, channel: channel || "", lastSyncAt: new Date().toISOString() }));
 
+    await runSharedSync(w, persisted, result);
     persisted.lastSyncAt = Date.now();
     savePersisted(persisted);
     state.lastSyncAt = persisted.lastSyncAt;
     state.lastSummary = `${channel ? store.channelDisplay(channel) + " · " : ""}拉取 ${result.pulled} 台设备 · 新增 ${result.added} · 刷新 ${result.updated} · 移除 ${result.removed} · ${result.uploaded ? "已上传" : "本机无变化"}`;
     state.running = false;
+    if (result.sharedSummary) state.lastSummary += " | " + result.sharedSummary;
     setStage("done", state.lastSummary);
     events.emit({ type: "poolsync", stage: "done", detail: state.lastSummary, running: false, percent: 100 });
     events.emit({ type: "status" }); // 号池页刷新
@@ -637,4 +632,223 @@ async function restoreAnchorMidFromRemote() {
   return { action: "restored", deviceMid: mid };
 }
 
-module.exports = { run, cancel, progress, configured, noteRemoved, onSharedPasswordMaybeChanged, accountKeyOf, backupAnchorMid, restoreAnchorMidFromRemote };
+module.exports = { run, cancel, progress, configured, noteRemoved, onSharedPasswordMaybeChanged, accountKeyOf, backupAnchorMid, restoreAnchorMidFromRemote,
+  // 共享配置同步（自测与诊断用；主流程在 run() 内部调用 runSharedSync）
+  exportShared, applyShared, encodeEnvelope, decodeEnvelope, runSharedSync,
+  // 号池归档封套（自测用：与共享配置共用同一 encode/decodeEnvelope，去重后靠这组断言守住行为）
+  encodeArchive, decodeArchive };
+const SHARED_FILE = "shared-config.json";
+const SHARED_FORMAT = "agenthub-proxy-shared@1";
+// 跨设备应当一致的配置项。设备专属的 port / bind / 并发 / 限速 / 签到开关刻意不含：
+// 同步过去会把另一台设备上按自身环境改过的端口与常开签到开关盖掉。
+const SHARED_CONFIG_KEYS = ["modelAliases", "modelReverseAliases", "modelCustom",
+  "modelOverrides", "modelFallback", "disabledModels"];
+/** 各键在本机配置里的形状：对端载荷按这个口径收，形状不符一律不写。
+ *  config 里只有 disabledModels 是数组，其余是「模型 → 值」映射；形状写错下游必炸——
+ *  server.cjs 的 (settings.disabledModels || []).includes / (settings.modelAliases || {})[model]
+ *  分别在禁用判定与别名解析的必经路径上，错了是所有对话请求 500/400。 */
+const SHARED_ARRAY_KEYS = new Set(["disabledModels"]);
+const shapeOk = (v, wantArray) => (wantArray ? Array.isArray(v) : !!v && typeof v === "object" && !Array.isArray(v));
+
+/** 本机共享配置快照（Key 先本机解密再进加密包，与 token 同规矩：绝不明文上传） */
+function exportShared() {
+  const cfg = config.loadConfig();
+  const p = cfg.proxy || {};
+  const conf = {};
+  for (const k of SHARED_CONFIG_KEYS) {
+    const v = p[k];
+    conf[k] = Array.isArray(v) ? v.slice() : (v && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : {});
+  }
+  const keys = store.listKeys()
+    .filter((k) => k.secret) // 解不开明文的（旧信封）跳过，避免把不可用 Key 传播出去
+    .map((k) => ({
+      id: k.id, name: k.name, secret: k.secret, route: k.route, routeOrder: k.routeOrder || "",
+      dailyQuota: k.dailyQuota, rateLimit: k.rateLimit,
+      enabled: k.enabled, createdAt: k.createdAt,
+    }));
+  // 模型清单及参数（rules/catalog.json）：整份随共享包走，新设备免重新拉官方目录。
+  // get 返回的是缓存对象本身，必须深拷贝，避免后续合并改动污染缓存。
+  let catalog = {};
+  try { catalog = JSON.parse(JSON.stringify(rules.get("catalog.json") || {})); } catch { catalog = {}; }
+  return {
+    format: SHARED_FORMAT,
+    exportedAt: Date.now(),
+    deviceId: deviceId(),
+    deviceName: deviceName(),
+    config: conf,
+    keys,
+    catalog,
+  };
+}
+
+/**
+ * 对象逐键合并：取并集，冲突以远端为准（远端 exportedAt 更晚）。
+ * 数组值（disabledModels）按整体处理并取【并集去重】：新增会传播、删除不传播（禁用名单宁多勿漏）。
+ * ⚠ 绝不能让数组走进 Object.assign({}, local)——那会把数组变成 {0:"…"} 形状的对象，
+ *    下游 (settings.disabledModels || []).includes 直接 TypeError，网关所有对话请求 500（真踩过）。
+ */
+function mergeSharedMap(local, remote) {
+  if (Array.isArray(local) || Array.isArray(remote)) {
+    const a = Array.isArray(local) ? local : [];
+    const b = Array.isArray(remote) ? remote : [];
+    const out = [];
+    const seen = new Set();
+    for (const v of a.concat(b)) {
+      const k = JSON.stringify(v);
+      if (!seen.has(k)) { seen.add(k); out.push(v); }
+    }
+    return { out, changed: JSON.stringify(out) === JSON.stringify(a) ? 0 : 1 };
+  }
+  const out = Object.assign({}, local || {});
+  let changed = 0;
+  for (const [k, v] of Object.entries(remote || {})) {
+    if (JSON.stringify(out[k]) !== JSON.stringify(v)) { out[k] = v; changed++; }
+  }
+  return { out, changed };
+}
+
+/**
+ * 模型清单合并（按渠道为单元）：本机没有的渠道直接入；
+ * 两边都有 → syncedAt 新者胜。渠道内不拆模型行合并——目录是「一次官方拉取」的产物，
+ * 按渠道整体取新，避免半新半旧的参数拼出矛盾条目（倍率是新的、上下文长度是旧的）。
+ */
+function mergeSharedCatalog(localCat, remoteCat) {
+  const out = Object.assign({}, localCat || {});
+  let added = 0, updated = 0;
+  for (const [ch, sec] of Object.entries(remoteCat || {})) {
+    if (!sec || typeof sec !== "object" || !Array.isArray(sec.models)) continue;
+    const cur = out[ch];
+    if (!cur || typeof cur !== "object") { out[ch] = JSON.parse(JSON.stringify(sec)); added++; continue; }
+    if ((Number(sec.syncedAt) || 0) > (Number(cur.syncedAt) || 0)) {
+      out[ch] = JSON.parse(JSON.stringify(sec));
+      updated++;
+    }
+  }
+  return { out, added, updated };
+}
+
+/**
+ * 把对端共享配置合并进本机。
+ * 语义：映射类逐键并集、冲突取远端（远端 exportedAt 更晚）；
+ *       API Key 按 id/hash 去重，只补本机没有的（本机已有的以本机为准，不覆盖启停状态）；
+ *       模型清单按渠道 syncedAt 新者胜（见 mergeSharedCatalog）。
+ */
+function applyShared(snap) {
+  const none = { applied: false, configChanged: 0, keyAdded: 0, catalogAdded: 0, catalogUpdated: 0 };
+  if (!snap || snap.format !== SHARED_FORMAT) return none;
+  const out = { applied: true, configChanged: 0, keyAdded: 0, catalogAdded: 0, catalogUpdated: 0 };
+  const cfg = config.loadConfig();
+  cfg.proxy = cfg.proxy || {};
+  for (const k of SHARED_CONFIG_KEYS) {
+    const remote = (snap.config || {})[k];
+    const wantArray = SHARED_ARRAY_KEYS.has(k);
+    // 形状校验双向：对端把 disabledModels 塞成对象（或把映射塞成数组）一律跳过；
+    // 本机侧形状不符（历史脏数据）时按空值起底，不能让坏形状顺着合并继续传下去
+    if (!shapeOk(remote, wantArray)) continue;
+    const localVal = cfg.proxy[k];
+    const r = mergeSharedMap(shapeOk(localVal, wantArray) ? localVal : (wantArray ? [] : {}), remote);
+    if (r.changed) { cfg.proxy[k] = r.out; out.configChanged += r.changed; }
+  }
+  if (out.configChanged) config.saveConfig(cfg);
+  for (const kk of Array.isArray(snap.keys) ? snap.keys : []) {
+    if (store.importKey(kk).ok) out.keyAdded++;
+  }
+  // 模型清单：与「拉取官方目录」同一写回路径（落盘 + reload 热生效）
+  if (snap.catalog && typeof snap.catalog === "object" && Object.keys(snap.catalog).length) {
+    let cur = {};
+    try { cur = JSON.parse(JSON.stringify(rules.get("catalog.json") || {})); } catch { cur = {}; }
+    const r = mergeSharedCatalog(cur, snap.catalog);
+    if (r.added || r.updated) {
+      fs.writeFileSync(path.join(rules.rulesDir(), "catalog.json"), JSON.stringify(r.out, null, 2), "utf8");
+      rules.reload("catalog.json");
+      out.catalogAdded = r.added;
+      out.catalogUpdated = r.updated;
+    }
+  }
+  return out;
+}
+
+/** 通用加密封套（与号池归档同一套：AES-256-GCM + scrypt 固定盐 + AHPPOOL1 magic） */
+function encodeEnvelope(snapshot, password) {
+  const plain = Buffer.from(JSON.stringify(snapshot), "utf8");
+  const key = crypto.scryptSync(String(password || ""), KDF_SALT, 32);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const payload = Buffer.concat([Buffer.from("AHPPOOL1", "latin1"), iv, tag, enc]);
+  return zip.createZip([{ name: ZIP_ENTRY, data: payload }]);
+}
+
+/** 解开封套（不做 format 校验，交给调用方） */
+function decodeEnvelope(buf, password) {
+  const entries = zip.readZip(buf);
+  const entry = entries.find((e) => e.name === ZIP_ENTRY);
+  if (!entry) throw new Error("不是号池同步压缩包（缺少 accounts.json）");
+  const d = entry.data;
+  if (d.length < 36 || d.subarray(0, 8).toString("latin1") !== "AHPPOOL1") throw new Error("压缩包封套损坏或版本不识别");
+  const key = crypto.scryptSync(String(password || ""), KDF_SALT, 32);
+  try {
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, d.subarray(8, 20));
+    decipher.setAuthTag(d.subarray(20, 36));
+    const plain = Buffer.concat([decipher.update(d.subarray(36)), decipher.final()]);
+    return JSON.parse(plain.toString("utf8"));
+  } catch (e) {
+    throw new Error("解密失败：WebDAV 密码与打包时不一致，或压缩包已损坏");
+  }
+}
+
+/**
+ * 共享配置同步：先拉取合并、再导出上传（顺序不能反：
+ * 反过来的话本机旧配置会盖掉对端刚做的改动）。
+ * 独立成函数是为了不动 run() 主体，改动面小、也好单独验证。
+ */
+async function runSharedSync(w, persisted, result) {
+  // 只有「远端读得成」才允许本轮上传：GET 报错（网络/鉴权）时远端是什么状态我们并不知道，
+  // 这时推本机版本会把对端更新的配置盖掉（LWW 语义下对端下次同步又反过来吃掉本机改动）。
+  // 读到内容但解不开（损坏/密码变过）不算「不知道」——按首次上传自愈，与号池归档同一处理。
+  let remoteReadOk = false;
+  try {
+    const got = await webdav.get(remoteUrl(w, POOL_DIR, SHARED_FILE), w);
+    remoteReadOk = true; // 含 404：确认对端还没有这个文件
+    if (got) {
+      let snap = null;
+      try {
+        snap = decodeEnvelope(got, w.password);
+      } catch (e) {
+        result.sharedDecodeError = String((e && e.message) || e);
+      }
+      if (snap && snap.format === SHARED_FORMAT && Number(snap.exportedAt) > Number(persisted.sharedAppliedAt || 0)) {
+        const ap = applyShared(snap);
+        persisted.sharedAppliedAt = Number(snap.exportedAt);
+        result.sharedFrom = snap.deviceName || snap.deviceId || "";
+        result.sharedConfigChanged = ap.configChanged;
+        result.sharedKeyAdded = ap.keyAdded;
+        result.sharedCatalogAdded = ap.catalogAdded;
+        result.sharedCatalogUpdated = ap.catalogUpdated;
+      }
+    }
+  } catch (e) { result.sharedPullError = String((e && e.message) || e); /* 网络/鉴权异常：不阻断号池同步，但留痕可诊断 */ }
+  try {
+    const shared = exportShared();
+    // hash 只覆盖内容（不含 exportedAt），否则每次同步都因时间戳不同而重传
+    const stable = sha1(Buffer.from(JSON.stringify({ config: shared.config, keys: shared.keys, catalog: shared.catalog })));
+    if (!remoteReadOk) {
+      result.sharedUploadSkipped = true;
+    } else if (persisted.sharedHash !== stable) {
+      await webdav.put(remoteUrl(w, POOL_DIR, SHARED_FILE), w, encodeEnvelope(shared, w.password));
+      persisted.sharedHash = stable;
+      result.sharedUploaded = true;
+    }
+  } catch (e) { result.sharedUploadError = String((e && e.message) || e); /* 上传失败不影响号池结果，但留痕可诊断 */ }
+  const parts = [
+    result.sharedFrom ? "配置取自 " + result.sharedFrom : "",
+    result.sharedConfigChanged ? "改 " + result.sharedConfigChanged + " 项" : "",
+    result.sharedKeyAdded ? "补 Key " + result.sharedKeyAdded : "",
+    result.sharedCatalogAdded ? "增清单渠道 " + result.sharedCatalogAdded : "",
+    result.sharedCatalogUpdated ? "更新清单渠道 " + result.sharedCatalogUpdated : "",
+    result.sharedUploadSkipped ? "共享配置本轮未上传（远端读取失败，等下轮）" : "",
+    result.sharedUploaded ? "共享配置已上传" : "",
+  ].filter(Boolean);
+  result.sharedSummary = parts.join(" · ");
+}

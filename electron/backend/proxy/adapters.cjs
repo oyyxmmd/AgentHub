@@ -18,6 +18,14 @@ function proxyConfig() {
   }
 }
 
+/** 渠道启闭（「上游启闭」弹窗）：配置里显式 false = 关闭，其余（缺省/非布尔）= 启用。
+ *  cfg 已在调用方就绪时直接传入，避免循环内重复读盘 */
+function channelOn(channel, cfg) {
+  const c = cfg || proxyConfig();
+  const v = (c.channelEnabled || {})[channel];
+  return v !== false;
+}
+
 const FIRST_BYTE_MS = 30000; // 首 token 30s 超时判失败。实测成功请求 TTFT P99≈8.7s、最大 20.2s，
 // 10s 会误杀慢模型/thinking 首包（参考项目无首字节总超时，读空闲容忍 300s，这里取全覆盖+余量的折中）
 const FIRST_BYTE_MAX_MS = 180000; // 首字节预算封顶（超长 prompt 的 prefill 可能上百秒）
@@ -554,6 +562,8 @@ const trae = {
   async chatOnce(url, headers, payload, model, emit) {
     const { resp, cancelTimer } = await fetchStream(url, { method: "POST", headers, body: payload, firstByteMs: firstByteBudgetMs(payload) });
     let settled = false;
+    let produced = false; // 是否产出过「客户端可消费」的内容（正文/思考/工具调用），见下方空流判定
+    let sawError = false; // 上游是否已发出 error 事件（有具体错误码→交由分类器处理，不当空流）
     const result = { status: 200, planLimit: false };
     const seenToolIndex = new Set(); // 流式 tool_calls：每个 index 只在首片带 name（OpenAI 官方形态，issue #82）
     try {
@@ -584,7 +594,10 @@ const trae = {
               return { index: idx, id: tc.id, type: "function", function: fn };
             });
           }
-          if (Object.keys(delta).length) emit({ type: "delta", delta });
+          if (Object.keys(delta).length) {
+            if (util.hasConsumableDelta(delta)) produced = true;
+            emit({ type: "delta", delta });
+          }
         } else if (ev === "token_usage") {
           // usage 透传完整对象（参考项目实证：含 reasoning_tokens / credit 等扩展字段），缺总数本地补
           const usage = {
@@ -601,6 +614,7 @@ const trae = {
           emit({ type: "finish", reason: data.finish_reason || data.finishReason || "stop" });
         } else if (ev === "error") {
           // code:1005 = 积分不足 PlanLimit；4008 = 限流；4001 = 模型配置问题（不罚号，交由分类器处理）
+          sawError = true;
           const code = Number(data.code) || 0;
           if (code === 1005) result.planLimit = true;
           const status = code === 1005 ? 402 : code === 4008 ? 429 : 502;
@@ -610,6 +624,30 @@ const trae = {
       });
     } finally {
       cancelTimer();
+    }
+    // 空流判定（与 zcode 同构，issue #73 同类问题）：两种形态都算失败——
+    //   ① 上游接受请求（HTTP 200）却一个 SSE 事件都没发（settled=false）；
+    //   ② 有事件但没产出任何「客户端可消费」的内容（produced=false，如只有
+    //      metadata/timing/usage 帧，或空占位帧）。
+    // 此前这两种情况都照样 return result（status:200/planLimit:false），于是 server.cjs 记为
+    // 200 成功（0 token）、applyCool 从不调用、账号不冷却且 serverFails 不递增，号池一直死磕该号。
+    // 抛错后归入 classifyUpstream 的 server 类（502），noteServerError 连续 3 次熔断才真正生效。
+    // status:502 且无 network 标记 → chat() 的 catch 直接上抛，不会去试镜像 URL（不产生双倍失败）。
+    // 判据用 util.hasConsumableDelta（与 server.cjs 的 sentDelta 同源），空名空参占位帧不算产出。
+    // ⚠ 必须让位于「上游已明确报错」：
+    //   · planLimit：额度耗尽（1005/402/欠费文案）→ server.cjs 走 coolAccount("credit") → exhausted
+    //     到次日 04:00，比「服务端异常」更强，不能被空流判定抢先降级成 30 分钟冷却；
+    //   · sawError：上游已给出具体错误事件（如 4001 模型配置为空、4008 限流）→ 必须交由
+    //     classifyUpstream 按其 code 分类（4001 属 model_config **不罚号**）。若被空流判定抢先
+    //     抛 502，这些「有 error 事件但无正文」的响应会被误归为 server 类而罚号——
+    //     实测会污染后续 server 熔断用例的计数（proxy-smoke 10.4b 场景）。
+    if (!result.planLimit && !sawError && (!settled || !produced)) {
+      throw Object.assign(new Error(settled
+        ? "上游返回了事件但没有任何可用内容（空响应，通常为余额耗尽/账号被限）"
+        : "上游接受了请求但未返回任何事件（空流，通常为余额耗尽/账号被限）"), {
+        status: 502,
+        emptyStream: true,
+      });
     }
     return result;
   },
@@ -1999,6 +2037,43 @@ function raccoonRefreshHeaders(c, account) {
   return h;
 }
 
+/** 手机端身份头（仅首次手机端登录奖励 mobileGrantUrl 用）：官方手机 App 壳的请求形态
+ *  （示例项目 agent2api 从安卓包逆向实测）：platform 报 app-android、版本报 App 侧 v1.0.3。
+ *  手机端端点认的也是桌面端登录签发的同一把 Bearer token（token 无平台绑定），
+ *  报哪端只影响走哪条端点，不影响凭证 —— 每个号两条一次性奖励各领一次。 */
+function raccoonMobileHeaders(c, account, secrets) {
+  const idn = raccoonIdentity(account);
+  const h = {
+    "content-type": "application/json",
+    accept: "application/json",
+    authorization: `Bearer ${secrets.token}`,
+    "X-Client-Platform": "app-android",
+    "X-Client-Version": "v1.0.3",
+  };
+  if (idn.officeIdentity && idn.officeIdentity !== "personal") h["X-Org-Code"] = idn.officeIdentity;
+  return h;
+}
+
+/** GLM 系（glm-5-3 / glm-5.3 等）的思考参数归一（issue #78）：上游这条链路只认 low/high/max，
+ *  发 "off" 会被 LiteLLM 直接 400——真实流水实证：「该模型始终思考，不支持关闭思考；请使用 low、
+ *  high 或 max」。这里把「关思考」译成官方语义 low（仍是关，只是强度最低），并摘掉 thinking /
+ *  enable_thinking 这些 GLM 不认的字段。**非 GLM 模型一律不动**：其它家族可能就吃 off，别替它们做决定。 */
+const RACCOON_GLM_RE = /glm[-._]?5[-._]?3/i;
+function normalizeGlmReasoning(out) {
+  if (!RACCOON_GLM_RE.test(String(out.model || ""))) return;
+  const eff = out.reasoning_effort;
+  if (eff != null) {
+    const v = String(eff).toLowerCase();
+    if (v === "off" || v === "none" || v === "minimal" || v === "disabled" || v === "false" || v === "0") out.reasoning_effort = "low";
+    else if (v === "max") out.reasoning_effort = "max";
+    else if (v === "low" || v === "high") out.reasoning_effort = v;
+    else out.reasoning_effort = "high"; // on/true/其它未知值：按官方「开思考」的默认档归一
+  }
+  delete out.thinking;
+  delete out.enable_thinking;
+  if (out.extra_body && typeof out.extra_body === "object") delete out.extra_body.thinking;
+}
+
 const raccoon = {
   id: "raccoon",
 
@@ -2094,6 +2169,7 @@ const raccoon = {
     delete out.conversation_id;
     delete out.conversationId;
     delete out.prompt_cache_key;
+    normalizeGlmReasoning(out); // GLM 系：off→low、摘 thinking（上游对 off 直接 400，见函数注释）
     return out;
   },
 
@@ -2202,11 +2278,22 @@ const raccoon = {
     }
   },
 
-  /** 每日签到 = 登录送积分：POST /login/points/grant（幂等，granted=true 才是本次新发放）。
-   *  同时锁定当日积分 7 天（会话4 §7.5：当天登录延长） */
+  /** 每日积分 = 两步懒结算：先 GET setting_info「激活」当日 Web 会话，再 POST grant 领取。
+   *
+   *  实测（2026-10-07 00:11，双账号、客户端未启动）：跳过第 1 步时 grant 恒返回
+   *  granted:false 且积分明细（/points/v1/bills）当日无 daily_grant 单据——即服务端
+   *  并未发放；补上 setting_info 后 grant 立即 granted:true，单据 created_at=调用时刻、
+   *  grant_at=当日 00:00（账期归属）、expire_at=+7 天。
+   *
+   *  官方规则页写的「00:00 自动发放、无需登录触发」指 grant_at 的账期归属；实际入库
+   *  是懒结算——要等当天首次 Web 会话活动（setting_info 正是客户端启动时的必调项）。
+   *  granted=false 语义 = 当日已发放（幂等），非失败。 */
   async checkin(account, secrets) {
     const c = this.cfg();
     const headers = raccoonWebHeaders(c, account, secrets);
+    // 第 1 步：setting_info 激活当日 Web 会话（懒结算前置；失败不阻断，由 grant 自行暴露）
+    await httpJson(c.settingUrl, { method: "GET", headers }).catch(() => null);
+    // 第 2 步：领取
     const r = await httpJson(c.grantUrl, { method: "POST", headers, body: "{}" }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
     if (r.status === 401) return { ok: false, message: "凭证失效，请重新登录" };
     const code = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
@@ -2215,6 +2302,54 @@ const raccoon = {
     }
     const granted = !!(r.data.data && r.data.data.granted);
     return { ok: true, already: !granted, claimed: granted, message: granted ? "已领取每日积分" : "今日已领取过" };
+  },
+
+  /**
+   * 首次登录奖励（一次性新手福利，桌面端与手机端各一条端点，同一把 Bearer token、各领一次）。
+   * 契约与 raccoon.checkin 的每日 grant 同形：`{code:0,data:{granted,popup?:{points}}}`；
+   * granted=false = 此前已发放（幂等成功，不重复加分）。两条端点互不共享额度：
+   * 桌面端早已领过的账号，手机端那条照样能拿满。
+   *
+   * 台账（已领取标记）存账号 meta.onboardingGrants（key → 结算时刻）：
+   *   · 台账已结算的任务不发请求 —— 落了标记后续恒跳过（「后续不再领取」）；
+   *   · 探测成功（无论 granted 真假）都算落定，返回 settled 增量由编排层写台账 ——
+   *     两种结果都代表奖励已落定，这一步就是「已领取」标记的写入口径；
+   *   · 探测失败（网络/5xx）不落台账，下次签到/自动签到自然重试（「直到领取成功」）；
+   *   · 401 = 凭证失效，整体失败（不落台账，也不对每条任务各撞一次 401）。
+   * 串行探测（与签到同一条防风控口径）。实际入账分值以响应 popup.points 为准，
+   * 取不到按名义值 3000 兜底（仅用于界面展示与流水摘要）。
+   */
+  async claimOnboarding(account, secrets) {
+    const c = this.cfg();
+    const meta = (account && account.meta) || {};
+    const ledger = meta.onboardingGrants && typeof meta.onboardingGrants === "object" ? meta.onboardingGrants : {};
+    const tasks = [
+      { key: "desktop_login_grant", title: "首次电脑端登录奖励", path: c.grantUrl, headers: raccoonWebHeaders(c, account, secrets) },
+      { key: "mobile_login_grant", title: "首次手机端登录奖励", path: c.mobileGrantUrl, headers: raccoonMobileHeaders(c, account, secrets) },
+    ];
+    const now = Date.now();
+    const settled = {};
+    const results = [];
+    let claimed = 0, already = 0, failed = 0, claimedPoints = 0;
+    for (const t of tasks) {
+      if (Number(ledger[t.key]) > 0) continue;
+      const r = await httpJson(t.path, { method: "POST", headers: t.headers, body: "{}" }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+      if (r.status === 401) return { ok: false, message: "凭证失效，请重新登录" };
+      const code = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+      if (!r.ok || !r.data || (code !== 0 && code !== 200)) {
+        failed++;
+        results.push({ key: t.key, title: t.title, ok: false, error: (r.data && r.data.message) || r.message || `HTTP ${r.status}` });
+        continue;
+      }
+      const granted = !!(r.data.data && r.data.data.granted);
+      const points = granted ? Number(r.data.data.popup && r.data.data.popup.points) || 3000 : 0;
+      settled[t.key] = now;
+      claimed++;
+      claimedPoints += points;
+      if (!granted) already++; // granted=false = 此前已发放，本轮幂等落定（不再入账）
+      results.push({ key: t.key, title: t.title, ok: true, already: !granted, points });
+    }
+    return { ok: failed === 0, settled, results, claimed, already, failed, claimedPoints };
   },
 
   /** 加油包领取：raccoon 加油包为付费购买（无免费"领取"动作），不支持 → 返回不可用提示 */
@@ -2290,6 +2425,1193 @@ const raccoon = {
     // 接口不可用时本地解码兜底：小浣熊 JWT 顶层是 iss（账户 ID）/ sid，util.jwtDecode 读不出，
     // 必须用 raccoon 自己的口径（与 discovery.scanRaccoon 一致），否则 uid 恒空、号池去重失效
     return { uid: raccoonAuth.tokenUid(token), name: "" };
+  },
+};
+
+// ===== LobsterAI（网易有道龙虾，渠道 id: lobster） =====// 协议事实（2026-10-05 本机实测 + 参考实现 lobsterai2api@21c39a4 交叉验证，见 docs/lobster-反代）：
+//   · 鉴权 = Bearer JWT（OAuth 授权码换发；回环回调 http://127.0.0.1:<port>/auth/callback）
+//   · 对话 = 原生 OpenAI Chat Completions，但**上游只接受 stream=true**（非流式实测 500）
+//   · 业务错误可能藏在 HTTP 200 的 SSE 流里（event:error 帧）→ 必须窥探首块
+//   · 签到 = client-activities 三段式（slot → context → actions/check_in），活动按 clientVersion 门禁
+//   · 积分 = /api/user/profile-summary 的 totalCreditsRemaining（/api/user/quota 不含活动积分）
+
+const LOBSTER_UA_FALLBACK = "2026.9.23";
+// 版本号缓存：签到活动按 clientVersion 下发，旧版本号会拿到 slotState=empty（实测 0.1.0 被隐藏）。
+// 1h TTL，失败 10min 后重试（与参考实现同口径）
+let lobsterVersionCache = { val: "", at: 0, failedAt: 0 };
+
+/**
+ * MiniMax 系模型的思考链归一：把 content 里的 `<think>…</think>` 抽成 reasoning_content。
+ *
+ * 实测三例对照（2026-10-05，同一 prompt「说：正常」）：
+ *   · MiniMax-M3      → 思考链**混在 content**（`<think>The user just said…`），无 reasoning_content 字段
+ *   · glm-5.3-flash   → 独立 `reasoning_content` 字段（1144 字符）
+ *   · deepseek-v4-pro → 独立 `reasoning_content` 字段（542 字符）
+ *
+ * 通用层 server.cjs 只认 `reasoning_content`（server.cjs L435），若不归一，MiniMax 的思考链
+ * 会被当正文原样透传（用户看到 "<think>The user simply…"）。
+ *
+ * 流式注意：标签可能被切成多帧（`<thi` + `nk>`），故用**跨帧状态机**。
+ * 状态随 chat() 一次调用创建、调用内共享（见 createThinkSplitter 的用法）。
+ */
+function createThinkSplitter() {
+  let inThink = false;
+  let pending = ""; // 可能是半个标签的尾巴（如 "<thi"），留到下一帧判定
+  const OPEN = "<think>";
+  const CLOSE = "</think>";
+
+  /** 取 s 末尾与 tag 开头匹配的最长前缀长度（把半个标签留到下一帧再判） */
+  const tagPrefixLen = (s, tag) => {
+    for (let n = Math.min(s.length, tag.length - 1); n > 0; n--) {
+      if (s.endsWith(tag.slice(0, n))) return n;
+    }
+    return 0;
+  };
+
+  /** 喂入一段 content，返回 { reasoning, content }（两者都可能为空串）。
+   *  注意：疑似半个标签的尾巴会被**推迟到下一帧**才计入 reasoning（可能不是标签），
+   *  因此调用方必须按帧累积 reasoning，不能只看最后一帧。 */
+  return function split(content) {
+    if (typeof content !== "string" || !content) return { reasoning: "", content: "" };
+    let buf = pending + content;
+    pending = "";
+    let reasoning = "";
+    let out = "";
+    for (;;) {
+      if (!inThink) {
+        const i = buf.indexOf(OPEN);
+        if (i >= 0) {
+          out += buf.slice(0, i);
+          buf = buf.slice(i + OPEN.length);
+          inThink = true;
+          continue;
+        }
+        const keep = tagPrefixLen(buf, OPEN);
+        if (keep > 0) {
+          out += buf.slice(0, buf.length - keep);
+          pending = buf.slice(buf.length - keep);
+        } else {
+          out += buf;
+        }
+        break;
+      }
+      const j = buf.indexOf(CLOSE);
+      if (j >= 0) {
+        reasoning += buf.slice(0, j);
+        buf = buf.slice(j + CLOSE.length);
+        inThink = false;
+        continue;
+      }
+      const keep = tagPrefixLen(buf, CLOSE);
+      if (keep > 0) {
+        reasoning += buf.slice(0, buf.length - keep);
+        pending = buf.slice(buf.length - keep);
+      } else {
+        reasoning += buf;
+      }
+      break;
+    }
+    return { reasoning, content: out };
+  };
+}
+
+/**
+ * 把一个 delta 按 <think> 归一：返回 { reasoning, rest }。
+ * rest 是改写后的 delta（content 可能被清空/截短）；reasoning 非空时由调用方
+ * 挂成独立的 reasoning_content 增量发给通用层。
+ * 快路径：既无 <think 也不在 think 段内时原样返回，零开销。
+ */
+function splitThinkDelta(split, d) {
+  const content = d && d.content;
+  if (typeof content !== "string" || !content) return { reasoning: "", rest: d };
+  if (!content.includes("<think") && !content.includes("</think")) {
+    // 不含标签：若上次留下半截标签（pending），仍需喂进去才能判出来
+    const r = split(content);
+    if (!r.reasoning && r.content === content) return { reasoning: "", rest: d };
+    const rest = { ...d };
+    if (r.content) rest.content = r.content;
+    else delete rest.content;
+    return { reasoning: r.reasoning, rest };
+  }
+  const r = split(content);
+  const rest = { ...d };
+  if (r.content) rest.content = r.content;
+  else delete rest.content;
+  return { reasoning: r.reasoning, rest };
+}
+
+// ===== ModelScope（魔搭 · 阿里）：官方 OpenAI 兼容 + 魔粒每日任务 =====
+// 与其它渠道的本质差异：这是**官方公开 API**（非逆向），对话面零签名零客户端依赖；
+// 但「魔粒」任务面在 www.modelscope.cn 的 openapi 上，鉴权是三头同发 + 浏览器上下文，
+// 且点赞是有副作用的公开动作（PUT 星标），故 checkin 的动作面与状态面严格分离：
+//   checkinStatus = 纯只读（读 earn/rules 与 balance，不产生任何写入）
+//   checkin       = 会话触碰（保 daily_active）+ 按剩余额度点赞（幂等：读 today_used 决定次数）
+const modelscope = {
+  id: "modelscope",
+
+  cfg() {
+    return rules.get("headers.json").modelscope;
+  },
+
+  /** 对话头：官方网关只认 Bearer（实测三头对 api-inference 非必需，但带上无害且与站点一致） */
+  chatHeaders(token) {
+    const c = this.cfg();
+    return {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "text/event-stream, application/json",
+    };
+  },
+
+  /** 魔粒控制面头：**三头同发 + 浏览器上下文**——缺 UA/Origin/Referer 会被风控中间件
+   *  静默忽略（实测：只带 Authorization 时 earn/rules 返回空/异常，补齐后才稳定 200） */
+  apiHeaders(token, refererPath) {
+    const c = this.cfg();
+    const base = String(c.apiBase || "https://www.modelscope.cn").replace(/\/+$/, "");
+    return {
+      authorization: `Bearer ${token}`,
+      "OpenAPI-Token": token,
+      "X-Modelfun-Token": token,
+      "content-type": "application/json",
+      accept: "application/json, text/plain, */*",
+      "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "user-agent": c.userAgent || "Mozilla/5.0",
+      origin: base,
+      referer: `${base}${refererPath || c.refererPath || "/my/overview"}`,
+    };
+  },
+
+  /** Cookie 头（/api/v1 族专用）。
+   *
+   *  为什么有这个：魔搭端点分两族且**严格互斥**（实测确立，见 rules.cjs 注释）：
+   *    「OAuth 可用族」推理 /v1/chat + 魔粒 /openapi/v1/*
+   *    「仅 Cookie/ms- 可用族」点赞 /api/v1/mcpServers/* + 令牌管理 /api/v1/users/tokens*
+   *  且 ms- 令牌虽能点赞却不触发 daily_active（参考项目实测注释：
+   *  只有 Web 会话（Cookie）活动才触发日活奖励）⇒ **Cookie 是唯一两全的凭据**。 */
+  cookieHeaderOf(secrets) {
+    const meta = (secrets && (secrets.meta || secrets.accountMeta)) || {};
+    return String(meta[this.cfg().cookieMetaKey] || "").trim();
+  },
+
+  /** 星标族头（点赞/列目标共用）：有 Cookie 用 Cookie，否则退 ms- 令牌 */
+  starHeaders(secrets, refererPath) {
+    const c = this.cfg();
+    const base = String(c.apiBase || "https://www.modelscope.cn").replace(/\/+$/, "");
+    const cookie = this.cookieHeaderOf(secrets);
+    const ua = c.userAgent || "Mozilla/5.0";
+    const common = {
+      "content-type": "application/json",
+      accept: "application/json, text/plain, */*",
+      "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "user-agent": ua,
+      origin: base,
+      referer: `${base}${refererPath || c.refererPath || "/my/overview"}`,
+    };
+    if (cookie) return { cookie, ...common };
+    // 回退：ms- 令牌（OAuth 令牌在此族会 401，故不尝试）
+    const token = String((secrets && secrets.token) || "");
+    return { authorization: `Bearer ${token}`, "OpenAPI-Token": token, "X-Modelfun-Token": token, ...common };
+  },
+
+  /** 是否有可用于星标族的凭据（Cookie 或 ms- 令牌；OAuth 令牌不算） */
+  hasStarCredential(secrets) {
+    if (this.cookieHeaderOf(secrets)) return true;
+    const tk = String((secrets && secrets.token) || "");
+    return !!tk && !tk.startsWith(String(this.cfg().oauthTokenPrefix || "ms_oauth"));
+  },
+
+  /** Web 会话触碰（触发 daily_active）。
+   *
+   *  daily_active 即「注册并登陆，每日登录即可获取」——参考项目 HAR 抓包确认前端每次页面加载
+   *  都会调 /api/v1/users/login/info，故必须**真的走 Web 请求**才算登录事件；纯 OpenAPI
+   *  （Bearer）调用不计入日活（参考项目实测注释明确记录）。
+   *
+   *  返回 { ok, touched, dead }：dead=true 表示 Cookie 已失效（供上层提示重新授权）。 */
+  async webTouch(secrets) {
+    const c = this.cfg();
+    const base = String(c.apiBase || "https://www.modelscope.cn").replace(/\/+$/, "");
+    const cookie = this.cookieHeaderOf(secrets);
+    if (!cookie) return { ok: false, touched: 0, dead: false, message: "无 Web 会话 Cookie" };
+    const ua = c.userAgent || "Mozilla/5.0";
+    const htmlHeaders = {
+      cookie,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "user-agent": ua,
+      referer: `${base}/`,
+    };
+    let touched = 0;
+    let dead = false;
+    const deadRe = new RegExp(c.cookieDeadRe || "not logged in", "i");
+    // ① Web 页面触碰（触发 Web 端活跃埋点中间件）
+    for (const p of (c.cookieTouchPaths || ["/my/overview", "/"])) {
+      const r = await httpJson(`${base}${p}`, { method: "GET", headers: htmlHeaders }).catch(() => ({ ok: false, status: 0 }));
+      if (r.status === 401 || r.status === 403) dead = true;
+      if (r.ok) touched++;
+    }
+    // ② 登录事件端点（daily_active 的关键——HAR 抓包确认前端必调）
+    const jsonHeaders = { ...htmlHeaders, accept: "application/json, text/plain, */*" };
+    for (const p of (c.cookieLoginEventPaths || [])) {
+      const r = await httpJson(`${base}${p}`, { method: "GET", headers: jsonHeaders }).catch(() => ({ ok: false, status: 0, data: null }));
+      if (r.status === 401 || r.status === 403) dead = true;
+      if (deadRe.test(JSON.stringify((r && r.data) || ""))) dead = true;
+      if (r.ok) touched++;
+    }
+    // ③ OpenAPI 轻量端点（魔粒系统激活，Cookie 同样可调）
+    for (const p of (c.cookieOpenapiPaths || [])) {
+      const r = await httpJson(`${base}${p}`, { method: "GET", headers: jsonHeaders }).catch(() => ({ ok: false }));
+      if (r.ok) touched++;
+    }
+    return { ok: touched > 0 && !dead, touched, dead };
+  },
+
+  models() {
+    return unionIds([...catalogMap("modelscope").values()].map((m) => String(m.id)), []);
+  },
+
+  /** 模型名归一：魔搭模型 id 形如 `deepseek-ai/DeepSeek-V4.1-Flash`（含斜杠，大小写敏感）。
+   *  容忍：小写/下划线变体、以及「去掉 owner 前缀」的简写（用户可能只写 DeepSeek-V4.1-Flash） */
+  mapModel(model) {
+    const m = String(model || "");
+    if (!m) return m;
+    const catalog = catalogMap("modelscope");
+    if (catalog.has(m.toLowerCase())) return catalog.get(m.toLowerCase()).id;
+    const norm = m.toLowerCase().replace(/_/g, "-");
+    for (const [k, v] of catalog) {
+      if (k.replace(/_/g, "-") === norm) return String(v.id);
+    }
+    // 简写回退：`GLM-5.3-Flash` → `zhipuai/glm-5.3-flash`
+    for (const [k, v] of catalog) {
+      const tail = k.split("/").pop();
+      if (tail === norm || tail.replace(/_/g, "-") === norm) return String(v.id);
+    }
+    return m;
+  },
+
+  /** 请求体改写：官方网关是标准 OpenAI 兼容，需要处理两件事：
+   *  ① max_completion_tokens → max_tokens 翻译；
+   *  ② **流式必须显式请求 usage**——实测：不带 stream_options.include_usage 时，
+   *     上游每个 delta 帧都带 `usage:{prompt_tokens:0,completion_tokens:0,total_tokens:0}`
+   *     占位且**不发最终真实帧**，网关侧 token 统计恒为 0；带上后最后一帧
+   *     （choices:[] + 真实 usage）才会出现。 */
+  rewriteBody(model, body, account) {
+    const out = { ...(body || {}) };
+    out.model = this.mapModel(model || out.model);
+    if (out.max_completion_tokens != null && out.max_tokens == null) {
+      out.max_tokens = Number(out.max_completion_tokens) || 4096;
+    }
+    delete out.max_completion_tokens;
+    if (out.stream === true) {
+      out.stream_options = { ...(out.stream_options || {}), include_usage: true };
+    }
+    // prompt_cache_key（与其它渠道同款）：账号段硬隔离，跨账号绝不复用同一键。
+    // ⚠ 只注入 prompt_cache_key，**不注入 conversation_id**——后者是 WB/raccoon 的厂商私有字段，
+    //   对严格的 OpenAI 兼容端点有 400 风险；会话段改用前 3 条消息的稳定指纹（同样满足
+    //   「同一会话多轮键稳定」，且不向该端点引入未知字段）。
+    //
+    // ⚠ 实测结论（2026-10-06，真实账号直连上游）：**魔搭上游不提供前缀缓存**。
+    //   · 上游 usage 只有 3 个键：prompt_tokens / completion_tokens / total_tokens，
+    //     **完全没有 prompt_tokens_details.cached_tokens**（流式与非流式一致）。
+    //   · 带 8KB 长前缀连发 4 次：prompt_tokens 恒为 3345，**无任何折扣**。
+    //   · 带上 prompt_cache_key 再连发 4 次：token 数同样不变，HTTP 全 200（**字段被安全忽略，不报 400**）。
+    //   ⇒ 本渠道历史记录 cache_read_tokens 全为 0 是**上游不提供该字段**，不是我们记账缺失，
+    //     也不是「缓存未命中」。（对照：同机 zcode 95.0% / workbuddy_ai 82.7% / workbuddy 62.7%，
+    //     那些渠道的上游确实给缓存字段。）
+    //   既然如此为何仍注入？**为与其它渠道保持一致的行为**，且上游若日后启用缓存即自动受益；
+    //   代价为零（实测不会引发 400）。
+    if (!out.prompt_cache_key) {
+      out.prompt_cache_key = util.promptCacheKey((account && account.uid) || "", util.stableConvId(out.messages));
+    }
+    return out;
+  },
+
+  /** 拉取模型目录：GET /v1/models（需 Bearer）。⚠ 清单是「按热度精选」而非全集
+   *  （实测 35 个；GLM-5.3-Flash 不在清单内但直调 200）——故清单只用于展示，
+   *  不用于可用性判定。返回 {ok, models:[{id,name,...}]} */
+  async fetchModels(account, secrets) {
+    const c = this.cfg();
+    const r = await httpJson(c.modelsUrl, { method: "GET", headers: this.chatHeaders(secrets.token) })
+      .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    if (r.status === 401 || r.status === 403) return { ok: false, authError: true, message: "凭证失效，请重新登录" };
+    if (!r.ok || !r.data) return { ok: false, message: `模型目录拉取失败：HTTP ${r.status}${r.message ? " " + r.message : ""}` };
+    const list = Array.isArray(r.data.data) ? r.data.data : [];
+    const models = [];
+    for (const raw of list) {
+      const id = raw && (raw.id || raw.modelId);
+      if (typeof id !== "string" || !id) continue;
+      models.push({
+        id,
+        name: String((raw && (raw.name || raw.modelName)) || id),
+        rate: null, // 魔粒按 tier 计费，非倍率制；不编造 rate
+        capabilities: { images: true, reasoning: true, tools: true },
+        contextLength: tokenLimit(raw && (raw.contextLength || raw.contextWindow)),
+        maxOutputTokens: tokenLimit(raw && (raw.maxOutputTokens || raw.max_output_tokens)),
+      });
+    }
+    if (!models.length) return { ok: false, message: "模型目录为空" };
+    return { ok: true, models };
+  },
+
+  /** 对话：官方 OpenAI 兼容直通（上游原生支持 stream/tool_calls/reasoning_content，
+   *  无需像龙虾那样做思考链归一——实测 reasoning_content 是独立字段） */
+  async chat({ account, secrets, model, body, emit }) {
+    const c = this.cfg();
+    const payload = JSON.stringify(this.rewriteBody(model, body, account));
+    const headers = this.chatHeaders(secrets.token);
+    let resp, cancelTimer;
+    try {
+      ({ resp, cancelTimer } = await fetchStream(c.chatUrl, { method: "POST", headers, body: payload, firstByteMs: firstByteBudgetMs(payload) }));
+    } catch (e) {
+      // 非 2xx 由 fetchStream 抛出（形如「上游 HTTP 403：{...错误体...}」）。
+      // 魔搭的 403 有两种**账号侧可自行修复**的前置条件，必须给出可操作指引而非通用 502：
+      //   ① 未绑定阿里云账号   → "please bind your Alibaba Cloud account"
+      //   ② 已绑定但未实名认证 → "real-name verified"（2026-10-06 双账号实测发现）
+      // 二者都属 403；其余 4xx/5xx 原样上抛交由通用分类器处理。
+      const text = String((e && e.message) || "");
+      if (/HTTP 403/.test(text) && /real-name|realname|实名/i.test(text)) {
+        emit({
+          type: "error", status: 403, code: 403,
+          message: "该魔搭账号绑定的阿里云账号未完成实名认证，无法调用推理。请到 https://www.modelscope.cn/my/accountsettings 完成实名后重试。",
+        });
+        return { status: 403, planLimit: false, needRealName: true };
+      }
+      if (/HTTP 403/.test(text) && /bind your Alibaba Cloud account|绑定阿里云/i.test(text)) {
+        emit({
+          type: "error", status: 403, code: 403,
+          message: "该魔搭账号尚未绑定阿里云账号，无法调用推理。请到 https://www.modelscope.cn/my/accountsettings 绑定后再试。",
+        });
+        return { status: 403, planLimit: false, needBind: true };
+      }
+      throw e;
+    }
+    const result = { status: 200, planLimit: false };
+
+    // ⚠ 非流式响应必须单独处理（2026-10-06 实测踩坑）：
+    //   魔搭对 stream:false 返回**单个 application/json 对象**（不是 SSE），内容在
+    //   choices[0].message.content。若直接交给 pumpSse，SseScanner 只认 `data:` 行，
+    //   整个响应会解析出 **0 帧** → 客户端拿到空回复（连 finish 都没有、usage 为 0），
+    //   酷似「模型没回答」。这正是 DSH 默认非流式时必现的空响应缺陷。
+    //   （先前误判为「delta 空壳顶掉 message」——那层判断本身没错，但它落在一条永远不会
+    //     执行到的路径上，因为整个响应根本没进帧处理逻辑。）
+    const ctype = String((resp.headers && resp.headers.get && resp.headers.get("content-type")) || "");
+    const looksSse = /text\/event-stream/i.test(ctype);
+    if (!looksSse) {
+      const bodyText = await resp.text().catch(() => "");
+      cancelTimer();
+      const data = parseJson(bodyText);
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        emit({ type: "error", status: 502, message: "上游返回了无法解析的响应体" });
+        return result;
+      }
+      const errObj = data.error || null;
+      if (errObj) {
+        const msg = String(errObj.message || errObj.code || "上游错误");
+        const isQuota = /insufficient|quota|balance|魔粒|余额|exceeded/i.test(msg);
+        if (isQuota) result.planLimit = true;
+        emit({ type: "error", status: isQuota ? 402 : 502, code: errObj.code || 0, message: msg });
+        return result;
+      }
+      const choice = Array.isArray(data.choices) && data.choices[0];
+      if (choice) {
+        // 非流式优先取 message（真身）；delta 只是伴随的空壳
+        const pick = (choice.message && typeof choice.message === "object") ? choice.message : choice.delta;
+        if (pick && typeof pick === "object") {
+          const clean = {};
+          for (const [k, v] of Object.entries(pick)) {
+            if (v === null) continue;
+            clean[k] = v;
+          }
+          // 空串 content 也要发：下游据此区分「有响应但内容为空」与「上游无响应」
+          if (Object.keys(clean).length) emit({ type: "delta", delta: clean });
+        }
+        emit({ type: "finish", reason: choice.finish_reason || "stop" });
+      }
+      if (data.usage) {
+        const u = data.usage;
+        const pt = Number(u.prompt_tokens ?? u.input_tokens) || 0;
+        const ct = Number(u.completion_tokens ?? u.output_tokens) || 0;
+        const tt = Number(u.total_tokens) || 0;
+        if (pt || ct || tt) emit({ type: "usage", usage: { ...u, prompt_tokens: pt, completion_tokens: ct, total_tokens: tt || pt + ct } });
+      }
+      return result;
+    }
+
+    let settled = false;
+    try {
+      await pumpSse(resp, (event, raw) => {
+        if (!settled) {
+          settled = true;
+          cancelTimer();
+        }
+        if (event === "error") {
+          const d = parseJson(raw);
+          const msg = String((d && (d.message || (d.error && d.error.message))) || raw || "上游返回错误帧").slice(0, 300);
+          const isQuota = /insufficient|quota|balance|魔粒|余额|欠费|exceeded/i.test(msg);
+          if (isQuota) result.planLimit = true;
+          emit({ type: "error", status: isQuota ? 402 : 502, code: (d && d.code) || 0, message: msg });
+          return;
+        }
+        if (raw === "[DONE]") {
+          emit({ type: "finish", reason: "" });
+          return;
+        }
+        const data = parseJson(raw);
+        // 非对象帧守卫（本仓库既有约定：null/数组/裸标量一律丢弃，防 TypeError 中断整条流）
+        if (!data || typeof data !== "object" || Array.isArray(data)) return;
+        const errObj = data.error || null;
+        if (errObj) {
+          const msg = String(errObj.message || errObj.code || "上游错误");
+          const isQuota = /insufficient|quota|balance|魔粒|余额|exceeded/i.test(msg);
+          if (isQuota) result.planLimit = true;
+          // 实名认证门槛（实测：绑定阿里云账号但未实名 → 403，错误信息含 real-name verified）：
+          // 这是**账号侧可自行修复**的前置条件，不能混成通用 502——否则用户只看到「上游错误」，
+          // 不知道要去 accountsettings 做实名。故单独归类为 403 并把可操作指引带进 message。
+          const isRealName = /real-name|realname|实名/i.test(msg);
+          if (isRealName) {
+            emit({
+              type: "error", status: 403, code: errObj.code || 0,
+              message: "该魔搭账号绑定的阿里云账号未完成实名认证，无法调用推理。请到 https://www.modelscope.cn/my/accountsettings 完成实名后重试。",
+            });
+            return;
+          }
+          emit({ type: "error", status: isQuota ? 402 : 502, code: errObj.code || 0, message: msg });
+          return;
+        }
+        const choice = Array.isArray(data.choices) && data.choices[0];
+        if (choice) {
+          // ⚠ 非流式响应同时带 delta 与 message（2026-10-06 实测）：
+          //   delta   = {role:null, content:"", tool_calls:null, …}   ← 空壳
+          //   message = {role:"assistant", content:"正常", …}          ← 真实内容
+          // 旧写法 `choice.delta || choice.message` 取到 truthy 的空壳 delta、丢弃真实内容 →
+          // 非流式客户端拿到空回复（finish_reason:stop、usage 极小，酷似「模型没回答」）。
+          // 改为优先取真正带内容的一方。
+          const carries = (o) => !!(o && (
+            (typeof o.content === "string" && o.content !== "")
+            || (typeof o.reasoning_content === "string" && o.reasoning_content !== "")
+            || (Array.isArray(o.tool_calls) && o.tool_calls.length)
+            || (Array.isArray(o.function_calls) && o.function_calls.length)
+          ));
+          const dRaw = choice.delta;
+          const mRaw = choice.message;
+          const d = carries(dRaw) ? dRaw : (carries(mRaw) ? mRaw : (dRaw || mRaw));
+          // 上游 delta 里带一堆 null 占位字段（role:null / tool_calls:null / function_calls:null），
+          // 直接透传会让下游 stripEmptyDelta 之外的路径收到无意义空壳；这里剥掉纯 null 字段
+          if (d) {
+            const clean = {};
+            for (const [k, v] of Object.entries(d)) {
+              if (v === null) continue;
+              if (typeof v === "string" && v === "") {
+                // 保留空串 content（[DONE] 前的收尾帧靠它标记结束），丢弃其它空串占位
+                if (k !== "content") continue;
+              }
+              clean[k] = v;
+            }
+            if (Object.keys(clean).length) emit({ type: "delta", delta: clean });
+          }
+          if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+        }
+        if (data.usage) {
+          // ⚠ 上游每个 delta 帧都带 usage 字段（实测 18/18 帧），但除最后一帧外全是空壳（全 0）。
+          // 若无条件 emit，会把真实 usage 之前的一堆 0 推给上层，聚合器最终拿到 0——
+          // 表现为「对话完全正常但 token 统计恒为 0」。故只在有真实数值时 emit。
+          const u = data.usage;
+          const pt = Number(u.prompt_tokens ?? u.input_tokens) || 0;
+          const ct = Number(u.completion_tokens ?? u.output_tokens) || 0;
+          const tt = Number(u.total_tokens) || 0;
+          if (pt || ct || tt) {
+            emit({ type: "usage", usage: { ...u, prompt_tokens: pt, completion_tokens: ct, total_tokens: tt || pt + ct } });
+          }
+        }
+      });
+    } finally {
+      cancelTimer();
+    }
+    return result;
+  },
+
+  /** 魔粒余额：GET /openapi/v1/magicubes/balance → data.total_balance */
+  async queryCredits(account, secrets) {
+    const r = await this.magicubesGet(secrets, this.cfg().balancePath);
+    if (r.authError) return { authError: true };
+    if (!r.ok) throw new Error(r.message || "魔粒余额查询失败");
+    const d = (r.data && r.data.data) || {};
+    const credits = Number(d.total_balance ?? d.available_balance ?? d.balance) || 0;
+    return { credits, raw: d };
+  },
+
+  /** 魔粒控制面 GET 封装：统一三头 + 错误语义（401/403 → authError，供上层触发重登） */
+  async magicubesGet(secrets, path, query) {
+    const c = this.cfg();
+    const base = String(c.apiBase || "https://www.modelscope.cn").replace(/\/+$/, "");
+    const url = `${base}${path}${query ? (path.includes("?") ? "&" : "?") + query : ""}`;
+    const r = await httpJson(url, { method: "GET", headers: this.apiHeaders(secrets.token) })
+      .catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    if (r.status === 401 || r.status === 403) return { ok: false, authError: true, message: "凭证失效，请重新登录" };
+    if (!r.ok || !r.data) return { ok: false, message: r.message || `HTTP ${r.status}` };
+    // 站点信封：{success:true,data:…}；openapi 直出数据时 data 字段即业务体
+    if (r.data.success === false) return { ok: false, message: r.data.message || "上游返回失败" };
+    return { ok: true, data: r.data };
+  },
+
+  /** 读任务规则表（28 条）：返回原始数组 */
+  async fetchEarnRules(secrets) {
+    const r = await this.magicubesGet(secrets, this.cfg().earnRulesPath);
+    if (!r.ok) return r;
+    const list = Array.isArray(r.data && r.data.data) ? r.data.data : [];
+    return { ok: true, rules: list };
+  },
+
+  /** 从规则表里取某个 rule_key */
+  ruleOf(rules, key) {
+    return (rules || []).find((x) => String(x && x.rule_key) === String(key)) || null;
+  },
+
+  /** 签到状态（**纯只读，零副作用**）：报告每日任务的领取情况与点赞剩余额度。
+   *  返回结构对齐其它渠道：{ok, checkedIn, already, reward, message}，
+   *  额外带 detail 供号池页展示「200 登录 / 50 绑云 / 40 点赞」的分解。 */
+  async checkinStatus(account, secrets) {
+    try {
+      const c = this.cfg();
+      const rr = await this.fetchEarnRules(secrets);
+      if (rr.authError) return { ok: false, message: "凭证失效，请重新登录" };
+      if (!rr.ok) return { ok: false, message: rr.message || "任务规则查询失败" };
+      const rules = rr.rules;
+      const daily = this.ruleOf(rules, c.ruleDailyActive);
+      const bind = this.ruleOf(rules, c.ruleAliyunBind);
+      const like = this.ruleOf(rules, c.ruleLike);
+      const likeCap = Number(like && like.daily_cap) || 0;
+      const likeUsed = Number(like && like.today_used) || 0;
+      const likeRemain = Math.max(likeCap - likeUsed, 0);
+      const likeAmount = Number(like && like.amount) || 2;
+      // 「已签到」判定：两条每日任务都已领取（daily_cap=1 时 today_remain=0）
+      const dailyDone = !!daily && Number(daily.today_remain) === 0 && Number(daily.today_used) > 0;
+      const bindDone = !!bind && Number(bind.today_remain) === 0 && Number(bind.today_used) > 0;
+      const checkedIn = dailyDone;
+      const reward = (Number(daily && daily.amount) || 0) + (Number(bind && bind.amount) || 0);
+      const parts = [];
+      parts.push(dailyDone ? `登录奖励 ${Number(daily.amount) || 200} 已领` : `登录奖励 ${Number(daily && daily.amount) || 200} 待领`);
+      parts.push(bindDone ? `绑云奖励 ${Number(bind && bind.amount) || 50} 已领` : `绑云奖励 ${Number(bind && bind.amount) || 50} 待领`);
+      parts.push(likeRemain > 0 ? `点赞可领 ${likeRemain}×${likeAmount}=${likeRemain * likeAmount} 魔粒` : "点赞今日已满");
+      return {
+        ok: true,
+        checkedIn,
+        already: checkedIn && likeRemain === 0,
+        reward,
+        likeRemain,
+        likeAmount,
+        message: parts.join(" · "),
+        detail: { daily, bind, like },
+      };
+    } catch (e) {
+      return { ok: false, message: String((e && e.message) || e) };
+    }
+  },
+
+  /** 每日任务执行（**有副作用**：Web 会话触碰 + 点赞）。
+   *  幂等设计：先读 today_used/today_remain，只补做剩余次数——重复调用不会超领。
+   *
+   *  凭据分层（关键，见 rules.cjs 注释与 §2.8）：
+   *    ① Web 会话触碰走 **Cookie**（唯一触发 daily_active 的凭据；Bearer 调用不计日活）
+   *    ② 点赞走 **Cookie**（OAuth 令牌在此端点被上游 401 拒绝；ms- 令牌可但无日活）
+   *    ③ 魔粒余额/规则查询走 **OAuth 令牌**（该族两种凭据都可）
+   *  无 Cookie 时降级为 ms- 令牌（能点赞、不计日活），并在结果里**如实标注**，
+   *  不再把「无可用凭据」静默吞成「无可点赞目标」——那是本实现早期的缺陷。 */
+  async checkin(account, secrets) {
+    const c = this.cfg();
+    const hasCookie = !!this.cookieHeaderOf(secrets);
+    const canStar = this.hasStarCredential(secrets);
+
+    // ① 会话触碰：读余额与规则（Cookie 通道下另有 Web 页面触碰，见 webTouch）
+    const before = await this.magicubesGet(secrets, this.cfg().balancePath);
+    if (before.authError) return { ok: false, message: "凭证失效，请重新登录" };
+    if (!before.ok) return { ok: false, message: before.message || "会话触碰失败" };
+    const balBefore = Number((before.data && before.data.data && before.data.data.total_balance)) || 0;
+
+    // ①b Web 会话触碰（Cookie 专用）：这是 daily_active 的真正触发条件
+    let web = null;
+    if (hasCookie) {
+      web = await this.webTouch(secrets).catch((e) => ({ ok: false, touched: 0, dead: false, message: String((e && e.message) || e) }));
+      if (web && web.dead) {
+        return {
+          ok: false, needReauth: true,
+          message: "Web 会话 Cookie 已失效（无法触发每日登录奖励与点赞），请在「添加账号」里重新完成一次 OAuth 授权以刷新会话",
+        };
+      }
+    }
+
+    const rr = await this.fetchEarnRules(secrets);
+    if (!rr.ok) return { ok: false, message: rr.message || "任务规则查询失败" };
+    const daily = this.ruleOf(rr.rules, c.ruleDailyActive);
+    const bind = this.ruleOf(rr.rules, c.ruleAliyunBind);
+    const like = this.ruleOf(rr.rules, c.ruleLike);
+    const dailyAmt = Number(daily && daily.amount) || 0;
+    const bindAmt = Number(bind && bind.amount) || 0;
+
+    // ② 点赞：按剩余额度补做（需要星标族凭据）
+    const cap = Math.min(Number(like && like.daily_cap) || 0, Number(c.likeHardCap) || 25);
+    const used = Number(like && like.today_used) || 0;
+    const remain = Math.max(cap - used, 0);
+    let liked = 0;
+    let likeErr = "";
+    if (remain > 0 && !canStar) {
+      // 无星标族凭据：如实说明，而不是伪装成「无目标」
+      likeErr = "点赞需 Web 会话（Cookie）或 ms- 令牌，当前账号只有 OAuth 令牌——请重新 OAuth 授权（应用内窗口会自动获取会话）";
+    } else if (remain > 0) {
+      const targets = await this.fetchLikeTargets(secrets, remain + 5);
+      if (!targets.length) likeErr = "无可点赞目标（上游列表为空）";
+      for (const t of targets) {
+        if (liked >= remain) break;
+        const okOne = await this.likeOne(secrets, t).catch(() => false);
+        if (okOne) liked++;
+        await new Promise((r) => setTimeout(r, (Number(c.likeDelayMinMs) || 400) + Math.floor(Math.random() * ((Number(c.likeDelayMaxMs) || 900) - (Number(c.likeDelayMinMs) || 400)))));
+      }
+      if (liked === 0 && !likeErr) likeErr = "点赞未成功（凭据可能无权调用该端点）";
+    }
+
+    // ③ 复核：重读规则 + 余额（防「接口成功但没发分」）
+    const afterRules = await this.fetchEarnRules(secrets);
+    const afterBal = await this.magicubesGet(secrets, this.cfg().balancePath);
+    const balAfter = Number((afterBal.ok && afterBal.data && afterBal.data.data && afterBal.data.data.total_balance)) || 0;
+    const likeAfter = afterRules.ok ? this.ruleOf(afterRules.rules, c.ruleLike) : null;
+    const likeUsedAfter = Number(likeAfter && likeAfter.today_used) || used;
+    const delta = balAfter - balBefore;
+    const gained = delta > 0 ? delta : 0;
+
+    // 成功判定：至少推进了一件事（点赞计数前进，或余额增长）
+    const progressed = (likeUsedAfter > used) || (gained > 0);
+    const msgs = [];
+    if (dailyAmt && Number(daily && daily.today_used) > 0) msgs.push(`登录奖励 ${dailyAmt} 已领`);
+    if (bindAmt && Number(bind && bind.today_used) > 0) msgs.push(`绑云奖励 ${bindAmt} 已领`);
+    if (liked > 0) msgs.push(`点赞 ${liked} 次 +${liked * (Number(like && like.amount) || 2)} 魔粒`);
+    else if (likeErr) msgs.push(likeErr);
+    if (gained > 0) msgs.push(`余额 +${gained}`);
+    // 降级提示：无 Cookie 时明确告知日活拿不到（避免用户以为签到成功了）
+    if (!hasCookie && canStar) msgs.push("（当前无 Web 会话，daily_active 登录奖励需 Cookie 才能触发；重新 OAuth 授权可自动获取）");
+    return {
+      ok: progressed || (liked === 0 && remain === 0),
+      already: liked === 0 && remain === 0 && !gained,
+      claimed: progressed,
+      liked,
+      gained,
+      balance: balAfter,
+      hasCookie,
+      webTouched: web ? web.touched : 0,
+      message: msgs.length ? msgs.join(" · ") : "无可执行任务（今日已全部完成）",
+    };
+  },
+
+  /** 列可点赞目标：PUT /api/v1/dolphin/mcpServers（分页体）→ Data.McpServer.McpServers[]，
+   *  过滤掉已星标（AlreadyStar），按需取够 needed 个
+   *  ⚠ 走 Cookie 通道：该端点在「仅 Cookie/ms- 可用族」里，OAuth 令牌调会 401 */
+  async fetchLikeTargets(secrets, needed) {
+    const c = this.cfg();
+    const base = String(c.apiBase || "https://www.modelscope.cn").replace(/\/+$/, "");
+    const out = [];
+    const seen = new Set();
+    for (let page = 1; page <= 3 && out.length < needed; page++) {
+      const body = JSON.stringify({ PageSize: Number(c.mcpPageSize) || 30, PageNumber: page, Query: "", Criterion: [] });
+      const r = await httpJson(`${base}${c.mcpServersPath}`, { method: "PUT", headers: this.starHeaders(secrets), body })
+        .catch(() => ({ ok: false, data: null }));
+      if (!r.ok || !r.data) break;
+      const servers = (((r.data.Data || {}).McpServer || {}).McpServers) || [];
+      if (!servers.length) break;
+      for (const s of servers) {
+        if (out.length >= needed) break;
+        const path = s.Path || s.FromSitePath || s.Namespace;
+        const name = s.Name;
+        if (!path || !name) continue;
+        if (s.AlreadyStar) continue;
+        const key = `${path}/${name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ path, name, key });
+      }
+    }
+    return out;
+  },
+
+  /** 点赞单个 MCP 服务：PUT /api/v1/mcpServers/{path}/{name}/stars
+   *  ⚠ 这是**对外可见**的动作（星标会展示在 MCP 服务页与用户动态），
+   *  故仅在 checkin 被显式调用时执行，checkinStatus 绝不触发
+   *  ⚠ 走 Cookie 通道（同 fetchLikeTargets）；无 Cookie 时回退 ms- 令牌（能点赞但不计日活） */
+  async likeOne(secrets, target) {
+    const c = this.cfg();
+    const base = String(c.apiBase || "https://www.modelscope.cn").replace(/\/+$/, "");
+    const url = `${base}${c.starPathPrefix}/${target.path}/${target.name}/stars`;
+    const headers = this.starHeaders(secrets, `/mcp/servers/${target.path}/${target.name}`);
+    const r = await httpJson(url, { method: "PUT", headers, body: "{}" })
+      .catch(() => ({ ok: false, data: null }));
+    if (!r.ok || !r.data) return false;
+    return !!(r.data.Success || r.data.Code === 200);
+  },
+
+  /** 魔搭无「加油包」类领取动作 */
+  async trial() {
+    return { ok: false, message: "ModelScope 无加油包领取动作" };
+  },
+
+  /** 令牌续期（OAuth 路径专用）：**由编排层注入实现**。
+   *
+   *  为什么不在适配器里直接 require discovery：discovery.cjs 顶部 require 了本模块
+   *  （`const adapters = require("./adapters.cjs")`），反向 require 会形成循环依赖
+   *  （Node 下取到半初始化模块 → undefined）。故与 qoderAdapter 同款处理：依赖注入。
+   *  index.cjs 启动时调用 setModelScopeRefresh() 把 discovery.refreshModelScopeToken 注入进来。
+   *
+   *  ⚠ 上游约束（实测）：① refresh_token 一次性轮换 → 成功后必须把新值写回账号；
+   *    ② OAuth 错误以 HTTP 200 + body.error 返回 → 判定在注入的实现内完成。 */
+  async refreshToken(account, secrets) {
+    const refresh = String((secrets && secrets.refreshToken) || "").trim();
+    if (!refresh) {
+      return { ok: false, terminal: true, message: "该账号是粘贴令牌入池（无 refresh_token），令牌失效后请到魔搭「访问令牌」页面重新生成并粘贴" };
+    }
+    if (typeof modelScopeRefreshImpl !== "function") {
+      return { ok: false, terminal: true, message: "续期实现未注入（编排层未初始化），请重新执行 OAuth 登录" };
+    }
+    const meta = (account && account.meta) || {};
+    const clientId = String(meta.oauthClientId || "");
+    const clientSecret = String(meta.oauthClientSecret || "");
+    if (!clientId || !clientSecret) {
+      return { ok: false, terminal: true, message: "缺少 OAuth 客户端信息（meta.oauthClientId/Secret），无法续期，请重新执行 OAuth 登录" };
+    }
+    const r = await modelScopeRefreshImpl(clientId, clientSecret, refresh).catch((e) => ({ ok: false, message: String((e && e.message) || e) }));
+    if (!r.ok) {
+      // invalid_grant 是终止性的（refresh 已被轮换消耗或吊销）——交由上层判 relogin
+      const terminal = /invalid_grant|invalid_client|expired/i.test(String(r.message || ""));
+      return { ok: false, terminal, message: r.message };
+    }
+    return { ok: true, token: r.token, refreshToken: r.refreshToken, expiresAt: r.expiresAt, rotated: r.rotated };
+  },
+};
+
+/** ModelScope 续期实现注入点（避免 adapters ↔ discovery 循环依赖，见 refreshToken 注释） */
+let modelScopeRefreshImpl = null;
+function setModelScopeRefresh(fn) {
+  modelScopeRefreshImpl = typeof fn === "function" ? fn : null;
+}
+
+const lobster = {
+  id: "lobster",
+
+  cfg() {
+    return rules.get("headers.json").lobster;
+  },
+
+  /** 授权/刷新/积分等控制面头（无需 Bearer） */
+  authHeaders(extra) {
+    const c = this.cfg();
+    return {
+      "content-type": "application/json",
+      accept: "application/json",
+      "user-agent": `${c.clientName || "LobsterAI"}/${this.version()}`,
+      ...(extra || {}),
+    };
+  },
+
+  /** 对话头：Bearer + 客户端能力/版本头（官方客户端实测值） */
+  chatHeaders(token, version) {
+    const c = this.cfg();
+    const ver = version || this.version();
+    return {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "text/event-stream, application/json",
+      "user-agent": `${c.clientName || "LobsterAI"}/${ver}`,
+      "X-LobsterAI-Client-Capabilities": c.clientCapabilities || "kimi-k3-agentic-v1",
+      "X-LobsterAI-Client-Version": ver,
+    };
+  },
+
+  /** 当前客户端版本号：优先官方更新接口（缓存 1h），失败回落配置常量。
+   *  签到活动按版本门禁——低于 2026.9.4 会被服务端隐藏（实测 0.1.0 → slotState=empty） */
+  version() {
+    const c = this.cfg();
+    const now = Date.now();
+    if (lobsterVersionCache.val && now - lobsterVersionCache.at < 3600000) return lobsterVersionCache.val;
+    if (lobsterVersionCache.failedAt && now - lobsterVersionCache.failedAt < 600000) {
+      return lobsterVersionCache.val || c.clientVersion || LOBSTER_UA_FALLBACK;
+    }
+    return lobsterVersionCache.val || c.clientVersion || LOBSTER_UA_FALLBACK;
+  },
+
+  /** 异步刷新版本号（签到/拉目录前调用，拿不到就用缓存/兜底） */
+  async refreshVersion() {
+    const c = this.cfg();
+    const now = Date.now();
+    if (lobsterVersionCache.val && now - lobsterVersionCache.at < 3600000) return lobsterVersionCache.val;
+    const fallback = c.clientVersion || LOBSTER_UA_FALLBACK;
+    const r = await httpJson(c.versionUrl, { method: "GET", headers: { accept: "application/json" } }).catch(() => null);
+    const v = r && r.ok && r.data && r.data.data && r.data.data.value && r.data.data.value.version;
+    if (v && /^\d{4}\.\d+/.test(String(v))) {
+      lobsterVersionCache = { val: String(v), at: now, failedAt: 0 };
+      return String(v);
+    }
+    lobsterVersionCache = { val: lobsterVersionCache.val || fallback, at: 0, failedAt: now };
+    return lobsterVersionCache.val;
+  },
+
+  models() {
+    return unionIds([...catalogMap("lobster").values()].map((m) => String(m.id)), []);
+  },
+
+  /** 模型名归一：龙虾模型 id 与 OpenAI 同名直传；容忍下划线变体 */
+  mapModel(model) {
+    const m = String(model || "");
+    const catalog = catalogMap("lobster");
+    if (catalog.has(m.toLowerCase())) return catalog.get(m.toLowerCase()).id;
+    const norm = m.toLowerCase().replace(/_/g, "-");
+    for (const [k, v] of catalog) {
+      if (k.replace(/_/g, "-") === norm) return String(v.id);
+    }
+    return m;
+  },
+
+  /** 拉取官方模型目录：优先 GET /api/models/available（Bearer，含账号可见范围），
+   *  Bearer 目录不可用（未登录/凭证失效/上游异常）时回退**公开** GET /api/models/pricing-catalog
+   *  ——官方文档 2026-08-27-more-models.md 标注其 remains public，实测无需鉴权，含完整
+   *  modelId/contextWindow/supportsImage/supportsThinking/costMultiplier。两者都失败才报错。
+   *  返回 {code,data:[{modelId,modelName,provider,apiFormat,supportsImage,supportsThinking,
+   *  contextWindow,explicitContextCache,thinkingConfig}]}（字段实证自官方开源仓库
+   *  docs/server-integration/2026-06-24-explicit-context-cache-models.md 与
+   *  specs/features/model-thinking-level-control） */
+  async fetchModels(account, secrets) {
+    let r = await this.fetchModelsOnce(account, secrets);
+    if (r.authError) {
+      const rr = await refreshTokenLocked(this.id, account, secrets).catch(() => ({ ok: false }));
+      if (rr.ok) {
+        if (account && account.id) {
+          store.updateAccount(account.id, { token: rr.token, refreshToken: rr.refreshToken, status: "online", coolUntil: 0, coolReason: "" });
+        }
+        r = await this.fetchModelsOnce(account, { token: rr.token, refreshToken: rr.refreshToken });
+      }
+    }
+    if (r.ok) return r;
+    // Bearer 目录拉不动时不直接判失败：公开定价目录仍能给出完整清单与真实元数据
+    // （入口 IPC 要求号池有 online 账号；凭证失效但账号仍在池里时，这个兜底让目录照样能刷新）
+    const pub = await this.fetchModelsPublic(account).catch(() => ({ ok: false }));
+    if (pub.ok) return pub;
+    return r.authError ? { ok: false, message: "账号登录态失效（401），请重新登录" } : r;
+  },
+
+  /** 公开定价目录（无需鉴权，权威兜底源）：{data:{textModels:[{modelId,modelName,contextWindow,
+   *  supportsImage,supportsThinking,costMultiplier,freeAccess,...}]}}（另有 imageModels/videoModels，
+   *  非文本对话、本渠道不接入） */
+  async fetchModelsPublic() {
+    const c = this.cfg();
+    if (!c.pricingCatalogUrl) return { ok: false, message: "未配置公开目录端点" };
+    const r = await httpJson(c.pricingCatalogUrl, { method: "GET", headers: { accept: "application/json" } }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    const list = (r.data && r.data.data && Array.isArray(r.data.data.textModels) && r.data.data.textModels) || null;
+    if (!r.ok || !list || !list.length) return { ok: false, message: `公开目录拉取失败（HTTP ${r.status || 0}）` };
+    const models = [];
+    for (const raw of list) {
+      const id = raw && raw.modelId;
+      if (typeof id !== "string" || !id) continue;
+      const img = typeof raw.supportsImage === "boolean" ? raw.supportsImage : undefined;
+      const think = typeof raw.supportsThinking === "boolean" ? raw.supportsThinking : undefined;
+      const rate = Number(raw.costMultiplier);
+      models.push({
+        id,
+        name: String(raw.modelName || id),
+        rate: Number.isFinite(rate) ? rate : null,
+        capabilities: capsWithImages(img, { reasoning: think !== false, tools: true }),
+        contextLength: tokenLimit(raw.contextWindow),
+        maxOutputTokens: tokenLimit(raw.maxOutputTokens),
+      });
+    }
+    if (!models.length) return { ok: false, message: "公开目录为空或无可对话模型" };
+    return { ok: true, models };
+  },
+
+  async fetchModelsOnce(account, secrets) {
+    const c = this.cfg();
+    const headers = this.chatHeaders(secrets.token);
+    const r = await httpJson(c.modelsUrl, { method: "GET", headers }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    if (r.status === 401 || r.status === 403) return { ok: false, authError: true, message: "登录态已过期（HTTP 401）" };
+    const code = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+    const list = (r.data && Array.isArray(r.data.data) && r.data.data) || findList(r.data, "data", 0);
+    if (!r.ok || code !== 0 || !Array.isArray(list) || !list.length) {
+      return { ok: false, message: `目录拉取失败（HTTP ${r.status || 0}${r.data && r.data.message ? " " + r.data.message : ""}）` };
+    }
+    const models = [];
+    for (const raw of list) {
+      const id = raw && (raw.modelId || raw.model_id || raw.id);
+      if (typeof id !== "string" || !id) continue;
+      const name = String(raw.modelName || raw.model_name || id);
+      // 能力位优先取服务端显式声明（supportsImage/supportsThinking），缺失才嗅探。
+      // 绝不编造：sniffImages 无信号时返回 undefined（=未声明），capsWithImages 会省略该键
+      const imgDeclared = typeof raw.supportsImage === "boolean" ? raw.supportsImage : undefined;
+      const thinkDeclared = typeof raw.supportsThinking === "boolean" ? raw.supportsThinking : undefined;
+      const img = imgDeclared !== undefined ? imgDeclared : (sniffImages(raw) ?? (/v-turbo|vision|-vl\b/i.test(id) ? true : undefined));
+      models.push({
+        id,
+        name,
+        rate: null,
+        capabilities: capsWithImages(img, { reasoning: thinkDeclared !== false, tools: true }),
+        // contextWindow 缺失一律 0（未知）——官方对 null 值由客户端回落 OpenClaw 默认 200k，
+        // 但本仓库约定「模型上限类字段绝不给编造的默认值」（假值会让客户端误判上下文溢出）
+        contextLength: tokenLimit(raw.contextWindow ?? raw.context_length ?? raw.contextLength),
+        maxOutputTokens: tokenLimit(raw.maxOutputTokens || raw.max_tokens),
+      });
+    }
+    if (!models.length) return { ok: false, message: "目录为空或无可对话模型" };
+    return { ok: true, models };
+  },
+
+  /** OpenAI body → lobster 改写：强制 stream=true（上游只支持流式）、归一 tool_choice、
+   *  剥离 AgentHub 注入的内部字段 */
+  rewriteBody(model, body) {
+    const out = { ...(body || {}) };
+    out.model = this.mapModel(model);
+    // 上游只支持流式（实测 stream:false → 500），必须强制开启
+    out.stream = true;
+    if (!out.stream_options || typeof out.stream_options !== "object") out.stream_options = {};
+    out.stream_options.include_usage = true;
+    // tool_choice 归一：空串/none/null 一律删除（上游不接受）
+    if ("tool_choice" in out) {
+      const tc = out.tool_choice;
+      if (tc == null || tc === "" || tc === "none") delete out.tool_choice;
+    }
+    delete out.conversation_id;
+    delete out.conversationId;
+    delete out.prompt_cache_key;
+    return out;
+  },
+
+  /** 对话主流程：原生 OpenAI SSE 透传。
+   *  ⚠ 龙虾会把部分业务错误（额度不足等）藏在 HTTP 200 的 SSE 流首（event:error 帧），
+   *  若不窥探会表现为「空内容的正常响应」穿透到客户端 → 必须识别并按错误处理 */
+  async chat({ account, secrets, model, body, emit, meta }) {
+    const c = this.cfg();
+    const payload = JSON.stringify(this.rewriteBody(model, body));
+    const headers = this.chatHeaders(secrets.token);
+    const { resp, cancelTimer } = await fetchStream(c.chatUrl, { method: "POST", headers, body: payload, firstByteMs: firstByteBudgetMs(payload) });
+    const result = { status: 200, planLimit: false };
+    // MiniMax 系把思考链塞在 content 里（<think>…</think>）→ 按帧状态机抽成 reasoning_content。
+    // 状态必须每次 chat() 新建（跨帧共享，但绝不跨请求残留）
+    const thinkSplit = createThinkSplitter();
+    let settled = false;
+    try {
+      await pumpSse(resp, (event, raw) => {
+        if (!settled) {
+          settled = true;
+          cancelTimer();
+        }
+        // 流内错误帧（event:error 或 data 里带 error 对象）
+        if (event === "error") {
+          const d = parseJson(raw);
+          const msg = String((d && (d.message || (d.error && d.error.message))) || raw || "上游返回错误帧").slice(0, 300);
+          const isQuota = /insufficient|credit|quota|balance|积分|余额|欠费|40201/i.test(msg);
+          if (isQuota) result.planLimit = true;
+          emit({ type: "error", status: isQuota ? 402 : 502, code: (d && d.code) || 0, message: msg });
+          return;
+        }
+        if (raw === "[DONE]") { emit({ type: "finish", reason: "" }); return; }
+        const data = parseJson(raw);
+        // 非对象帧一律丢弃：上游可能夹字面量 null / 数组 / 裸字符串（Qoder 渠道实证过
+        // body:"null" 帧——JSON.parse 得 null 后访问 .choices 抛 TypeError，整条流以
+        // 内部异常中断，用户看到 "Cannot read properties of null"）。`!data` 只挡 falsy，
+        // 故这里显式判类型，覆盖 [] / "abc" / 123 这类 truthy 非对象值
+        if (!data || typeof data !== "object" || Array.isArray(data)) return;
+        const errObj = data.error || null;
+        const codeNum = Number((errObj && errObj.code) ?? (data.choices ? 0 : data.code)) || 0;
+        const msgStr = String((errObj && errObj.message) || data.message || "");
+        if (errObj || (codeNum && codeNum !== 0 && codeNum !== 200)) {
+          const isQuota = codeNum === 40201 || /insufficient|credit|quota|balance|积分|余额|欠费/i.test(msgStr);
+          const status = isQuota ? 402 : codeNum === 401 ? 401 : codeNum === 429 ? 429 : 502;
+          if (isQuota) result.planLimit = true;
+          emit({ type: "error", status, code: codeNum, message: msgStr || `上游错误 ${codeNum}` });
+          return;
+        }
+        const choice = Array.isArray(data.choices) && data.choices[0];
+        if (choice) {
+          const d = choice.delta || choice.message;
+          if (d && Object.keys(d).length) {
+            // MiniMax 系（M3 / M3.1）把思考链以 `<think>…</think>` 文本塞在 content 里，
+            // 而不是像 GLM / DeepSeek 那样用独立的 reasoning_content 字段（实测三例对照）。
+            // 通用层 server.cjs 只认 reasoning_content，若不在此归一，思考链会被当正文
+            // 原样透传给客户端（用户看到一堆 "<think>The user simply…"）。
+            // 归一方式：把 content 里的 think 段抽出来改挂 reasoning_content，与其它模型对齐。
+            const norm = splitThinkDelta(thinkSplit, d);
+            if (norm.reasoning) emit({ type: "delta", delta: { reasoning_content: norm.reasoning } });
+            if (norm.rest && Object.keys(norm.rest).length) emit({ type: "delta", delta: norm.rest });
+          }
+          if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+        }
+        if (data.usage) {
+          emit({
+            type: "usage",
+            usage: {
+              ...data.usage,
+              prompt_tokens: Number(data.usage.prompt_tokens ?? data.usage.input_tokens) || 0,
+              completion_tokens: Number(data.usage.completion_tokens ?? data.usage.output_tokens) || 0,
+              total_tokens: Number(data.usage.total_tokens) || 0,
+            },
+          });
+        }
+      });
+    } finally {
+      cancelTimer();
+    }
+    return result;
+  },
+
+  /** 积分余额：GET /api/user/profile-summary → data.totalCreditsRemaining（含活动积分） */
+  async queryCredits(account, secrets) {
+    const c = this.cfg();
+    const headers = this.chatHeaders(secrets.token);
+    const r = await httpJson(c.balanceUrl, { method: "GET", headers }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    if (r.status === 401 || r.status === 403) return { authError: true };
+    const code = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+    if (!r.ok || !r.data || code !== 0) {
+      throw new Error(`额度查询失败：HTTP ${r.status}${r.data && r.data.message ? " " + r.data.message : ""}${r.message ? " " + r.message : ""}`);
+    }
+    const d = r.data.data || r.data;
+    const credits = Number(d.totalCreditsRemaining ?? d.total_credits_remaining ?? d.remainingCredits) || 0;
+    return { credits, raw: d };
+  },
+
+  /** 签到状态：读活动 context 的 claimedToday（不消费签到动作） */
+  async checkinStatus(account, secrets) {
+    try {
+      const c = this.cfg();
+      const version = await this.refreshVersion();
+      const slot = await this.fetchSlot(secrets, version);
+      if (!slot.ok) return { ok: false, message: slot.message };
+      if (!slot.activity) return { ok: true, unavailable: true, checkedIn: false, message: "当前没有可参与的签到活动（活动按客户端版本下发）" };
+      const ctx = await this.fetchContext(secrets, slot.activity.activityCode, slot.activity.configRevision, version);
+      if (!ctx.ok) return { ok: false, message: ctx.message };
+      const claimed = !!(ctx.state && ctx.state.claimedToday);
+      return {
+        ok: true,
+        checkedIn: claimed,
+        already: claimed,
+        reward: Number(ctx.state && ctx.state.rewardCredits) || 0,
+        message: claimed ? "今日已签到" : `今日未签到（可得 ${Number(ctx.state && ctx.state.rewardCredits) || 0} 积分）`,
+      };
+    } catch (e) {
+      return { ok: false, message: String((e && e.message) || e) };
+    }
+  },
+
+  /** 活动槽：GET /api/client-activities/slot?placement=…&clientVersion=… */
+  async fetchSlot(secrets, version) {
+    const c = this.cfg();
+    const u = `${c.activitySlotUrl}?placement=${encodeURIComponent(c.checkinPlacement || "desktop_sidebar")}&clientVersion=${encodeURIComponent(version)}&containerApiVersion=2&platform=win32`;
+    const r = await httpJson(u, { method: "GET", headers: this.authHeaders({ authorization: `Bearer ${secrets.token}` }) }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    if (r.status === 401 || r.status === 403) return { ok: false, authError: true, message: "凭证失效，请重新登录" };
+    const code = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+    if (!r.ok || code !== 0 || !r.data) return { ok: false, message: (r.data && r.data.message) || r.message || `活动查询失败 HTTP ${r.status}` };
+    const d = r.data.data || {};
+    // slotState=empty 表示该版本号看不到活动（不是错误，如实提示）
+    if (d.slotState !== "available" || !d.activity) return { ok: true, activity: null, slotState: d.slotState || "" };
+    return { ok: true, activity: d.activity };
+  },
+
+  /** 活动状态：GET /api/client-activities/{code}/context?configRevision=N */
+  async fetchContext(secrets, code, revision, version) {
+    const c = this.cfg();
+    const u = `${c.activityBaseUrl}/${encodeURIComponent(code)}/context?configRevision=${Number(revision) || 1}`;
+    const r = await httpJson(u, { method: "GET", headers: this.authHeaders({ authorization: `Bearer ${secrets.token}` }) }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    if (r.status === 401 || r.status === 403) return { ok: false, authError: true, message: "凭证失效，请重新登录" };
+    const code0 = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+    if (!r.ok || code0 !== 0 || !r.data) return { ok: false, message: (r.data && r.data.message) || r.message || `活动状态查询失败 HTTP ${r.status}` };
+    const d = r.data.data || {};
+    return { ok: true, state: d.state || {}, actions: Array.isArray(d.actions) ? d.actions : [], authenticated: !!d.authenticated };
+  },
+
+  /** 每日签到：slot → context → POST actions/check_in → 复核 claimedToday。
+   *  幂等：已签到 / 无活动 都返回 ok（不算失败），不会重复领取（服务端另有 idempotencyKey 兜底） */
+  async checkin(account, secrets) {
+    const c = this.cfg();
+    const version = await this.refreshVersion();
+    const slot = await this.fetchSlot(secrets, version);
+    if (!slot.ok) return { ok: false, message: slot.message };
+    if (!slot.activity) {
+      // 版本门禁（服务端按 clientVersion 下发活动）：属「不开放」而非失败——照 trae 的
+      // 同款约定返回 ok:true + unavailable，号池页才会显示「不开放」而不是红色「失败」
+      // （checkinTagText 对 ok:false 一律判失败，unavailable 分支根本走不到）
+      return { ok: true, unavailable: true, claimed: false, message: `当前版本看不到签到活动（slotState=${slot.slotState || "empty"}）——已自动取线上版本号，仍为空请稍后重试` };
+    }
+    const { activityCode: code, configRevision: rev } = slot.activity;
+    const ctx = await this.fetchContext(secrets, code, rev, version);
+    if (!ctx.ok) return { ok: false, message: ctx.message };
+    const reward = Number(ctx.state && ctx.state.rewardCredits) || 0;
+    if (ctx.state && ctx.state.claimedToday) {
+      return { ok: true, already: true, claimed: false, reward, message: "今日已签到" };
+    }
+    if (!ctx.actions.includes("check_in")) {
+      return { ok: false, message: `活动不可签到（actions=${JSON.stringify(ctx.actions)}）` };
+    }
+    const body = JSON.stringify({ configRevision: Number(rev) || 1, idempotencyKey: util.uuid(), payload: {} });
+    const actionUrl = `${c.activityBaseUrl}/${encodeURIComponent(code)}/actions/check_in`;
+    const r = await httpJson(actionUrl, { method: "POST", headers: this.authHeaders({ authorization: `Bearer ${secrets.token}` }), body }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    if (r.status === 401 || r.status === 403) return { ok: false, message: "凭证失效，请重新登录" };
+    const codeN = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+    if (!r.ok || codeN !== 0) {
+      return { ok: false, message: (r.data && r.data.message) || r.message || `签到失败 HTTP ${r.status}` };
+    }
+    // 复核：只有 claimedToday 真的翻转才算成功（防"接口成功但没发分"）
+    const after = await this.fetchContext(secrets, code, rev, version);
+    if (after.ok && after.state && !after.state.claimedToday) {
+      return { ok: false, message: "签到接口已返回成功，但服务端 claimedToday 未翻转，请稍后在客户端确认" };
+    }
+    const got = Number(after.ok && after.state && after.state.claimedCredits) || 0;
+    return { ok: true, already: false, claimed: true, reward: reward || got, message: reward ? `签到成功，+${reward} 积分` : "签到成功" };
+  },
+
+  /** 龙虾无"加油包"免费领取动作 */
+  async trial() {
+    return { ok: false, message: "LobsterAI 无加油包领取动作" };
+  },
+
+  /** Token 刷新：POST /api/auth/refresh（body 含 refreshToken + keyfrom 载荷，无需 Bearer）。
+   *  参考实现口径：响应 accessToken 缺失即视为 refresh 被拒（终止性，需重新登录） */
+  async refreshToken(account, secrets) {
+    const c = this.cfg();
+    const refreshToken = (secrets && secrets.refreshToken) || "";
+    if (!refreshToken) return { ok: false, message: "无 refreshToken，请重新登录" };
+    const meta = (account && account.meta) || {};
+    const body = JSON.stringify({
+      refreshToken,
+      firstKeyfrom: String(meta.firstKeyfrom || ""),
+      latestKeyfrom: String(Date.now()),
+      version: "0.1.0",
+      ...(meta.uuid ? { uuid: String(meta.uuid) } : {}),
+      ...(meta.youdaoUserId ? { userId: String(meta.youdaoUserId) } : {}),
+    });
+    const r = await httpJson(c.refreshUrl, { method: "POST", headers: this.authHeaders(), body }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
+    const d = (r.data && (r.data.data || r.data)) || null;
+    const code = Number((r.data && r.data.code) ?? (r.ok ? 0 : -1));
+    const token = d && (d.accessToken || d.access_token);
+    if (r.ok && code === 0 && token) {
+      const nextRefresh = (d.refreshToken || d.refresh_token) ? String(d.refreshToken || d.refresh_token) : refreshToken;
+      const expiresIn = Number(d.expiresIn || d.expires_in) || 0;
+      return {
+        ok: true,
+        token: String(token),
+        refreshToken: nextRefresh,
+        expiresAt: expiresIn > 0 ? Date.now() + expiresIn * 1000 : (util.jwtDecode(String(token)).exp || 0) * 1000,
+      };
+    }
+    if (r.status === 401 || r.status === 403 || code === 401 || code === 40100 || code === 40101) {
+      return { ok: false, expired: true, message: "登录态已过期，请重新登录" };
+    }
+    return { ok: false, message: (r.data && (r.data.message || r.data.msg)) || r.message || `刷新失败 HTTP ${r.status}` };
+  },
+
+  /** 用户信息（导入后补全 uid/昵称）：GET /api/user/profile-summary */
+  async userInfo(token, account) {
+    const c = this.cfg();
+    const r = await httpJson(c.balanceUrl, { method: "GET", headers: this.chatHeaders(token) }).catch(() => ({ ok: false, status: 0, data: null }));
+    const d = r.data && (r.data.data || r.data);
+    if (r.ok && d) {
+      return {
+        uid: String(d.uid || d.userId || d.user_id || d.id || ""),
+        name: String(d.nickname || d.name || d.phone || ""),
+      };
+    }
+    // 兜底：从 JWT 解 uid
+    const dec = util.jwtDecode(token);
+    return { uid: String(dec.uid || dec.sub || ""), name: "" };
   },
 };
 
@@ -2529,7 +3851,14 @@ const zcode = {
           session_id: cleanSessionId,
         }),
       };
-      const bridge = zcodeAnthropic.createSseBridge(emit);
+      // 产出追踪：包一层 emit 观察 bridge 是否产出过「客户端可消费」的内容（正文/思考/工具调用）。
+      // 只观察不改写——判定见下方空流判定；判据与 server.cjs 的 sentDelta 同源（hasConsumableDelta），
+      // 因此只有 metadata/timing/usage 帧、或 message_start+message_stop 空内容的响应会被识别。
+      let zcProduced = false;
+      const bridge = zcodeAnthropic.createSseBridge((ev) => {
+        if (ev && ev.type === "delta" && util.hasConsumableDelta(ev.delta)) zcProduced = true;
+        emit(ev);
+      });
       const result = { status: 200, planLimit: false };
       const payloadText = JSON.stringify(payload);
       let respPair;
@@ -2566,6 +3895,28 @@ const zcode = {
         respPair.cancelTimer();
       }
       if (bridge.result.planLimit) result.planLimit = true;
+      // 空流判定（issue #73）：两种形态都算失败——
+      //   ① 上游接受了请求（HTTP 200）却一个 SSE 事件都没发（zcSettled=false）；
+      //   ② 有事件但没产出任何可用内容（zcProduced=false，如只有 metadata/usage 帧，
+      //      或 message_start+message_stop 空内容）。
+      // 此前两种都照样 return result（status:200/planLimit:false），于是 server.cjs 记为 200 成功
+      // （0 token）→ applyCool 从不调用 → 账号不冷却、serverFails 不递增 → 号池每轮仍选中它
+      // （credits 是旧缓存，跳过条件不成立）→ 死磕一个号。
+      // 抛错后归入 classifyUpstream 的 server 类（502），noteServerError 连续 3 次熔断才真正生效。
+      // 注意：判定用「收到过任意帧」+「产出过可消费内容」双条件，正常只发 metadata 帧的上游不受影响。
+      // ⚠ 必须让位于「上游已明确报错」：
+      //   · planLimit：额度耗尽 → coolAccount("credit") → exhausted 到次日 04:00（强于服务端异常）；
+      //   · sawError（bridge.result 已提供）：上游已给出具体错误事件 → 必须交由 classifyUpstream
+      //     按其 code 分类（如 4001 模型配置为空属 model_config，**不罚号**）。若被空流判定抢先抛
+      //     502，这类「有 error 事件但无正文」的响应会被误归为 server 类而罚号。
+      if (!result.planLimit && !bridge.result.sawError && (!zcSettled || !zcProduced)) {
+        throw Object.assign(new Error(zcSettled
+          ? "上游返回了事件但没有任何可用内容（空响应，通常为余额耗尽/账号被限）"
+          : "上游接受了请求但未返回任何事件（空流，通常为余额耗尽/账号被限）"), {
+          status: 502,
+          emptyStream: true,
+        });
+      }
       return result;
     };
 
@@ -2859,7 +4210,48 @@ const zcode = {
   },
 };
 
-const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, zcode };
+// ===== 适配器契约（新增/维护渠道必读）=====
+// 必需方法（缺失在启动期就报错，绝不留到运行期 "ad.chat is not a function"）：
+//   cfg()           渠道配置（rules/headers.json 等，含网关地址）
+//   models()        静态兜底模型清单（string[]，可为空数组——清单来自拉取目录时）
+//   chat(ctx)       对话转发：{ account, secrets, model, body, emit, meta }，事件经 emit 回流
+//   queryCredits()  余额查询：(account, secrets) → { credits, expiresAt }
+// 推荐方法（现有 9 渠道全有；缺省时调用点各自守卫/降级）：
+//   fetchModels / checkin / checkinStatus / refreshToken
+// 可选方法（调用点均有 typeof 守卫或降级分支）：
+//   trial / userInfo / mapModel / rewriteBody / solveCaptcha / claimOnboarding /
+//   fetchModelsPublic / fetchModelsOnce / chatOnce …
+// 可选扩展点：
+//   stateful() + chatSession(ctx)  会话式转发：一次客户端请求 = 多个上游请求 + 协议翻译时声明
+//     stateful() 返回 true，server 改走 chatSession（ctx 同 chat，不再走单发 chat）；缺省单发。
+//   classifyError(e)  渠道私有业务码分类：返回 { kind, switchable, status } 走渠道级分类，
+//     返回 null/undefined 走通用 classifyUpstream。注意 4008/11102 等码**跨渠道共用**
+//     （trae/workbuddy/qoder 都会回），不要把它们搬进单个渠道的 classifyError。
+// 命名约定：请求头方法统一 headers()。新增渠道步骤：
+//   ① store.cjs 的 CHANNELS 加一行（含 display/domain/costTier）
+//   ② 本文件实现适配器并挂到 ADAPTERS（必需方法缺失启动期即抛错）
+//   ③ rules/headers.json 等规则文件加渠道配置
+//   ④ 前端 format.ts 补 CHANNEL_NAMES / checkinLabels / balanceUnit 等展示文案
+//   ⑤ tools/ 自测补注册断言（双表一致性由 consistencyReport 兜底，漏挂即自测失败）
+const REQUIRED_ADAPTER_METHODS = ["cfg", "models", "chat", "queryCredits"];
+
+/** 契约断言：必需方法缺失即抛错（启动期 fail-fast，而非运行期 TypeError） */
+function assertAdapterContract(channel, ad) {
+  for (const m of REQUIRED_ADAPTER_METHODS) {
+    if (typeof (ad && ad[m]) !== "function") {
+      throw new Error(`渠道 ${channel} 缺少必需的适配器方法 ${m}()（契约见 adapters.cjs 顶部注释块）`);
+    }
+  }
+}
+
+const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, modelscope, lobster, zcode };
+
+// ===== CatPaw（美团）=====
+// 上游是**有状态会话协议**（round → event(running) → turn(SSE) → 工具循环 → event(completed)），
+// 一个客户端请求会变成多个上游请求 + 协议翻译，故声明 stateful() 走 chatSession 扩展点
+// （契约见本文件顶部注释块）。协议实现整体收在 catpaw/ 子目录，这里只做挂载
+const { makeCatPaw } = require("./catpaw/adapter.cjs");
+ADAPTERS.catpaw = makeCatPaw();
 
 // ===== Qoder 双区（凭据层 + WASM 签名器 + 适配器）=====
 // 与其它渠道的差异：签名是**每请求的**（wasm 驱动，见 qoderSigner.cjs），
@@ -2878,6 +4270,10 @@ ADAPTERS.qoder = qoder;
 if (store.QODER_INTL_ENABLED) {
   ADAPTERS.qoder_intl = makeQoder("qoder_intl", qoderDeps);
 }
+
+// 启动期契约校验：全员必需方法缺失在 require 阶段即抛错（fail-fast），
+// 人为删掉某个适配器的 chat() 后应用启动即崩在明面上，而不是运行期才 404/TypeError
+for (const [channel, ad] of Object.entries(ADAPTERS)) assertAdapterContract(channel, ad);
 
 function get(channel) {
   return ADAPTERS[channel] || null;
@@ -3012,29 +4408,43 @@ function mergedModels(cfg) {
 }
 
 /** 模型 → 渠道归属：返回拥有该模型的渠道列表（模型完全不存在 → 空数组） */
+/** 模型 → 渠道归属：反向映射命中的渠道**排在最前**，其后追加目录里同名 id 的渠道（去重、保序）。
+ *  反向映射只表达「这个渠道上该用哪个模型名」，不该顺手把跨渠道自救的备选集合收窄成映射里写的那几个——
+ *  原实现命中即 return，用户一旦给某模型配了反向映射，它的备选就只剩映射里的渠道（issue #78）。 */
 function modelOwners(model, cfg) {
   const c = cfg || proxyConfig();
   const rev = c.modelReverseAliases || {};
-  // 先查反向映射
+  const lower = String(model || "").toLowerCase();
+  const mapped = [];
   const directRev = rev[model];
   if (directRev && typeof directRev === "object") {
-    const owners = Object.keys(directRev).filter((ch) => ADAPTERS[ch]);
-    if (owners.length) return owners;
-  }
-  const lower = String(model || "").toLowerCase();
-  for (const [k, map] of Object.entries(rev)) {
-    if (k.toLowerCase() === lower && map && typeof map === "object") {
-      const owners = Object.keys(map).filter((ch) => ADAPTERS[ch]);
-      if (owners.length) return owners;
+    mapped.push(...Object.keys(directRev).filter((ch) => ADAPTERS[ch]));
+  } else {
+    for (const [k, map] of Object.entries(rev)) {
+      if (k.toLowerCase() === lower && map && typeof map === "object") {
+        mapped.push(...Object.keys(map).filter((ch) => ADAPTERS[ch]));
+        break;
+      }
     }
   }
-
-  const id = lower;
-  const owners = [];
-  for (const [channel, ad] of Object.entries(ADAPTERS)) {
-    if (ad.models().some((m) => String(m).toLowerCase() === id)) owners.push(channel);
+  const out = [];
+  const seen = new Set();
+  for (const ch of mapped) {
+    if (seen.has(ch)) continue;
+    seen.add(ch);
+    out.push(ch);
   }
-  return owners;
+  for (const [channel, ad] of Object.entries(ADAPTERS)) {
+    if (seen.has(channel)) continue;
+    // 关闭的渠道不算归属：单源模型也判「不可用」（resolveChannel 拿到空列表 → 400 给可用模型提示），
+    // 多源模型自动收窄到启用渠道（故障转移备选同步收窄，路由打分与备选队列全走这里）
+    if (!channelOn(channel, c)) continue;
+    if (ad.models().some((m) => String(m).toLowerCase() === lower)) {
+      seen.add(channel);
+      out.push(channel);
+    }
+  }
+  return out;
 }
 
 /** /v1/models 对外可列模型：合并视图减去 disabledModels（口径与请求路径 400 拦截一致）。
@@ -3042,13 +4452,32 @@ function modelOwners(model, cfg) {
 function listableModels(cfg) {
   const c = cfg || proxyConfig();
   const disabled = c.disabledModels || [];
-  if (!disabled.length) return mergedModels(c);
-  const off = new Set(disabled.map((s) => String(s).toLowerCase()));
-  return mergedModels(c).filter((m) => !off.has(m.id.toLowerCase()));
+  const off = new Set((disabled || []).map((s) => String(s).toLowerCase()));
+  const on = (ch) => channelOn(ch, c);
+  return mergedModels(c)
+    .filter((m) => (m.sources || []).some(on)) // 全源渠道都被关闭的模型不对外暴露（客户端不再看到）
+    .filter((m) => !off.has(m.id.toLowerCase()));
 }
 
-module.exports = { get, ADAPTERS, mergedModels, listableModels, modelOwners, httpJson, refreshTokenLocked, setPendingCaptcha, getPendingCaptcha,
-  // 供自测校验首字节预算随 prompt 规模增长（修"大 prompt 被 30s 误杀→熔断 30 分钟"）
+/** 双表一致性报告（CHANNELS ↔ ADAPTERS）：两向差集非空即自测失败（tools/proxy-smoke.cjs 断言）。
+ *  只从 CHANNELS 移除而留 ADAPTERS，会让模型被判「双区共有」并路由到无账号的渠道；
+ *  只加 ADAPTERS 不加 CHANNELS，会让渠道有适配器却不出现在任何 UI/健康检查/池同步校验里 */
+function consistencyReport() {
+  const chanIds = new Set(store.CHANNELS.map((c) => c.id));
+  const adIds = new Set(Object.keys(ADAPTERS));
+  return {
+    channelsWithoutAdapter: [...chanIds].filter((id) => !adIds.has(id)),
+    adaptersWithoutChannel: [...adIds].filter((id) => !chanIds.has(id)),
+  };
+}
+
+module.exports = { get, ADAPTERS, mergedModels, listableModels, modelOwners, channelOn, httpJson, refreshTokenLocked, setPendingCaptcha, getPendingCaptcha,
+  // 适配器契约（启动期校验 + 自测复验用）
+  REQUIRED_ADAPTER_METHODS, assertAdapterContract, consistencyReport,
+  // ModelScope 续期实现注入（避免 adapters ↔ discovery 循环依赖；由 index.cjs 启动时注入）
+  setModelScopeRefresh,
+  // 供自测校验 LobsterAI 的 <think> 思考链归一（MiniMax 系把思考塞在 content 里）
+  __lobsterThink: { createThinkSplitter, splitThinkDelta },  // 供自测校验首字节预算随 prompt 规模增长（修"大 prompt 被 30s 误杀→熔断 30 分钟"）
   firstByteBudgetMs, estimateInputTokens, FIRST_BYTE_MS, FIRST_BYTE_MAX_MS,
   // 供自测校验模态识别（通用嗅探 / 能力合并 OR 语义）
   sniffImages, mergeCapabilities,

@@ -8,8 +8,11 @@ import * as api from "../../api/ipc";
 import type { ProxyModel, ProxyRuleFile } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { fmtAgo, fmtK } from "../../views/proxy/format";
+import ProxyUpstreamDialog from "../ProxyUpstreamDialog.vue";
 
 const app = useAppStore();
+// 上游启闭弹窗（渠道级开关：关闭的渠道在反代网关全部页面动态隐藏，重新打开立即恢复）
+const upOpen = ref(false);
 // 页面内的二级子板块：服务与路由 / 监控与安全 / 规则文件
 const tab = ref<"service" | "monitor" | "rules">("service");
 const rules = ref<ProxyRuleFile[]>([]);
@@ -29,11 +32,18 @@ function gotoTiming() {
   app.settingsOpen = true;
 }
 
-/** 当前周期状态摘要（引导行里给用户看现状） */
+/** 当前周期状态摘要（引导行里给用户看现状）：自动签到按渠道开，这里汇总已开启的渠道数 */
+const autoCheckinChannels = computed(() =>
+  Object.values(app.config.proxy.checkinAutoRules || {}).filter((r) => r && r.enabled).length
+);
 const proxyTimingSummary = computed(() =>
   [
     `额度每 ${app.config.proxy.creditsRefreshMin} 分钟刷新`,
-    app.config.proxy.checkinAuto ? `签到 ${app.config.proxy.checkinAutoTime}` : "定时签到关",
+    !app.config.proxy.checkinAuto || (!autoCheckinChannels.value && app.config.proxy.checkinAutoTime === "")
+      ? "自动签到关"
+      : autoCheckinChannels.value
+        ? `自动签到 ${autoCheckinChannels.value} 个渠道`
+        : `签到 ${app.config.proxy.checkinAutoTime}`,
     app.config.proxy.growthTravelAuto || app.config.proxy.growthCatAuto || app.config.proxy.growthActivityAuto || app.config.proxy.growthSchoolAuto ? "积分任务开" : "积分任务关",
   ].join(" · "),
 );
@@ -129,6 +139,7 @@ function openDataDir() {
       </div>
       <div class="cfg-sec-actions">
         <span v-if="msg" class="tag" :class="msgErr ? 'tag-err' : 'tag-ok'">{{ msg }}</span>
+        <button class="btn btn-ghost" @click="upOpen = true"><i class="ph ph-plugs-connected"></i>上游启闭</button>
         <button class="btn btn-cta" :disabled="saving" @click="save">{{ saving ? "保存中…" : "保存并重启服务" }}</button>
       </div>
     </div>
@@ -192,6 +203,16 @@ function openDataDir() {
           <div class="set-info"><div class="set-name">优先渠道</div></div>
           <el-select v-model="app.config.proxy.fixedChannel" class="f-el-select" popper-class="glass-popper" style="width: 208px">
             <el-option v-for="c in channels" :key="c.id" :value="c.id" :label="c.display" />
+          </el-select>
+        </div>
+        <div class="set-row">
+          <div class="set-info">
+            <div class="set-name">渠道优先顺序</div>
+            <div class="set-desc">智能打分 = 按健康度 × 余额排序（默认）；免费优先 = 魔搭等免费/低成本渠道的额度优先消耗，不可用（耗尽/降级）时自动落付费渠道，恢复后自动回切。免费额度每日限量，耗尽属正常现象；Key 上可单独覆盖</div>
+          </div>
+          <el-select v-model="app.config.proxy.routeOrder" class="f-el-select" popper-class="glass-popper" style="width: 208px">
+            <el-option value="score" label="智能打分（默认）" />
+            <el-option value="cost-first" label="免费 / 低成本优先" />
           </el-select>
         </div>
         <div class="set-row">
@@ -322,5 +343,8 @@ function openDataDir() {
         </table>
       </div>
     </div>
+
+    <!-- 上游启闭弹窗（渠道级开关）：关闭的渠道在反代网关全部页面动态隐藏，重新打开立即恢复 -->
+    <ProxyUpstreamDialog :open="upOpen" @close="upOpen = false" />
   </div>
 </template>

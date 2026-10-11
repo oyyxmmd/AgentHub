@@ -44,28 +44,17 @@ export function fmtAgo(ts: number): string {
 }
 
 /**
- * 格式化 Token 数量：
- * 智谱不是积分，是 Token，支持换算单位百万、千万、亿，保留合理小数位并去除末尾零。
+ * 大数中文数量级：万 / 百万 / 千万 / 亿 / 百亿，换算档固定保留两位小数。
+ * 渠道额度共用一套换算（积分与 Token 同规）；不足 1 万保持千分位整数。
  */
-export function fmtToken(n: number): string {
+export function fmtCnAmount(n: number): string {
   const v = Number(n) || 0;
   if (v <= 0) return "0";
-  if (v >= 1e8) {
-    const s = (v / 1e8).toFixed(2).replace(/\.?0+$/, "");
-    return `${s} 亿`;
-  }
-  if (v >= 1e7) {
-    const s = (v / 1e7).toFixed(2).replace(/\.?0+$/, "");
-    return `${s} 千万`;
-  }
-  if (v >= 1e6) {
-    const s = (v / 1e6).toFixed(2).replace(/\.?0+$/, "");
-    return `${s} 百万`;
-  }
-  if (v >= 1e4) {
-    const s = (v / 1e4).toFixed(1).replace(/\.?0+$/, "");
-    return `${s} 万`;
-  }
+  if (v >= 1e10) return (v / 1e10).toFixed(2) + " 百亿";
+  if (v >= 1e8) return (v / 1e8).toFixed(2) + " 亿";
+  if (v >= 1e7) return (v / 1e7).toFixed(2) + " 千万";
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + " 百万";
+  if (v >= 1e4) return (v / 1e4).toFixed(2) + " 万";
   return fmtInt(v);
 }
 
@@ -84,15 +73,12 @@ export function fmtCredits(n: number): string {
 /** Qoder 双区共用一套展示口径（Credits 浮点 + 领 Credits 动作），判断收敛到一处 */
 export const isQoderChannel = (id?: string): boolean => id === "qoder" || id === "qoder_intl";
 
-/** 渠道余额格式化（针对智谱输出换算后的 Token，其他渠道输出积分） */
+/** 渠道余额格式化（智谱是 Token 不是积分，同走中文数量级换算；Qoder 保持浮点 Credits） */
 export function fmtBalance(val: number, channel?: string): string {
   if (val === -1) return "不限";
-  if (channel === "zcode") {
-    return fmtToken(val);
-  }
   // Qoder 的 credits 是浮点（实测 0.0066 级精度），整数化会丢计量
   if (isQoderChannel(channel)) return fmtCredits(val);
-  return fmtInt(val);
+  return fmtCnAmount(val);
 }
 
 /** 渠道余额单位标签 */
@@ -102,13 +88,63 @@ export function balanceUnit(channel?: string): string {
   return "积分";
 }
 
+/** 本地时区的今天（YYYY-MM-DD）：与主进程 store.dayStr 同口径，签到记录的跨天判定用 */
+export function todayStr(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/**
+ * 签到动作的渠道化文案：各渠道"领取"形态不同（加油包/Credits 一次性领取、zcode 领奖励、
+ * 其余每日签到），按钮/完成态/详情标题统一吃这一份，避免把"领加油包"写成"签到"
+ */
+export function checkinLabels(channel?: string): {
+  /** 设置按钮：自动签到 / 自动领加油包 / 自动领 Credits / 自动领取 */
+  auto: string;
+  /** 工具栏动作按钮：一键签到 / 领加油包 / 领 Credits / 一键领取 */
+  run: string;
+  /** 行内动作按钮（窄）：签到 / 领加油包 / 领 Credits / 领取 */
+  shortRun: string;
+  /** 全部完成后的工具栏按钮：签到成功 / 领取成功 */
+  done: string;
+  /** 行内完成态：已签到 / 已领取 */
+  shortDone: string;
+  /** 行内失败态：签到失败 / 领取失败 */
+  shortFail: string;
+  /** 详情弹窗标题词：签到详情 / 领取详情 */
+  detail: string;
+} {
+  if (channel === "workbuddy_ai") {
+    return { auto: "自动领加油包", run: "领加油包", shortRun: "领加油包", done: "领取成功", shortDone: "已领取", shortFail: "领取失败", detail: "领取详情" };
+  }
+  if (isQoderChannel(channel)) {
+    return { auto: "自动领 Credits", run: "领 Credits", shortRun: "领 Credits", done: "领取成功", shortDone: "已领取", shortFail: "领取失败", detail: "领取详情" };
+  }
+  if (channel === "zcode") {
+    return { auto: "自动领取", run: "一键领取", shortRun: "领取", done: "领取成功", shortDone: "已领取", shortFail: "领取失败", detail: "领取详情" };
+  }
+  return { auto: "自动签到", run: "一键签到", shortRun: "签到", done: "签到成功", shortDone: "已签到", shortFail: "签到失败", detail: "签到详情" };
+}
+
+/** 渠道成本档 → 展示文案（cost-first 路由排序的标注；'' = 未标注按普通） */
+export const COST_TIER_NAMES: Record<string, string> = {
+  free: "免费",
+  low: "低成本",
+  normal: "普通",
+};
+export const costTierName = (tier?: string) => COST_TIER_NAMES[tier || "normal"] || "普通";
+
 /** 渠道显示名（usage 流水里的 channel id → 中文名） */
 export const CHANNEL_NAMES: Record<string, string> = {
   trae: "Trae SOLO CN",
   workbuddy: "WorkBuddy CN",
   workbuddy_ai: "WorkBuddy AI",
   raccoon: "商汤小浣熊",
+  modelscope: "ModelScope（魔搭）",
+  lobster: "LobsterAI（有道）",
   zcode: "ZCode（智谱）",
+  catpaw: "CatPaw（美团）",
   qoder: "Qoder CN",
   qoder_intl: "Qoder International",
 };
@@ -160,29 +196,9 @@ export function capabilityNames(m: { capabilities?: { images?: boolean; reasonin
 
 /**
  * 上下文长度 → 紧凑显示（K/M）。
- * 表格列只有 82px，131072 这样的六位数必然被 nowrap 裁断；用 K/M 缩写后
- * 最长 4 字符（如 1.0M / 131K），列内可完整显示。
- * 不足 1000 按原数；1000~999999 用 K（≥100K 取整、其余 1 位小数）；≥1e6 用 M。
+ * 记忆中枢的模型行也要用同一套缩写，实现已提到 utils/format.ts（此处转出保持既有引用不变）。
  */
-export function fmtCtx(n: number | null | undefined): string {
-  const v = Number(n) || 0;
-  if (v <= 0) return "";
-  if (v >= 1e6) {
-    const s = (v / 1e6).toFixed(1).replace(/\.0$/, "");
-    return `${s}M`;
-  }
-  if (v >= 1e3) {
-    // 131072 → 131K（三位数不再带小数，避免 131.1K 超长）；4096 → 4.1K；
-    // 取整到 1000K 时进位为 1M，避免出现 5 字符的 1000K
-    if (v >= 1e5) {
-      const k = Math.round(v / 1e3);
-      return k >= 1000 ? "1M" : `${k}K`;
-    }
-    const s = (v / 1e3).toFixed(1).replace(/\.0$/, "");
-    return `${s}K`;
-  }
-  return String(Math.round(v));
-}
+export { fmtCtx } from "../../utils/format";
 
 /**
  * 上下文长度输入框的显示值 → 数字。

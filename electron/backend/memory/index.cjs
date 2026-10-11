@@ -30,7 +30,7 @@ const { ImportEngine } = require("./import/engine.cjs");
 const { LlmClient } = require("./llm/client.cjs");
 const agents = require("./agents.cjs");
 const tools = require("./tools.cjs");
-const { SCHEMA, defaultConfig: schemaDefaults, validateValue } = require("./config-schema.cjs");
+const { SCHEMA, defaultConfig: schemaDefaults, validateValue, migrateTaskTimes } = require("./config-schema.cjs");
 const profileCache = require("./profile-cache.cjs");
 
 let service = null;
@@ -155,6 +155,16 @@ function init() {
     deviceId: deviceId(),
     onEvent: (p) => emit(p),
   }).init();
+  // 一次性迁移：任务默认执行时间 23:00/23:30/02:00/03:00/04:00 → 11 点档（2026-10-08）。
+  // 任务保存会把时间落盘，存量配置里写死的是旧默认值；meta 闸门保证整轮只跑一次 ——
+  // 否则用户刻意改回旧时间点时，重启会被再次搬走。迁移失败不阻塞启动（下次启动重试）。
+  try {
+    if (service.index.getMeta("mem_sched_rhythm_v2") !== "done") {
+      const tasks = JSON.parse(JSON.stringify(memCfg.get("auto.tasks") || {}));
+      if (migrateTaskTimes(tasks)) memCfg.set({ "auto.tasks": tasks }, { local: false });
+      service.index.setMeta("mem_sched_rhythm_v2", "done");
+    }
+  } catch { /* 迁移失败不阻塞启动 */ }
   access = new AgentAccess({
     appPath: electron && electron.app ? electron.app.getPath("exe") : process.execPath,
     resourcesPath: electron && electron.app && process.resourcesPath ? process.resourcesPath : undefined,
@@ -247,6 +257,16 @@ async function boot() {
   }
   startWatch();
   if (scheduler) scheduler.start();
+  // 存量项目元数据自愈：老版本用显式项目名写入时不探测 Git，项目卡因此缺远程/本地路径。
+  // 延后到启动流程之外异步跑，且逐项目最多读少量文件——不能阻塞启动（曾因同步扫描主进程冻结数十秒）。
+  setTimeout(() => {
+    try {
+      const r = service && service.reconcileProjectMetadata();
+      if (r && r.healed) emit({ type: "projects", healed: r.healed });
+    } catch (e) {
+      emit({ type: "projects", healed: 0, message: String((e && e.message) || e) });
+    }
+  }, 6000);
   if (flatSettings()["agents.autoVerify"] !== false) {
     // 异步巡检，不阻塞启动
     setTimeout(() => reconcileAgents().catch(() => {}), 4000);
@@ -401,6 +421,7 @@ function costEstimates() {
     consolidate: "每轮约 5,000 token",
     profile: "每次约 8,000 token",
     "index-scan": "0（本地扫描）",
+    cleanup: "0（本地扫描）",
   };
 }
 
@@ -540,6 +561,8 @@ function register(ipcMain) {
   ipcMain.handle("memory_project_assign", handle(({ ids, slug }) => need().projectAssign(ids, slug)));
   ipcMain.handle("memory_project_suggest", handle(() => ok({ items: need().projectSuggestions() })));
   ipcMain.handle("memory_project_confirm", handle(({ id, slug }) => need().confirmSuggestion(id, slug)));
+  // 正式关联入口：选一个本地目录补全项目卡的远程/路径（不新建卡、不改 slug）
+  ipcMain.handle("memory_project_attach", handle(({ slug, dir }) => need().projectAttachPath(slug, dir)));
 
   // ===== 索引与检索 =====
   // 重建完成后随事件带上诊断快照，前端据此即时刷新健康卡，不必再猜修没修好
@@ -585,10 +608,39 @@ function register(ipcMain) {
     return ok({ files: files.length, pruned, caseFixed, failed, diagnose });
   })));
   ipcMain.handle("memory_index_rebuild", handle(() => need().withWrite(async () => {
-    emit({ type: "index", running: true, done: 0, total: need().store.walkMemoryFiles().length });
-    const r = need().rebuildIndex((p) => emit({ type: "index", running: true, ...p }));
-    emit({ type: "index", running: false, done: r.files, total: r.files, tookMs: r.tookMs, diagnose: diagnoseSnapshot() });
-    return ok(r);
+    const total = need().store.walkMemoryFiles().length;
+    emit({ type: "index", running: true, done: 0, total });
+    // 优先走 worker 建旁路库 + 事务换入：全量重建是几十秒的同步 CPU/IO，跑在主进程会把
+    // 界面、记忆中枢本地 API 与 9527 模型网关一起冻住（实测 43~56s）。worker 期间主进程
+    // 照常服务读写，只有最后的换入需要独占写（实测 ~1.5s，且是单事务）。
+    try {
+      const { rebuildInWorker, snapshotDb, checkpointWithRetry } = require("./rebuild-worker.cjs");
+      const dbFile = path.join(rootDir, "index", "memory.sqlite");
+      const sidecar = path.join(configMod.dataDir(), "memory-rebuild-sidecar.sqlite");
+      // 先把主库 WAL 落盘再复制，保证旁路库拿到的是完整快照（占用时重试后放弃，拿陈旧快照兜底）
+      checkpointWithRetry(need().index.db);
+      snapshotDb(dbFile, sidecar);
+      const r = await rebuildInWorker({
+        servicePath: __filename.replace(/index\.cjs$/, "service.cjs"),
+        root: rootDir,
+        sidecar,
+        deviceId: deviceId(),
+        onProgress: (p) => emit({ type: "index", running: true, done: p.done, total: p.total }),
+      });
+      const sw = need().swapInRebuiltIndex(sidecar);
+      try { fs.rmSync(sidecar, { force: true }); fs.rmSync(sidecar + "-wal", { force: true }); fs.rmSync(sidecar + "-shm", { force: true }); } catch {}
+      const result = { files: r.files, failed: r.failed, tookMs: r.tookMs, swapMs: sw.tookMs, mode: "worker" };
+      emit({ type: "index", running: false, done: r.files, total: r.files, tookMs: r.tookMs, diagnose: diagnoseSnapshot() });
+      return ok(result);
+    } catch (e) {
+      // 退化路径：worker 不可用（环境异常/超时熔断）时仍走主进程同步重建，保证功能不丢；
+      // 失败的旁路库（可能带着 worker 写了一半的 WAL）一并清掉，不留垃圾文件
+      try { fs.rmSync(sidecar, { force: true }); fs.rmSync(sidecar + "-wal", { force: true }); fs.rmSync(sidecar + "-shm", { force: true }); } catch {}
+      emit({ type: "index", running: true, done: 0, total, detail: `worker 重建不可用（${String(e.message || e).slice(0, 80)}），改用主进程重建` });
+      const r = need().rebuildIndex((p) => emit({ type: "index", running: true, ...p }));
+      emit({ type: "index", running: false, done: r.files, total: r.files, tookMs: r.tookMs, diagnose: diagnoseSnapshot() });
+      return ok({ ...r, mode: "inline", fallbackReason: String(e.message || e) });
+    }
   })));
   ipcMain.handle("memory_index_diagnose", handle(() => ok({ diagnose: need().diagnose(), graph: need().graphStats() })));
   ipcMain.handle("memory_index_vacuum", handle(() => need().vacuum()));
@@ -697,12 +749,13 @@ function register(ipcMain) {
     if (truncated) lines.push("", `> 超出 32MB 导出上限，省略 ${truncated} 个文件（完整备份请用「导出压缩包」）`);
     return ok({ content: lines.join("\n"), files: files.length, truncated });
   }));
-  ipcMain.handle("memory_export_zip", handle(() => {
+  ipcMain.handle("memory_export_zip", handle(async () => {
     const dir = path.join(configMod.dataDir(), "memory-export");
     fs.mkdirSync(dir, { recursive: true });
     const out = path.join(dir, `memory-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz`);
-    const { packDir } = require("../tarpack.cjs");
-    const count = packDir(rootDir, out);
+    // worker 化：整树 tar+gzip 是几十秒的同步 CPU/IO 大头，原先在主进程里做会把 UI 与模型网关一起冻住
+    const { packDirAsync } = require("../tarpack.cjs");
+    const count = await packDirAsync(rootDir, out);
     const bytes = (() => { try { return fs.statSync(out).size; } catch { return 0; } })();
     return ok({ file: out, files: count, bytes });
   }));
@@ -741,6 +794,7 @@ function register(ipcMain) {
     return r.ok ? ok({ id: r.id }) : fail(r.message);
   }));
   ipcMain.handle("memory_provider_delete", handle(({ id }) => providers.remove(id)));
+  ipcMain.handle("memory_provider_toggle", handle(({ id, enabled }) => providers.toggleProvider(id, enabled)));
   ipcMain.handle("memory_provider_test", handle(({ id, modelId }) => providers.test(id, modelId)));
   ipcMain.handle("memory_provider_fetch_models", handle(({ id }) => providers.fetchModels(id)));
   ipcMain.handle("memory_provider_quirks", handle(({ id }) => ok(providers.quirks(id))));
@@ -907,7 +961,15 @@ function register(ipcMain) {
 async function resolveReview(svc, id, action, payload) {
   const row = svc.index.db.prepare("SELECT * FROM review_queue WHERE id = ?").get(id);
   if (!row) return fail("待确认项不存在");
-  const data = JSON.parse(row.payload || "{}");
+  // 与 confirmSuggestion 同口径：payload 因历史脏数据/手工改库损坏时显式失败，
+  // 不让 JSON.parse 的英文异常冒给前端
+  let data;
+  try {
+    data = JSON.parse(row.payload || "{}");
+  } catch {
+    return fail("待确认项数据损坏，无法解析");
+  }
+  if (!data || typeof data !== "object") return fail("待确认项数据损坏，无法解析");
   if (row.kind === "supersede") {
     if (action === "confirm") {
       const r = await svc.markSuperseded(data.oldId, data.newId, data.reason || "人工确认失效");

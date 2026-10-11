@@ -28,7 +28,7 @@
 | **反代网关** | 把已登录的订阅额度包成 OpenAI 兼容 API（`http://127.0.0.1:9527/v1`），给任何客户端用；号池五态管理、自动换号、冷却、多机 WebDAV 同步 |
 | **记忆中枢** | 本地 Markdown 记忆库 + MCP 服务，让 Agent 记住项目与偏好 |
 
-**反代网关渠道**：Trae SOLO CN / WorkBuddy CN / WorkBuddy AI / 商汤小浣熊 / ZCode（智谱）/ Qoder CN / Qoder International——号池、签到、策略各渠道独立；添加账号支持 OAuth 登录、本机客户端导入、JSON/ZIP 文件、粘贴 JSON 四种方式。
+**反代网关渠道**：Trae SOLO CN / WorkBuddy CN / WorkBuddy AI / 商汤小浣熊 / LobsterAI（有道龙虾）/ ZCode（智谱）/ Qoder CN / Qoder International / ModelScope（魔搭）/ CatPaw（美团）——号池、签到、策略各渠道独立；添加账号支持 OAuth 登录、本机客户端导入、JSON/ZIP 文件、粘贴 JSON 四种方式。
 
 > Qoder 渠道依赖本机安装的客户端（签名由客户端内置 wasm 生成）；每日领 Credits 同理。Trae 不支持「切到 IDE」（登录态为设备绑定的加密信封）。
 
