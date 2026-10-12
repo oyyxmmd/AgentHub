@@ -52,7 +52,7 @@ onBeforeUnmount(stopPolling);
     <section class="sync-dialog" role="dialog" aria-modal="true" aria-label="用量同步">
       <div class="sync-dialog-head">
         <div>
-          <div class="eyebrow">沐辉制作 · AGENTHUB 用量统计</div>
+          <div class="eyebrow">AGENTHUB 用量统计</div>
           <h2>用量同步</h2>
         </div>
         <el-tooltip content="关闭" placement="top">

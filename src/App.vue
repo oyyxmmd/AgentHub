@@ -1,4 +1,4 @@
-<!-- 沐辉制作：AgentHub Agent中控台入口 -->
+<!-- AgentHub：Agent中控台入口 -->
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from "vue";
 import { animate, stagger } from "motion-v";

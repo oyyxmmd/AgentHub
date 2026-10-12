@@ -266,7 +266,7 @@ const DISCLAIMER: { h: string; p: string[] }[] = [
   {
     h: "一、软件性质与用途",
     p: [
-      "AgentHub（以下简称「本软件」）是由作者「沐辉」开发并免费提供的开源工具，仅供技术交流、学习研究与个人合法使用。本软件不构成任何商业产品、服务或承诺，作者不提供任何形式的担保、技术支持义务或质量保证。",
+      "AgentHub（以下简称「本软件」）是免费提供的开源工具，仅供技术交流、学习研究与个人合法使用。本软件不构成任何商业产品、服务或承诺，作者不提供任何形式的担保、技术支持义务或质量保证。",
       "你在下载、安装、复制、修改或使用的任一时刻，即视为已阅读、理解并自愿接受本声明的全部内容；如不同意，请立即停止使用并删除本软件。",
     ],
   },
@@ -526,7 +526,7 @@ onUnmounted(() => {
     <div class="card">
       <div class="set-row">
         <div class="set-info"><div class="set-name">版本</div></div>
-        <span class="num">{{ version }} · 作者 沐辉</span>
+        <span class="num">{{ version }}</span>
       </div>
       <div class="set-row">
         <div class="set-info">
@@ -564,7 +564,7 @@ onUnmounted(() => {
           <h3>{{ sec.h }}</h3>
           <p v-for="(p, i) in sec.p" :key="i">{{ p }}</p>
         </section>
-        <div class="dc-foot">—— 作者：沐辉 · AgentHub</div>
+        <div class="dc-foot">—— AgentHub</div>
       </div>
       <template #footer>
         <button class="btn btn-cta" @click="disclaimerOpen = false">我已知晓</button>

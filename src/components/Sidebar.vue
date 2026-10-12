@@ -553,13 +553,10 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
         </template>
       </div>
 
-      <!-- 左下角全局操作：版本 / 署名 / 亮暗 / 设置 -->
+      <!-- 左下角全局操作：版本 / 亮暗 / 设置 -->
       <div class="side-foot">
         <div class="foot-meta">
           <div class="foot-ver">{{ version }}</div>
-          <el-tooltip content="作者" placement="top">
-            <div class="foot-author"><i class="ph ph-user"></i><b>沐辉</b></div>
-          </el-tooltip>
         </div>
         <el-tooltip content="切换亮暗主题" placement="top">
           <button class="btn btn-ghost" @click="app.toggleTheme()">
@@ -896,21 +893,6 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
   font-size: 10px;
   color: var(--text-2);
 }
-.foot-author {
-  font-size: 10px;
-  color: var(--text-3);
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.foot-author .ph {
-  font-size: 11px;
-}
-.foot-author b {
-  color: var(--text-2);
-  font-weight: 600;
-}
-
 /* ===== 下卡片：模块总览概况 ===== */
 .side-overview {
   flex: 1;
