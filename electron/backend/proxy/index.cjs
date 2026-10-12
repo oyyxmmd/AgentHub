@@ -287,7 +287,7 @@ async function checkinBatch({ channel, accountId, action, interactive, trigger }
           ok: !!x.ok,
           result: x.deferred ? "deferred" : x.unavailable ? "unavailable" : x.needCaptcha ? "captcha" : x.already ? "already" : x.ok ? "claimed" : "error",
           claimed: !!(x.ok && !x.already && !x.unavailable && !x.deferred),
-          reward: Number(x.credit || x.rewardCredit || (x.status && x.status.creditsEarnedToday) || 0) || 0,
+          reward: Number(x.credit || x.claimedCredit || x.rewardCredit || (x.status && x.status.creditsEarnedToday) || 0) || 0,
           message: x.message || "",
         })),
       });
@@ -371,7 +371,7 @@ function checkinAutoTick() {
     //   否则当天签到会被永久跳过（标记只在真正发起该渠道签到前落）
     wakeGuard.noteTick("checkin-auto", CHECKIN_TICK_MS);
     if (!wakeGuard.checkinAllowed()) return;
-    // fork 全局总闸（托盘面板 / 号池页「自动开/关」按钮写 proxy.checkinAuto）：
+    // fork 全局总闸（号池页「自动开/关」按钮写 proxy.checkinAuto）：
     // 显式 false 时全部渠道的自动签到停摆，按渠道规则与兜底时刻都不再跑
     if (cfg.checkinAuto === false) return;
     const rules = cfg.checkinAutoRules || {};
@@ -470,51 +470,6 @@ function growthLogPush(entry) {
   try {
     fs.writeFileSync(growthLogFile(), JSON.stringify(growthLog));
   } catch { /* 落盘失败不影响任务执行 */ }
-}
-
-/** 托盘聚合摘要：账号积分 / 今日各任务最近执行 / 当前 IDE 节点。
- *  各段独立兜底（库未就绪/无日志/未切节点都不抛错），托盘菜单每次打开时调用 */
-function traySummary() {
-  const day = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  })();
-  let accounts = [];
-  try {
-    const chans = new Map(store.CHANNELS.map((c) => [c.id, c.display]));
-    accounts = store
-      .listAccounts()
-      .filter((a) => a.hasToken && a.status !== "disabled")
-      .map((a) => ({
-        uid: a.uid || "",
-        name: a.name || a.uid || "",
-        channel: chans.get(a.channel) || a.channel,
-        credits: Number(a.credits) || 0,
-      }))
-      .sort((x, y) => y.credits - x.credits);
-  } catch { /* 号池库未就绪 */ }
-  const tasks = {};
-  try {
-    for (const e of growthLog) {
-      const dt = new Date(e.ts);
-      const ds = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
-      if (ds !== day || tasks[e.action]) continue; // growthLog 新在前：首遇即当日最新
-      tasks[e.action] = {
-        ok: e.okCount,
-        total: e.total,
-        at: `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`,
-      };
-    }
-  } catch { /* 无执行日志 */ }
-  let node = "";
-  try {
-    const st = ideswitch.ideSwitchStatus();
-    if (st && st.currentUid) {
-      const acc = accounts.find((a) => a.uid === st.currentUid);
-      node = acc ? `${acc.name}（${acc.channel}）` : st.currentUid;
-    }
-  } catch { /* IDE 切换状态不可用 */ }
-  return { accounts, tasks, node };
 }
 
 let growthBusy = false;
@@ -1338,4 +1293,4 @@ function register(ipcMain) {
 }
 
 // 计划判定与抖动的纯函数一并导出：供自测直接验证跨午夜 / 不补欠账 / 已完成等分支
-module.exports = { boot, shutdown, register, settings, traySummary, checkinJitterOffset, checkinPlannedAt, checkinDueKey };
+module.exports = { boot, shutdown, register, settings, checkinJitterOffset, checkinPlannedAt, checkinDueKey };

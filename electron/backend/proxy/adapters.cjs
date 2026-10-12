@@ -1495,12 +1495,21 @@ function makeWorkBuddy(channelId) {
       return { ok: already, already, message: msg || `签到失败 HTTP ${r.status}` };
     },
 
-    /** 国际版一次性 trial 加油包（CN 无此端点）：幂等码 14051 = 已领过 */
+    /** 国际版一次性 trial 加油包（CN 无此端点）：幂等码 14051 = 已领过。
+     *  成功时从响应体提取 claimedCredit（领取到账的积分），供任务日志/托盘展示实际收益 */
     async trial(account, secrets) {
       const r = await this.billingCall(account, secrets, ["/billing/ide/trial", "/v2/billing/ide/trial"], "{}");
       const code = Number((r.data && r.data.code) ?? 0);
       const msg = String((r.data && (r.data.message || r.data.msg)) || r.message || "");
-      if (r.ok && (code === 0 || code === 200)) return { ok: true, claimed: true, message: msg || "加油包领取成功" };
+      const d = (r.data && (r.data.data || r.data)) || null;
+      if (r.ok && (code === 0 || code === 200)) {
+        return {
+          ok: true,
+          claimed: true,
+          claimedCredit: Number((d && (d.credit ?? d.today_credit ?? d.todayCredit)) ?? 0) || 0,
+          message: msg || "加油包领取成功",
+        };
+      }
       if (/\b14051\b/.test(msg) || /已领取|已领过|already/i.test(msg)) return { ok: true, claimed: false, already: true, message: msg || "已领取过" };
       return { ok: false, message: msg || `领取失败 HTTP ${r.status}` };
     },

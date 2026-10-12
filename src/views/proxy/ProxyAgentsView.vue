@@ -296,12 +296,13 @@ async function runCheckinChannel() {
   }
 }
 
-/** 单账号签到（表格行内按钮），结果同样进弹窗 */
+/** 单账号签到（表格行内按钮），结果同样进弹窗。
+ *  国际版没有每日签到：显式传 trial（领加油包），语义与按钮文案「领取详情」一致 */
 async function runCheckinAccount(acc: ProxyAccount) {
   if (checkinBusy.value) return;
   checkinBusy.value = true;
   try {
-    const r = await api.proxyCheckinRun({ channel: acc.channel, accountId: acc.id, action: "checkin" });
+    const r = await api.proxyCheckinRun({ channel: acc.channel, accountId: acc.id, action: acc.channel === "workbuddy_ai" ? "trial" : "checkin" });
     if (r.ok === false) {
       toast(r.message || "签到失败", "err");
       return;
@@ -400,7 +401,7 @@ function checkinRowTitle(acc: ProxyAccount): string {
   const L = checkinLabels(acc.channel);
   if (st === "done") return `点开查看今日${L.detail}`;
   if (st === "fail") return "点开查看本次失败原因";
-  if (acc.channel === "workbuddy_ai") return "国际版无每日签到，点此领一次性加油包";
+  if (acc.channel === "workbuddy_ai") return "领取一次性加油包（一次性语义：已领过的账号会提示已领取，幂等不算失败）";
   if (acc.channel === "raccoon") return "登录送积分（幂等，锁定当日积分 7 天）";
   if (acc.channel === "modelscope") return "执行每日任务：会话触碰（登录 200 + 绑云 50）+ 收藏/喜欢至 20 次（+40 魔粒）。点赞是公开星标动作";
   if (acc.channel === "lobster") return "每日签到领 100 积分（常驻活动，需客户端版本 ≥ 2026.9.4）";

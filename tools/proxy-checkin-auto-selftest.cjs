@@ -168,5 +168,10 @@ ok("tick 含总闸判定与无规则兜底", /cfg\.checkinAuto === false\) retur
 const view = read("src/views/proxy/ProxyAgentsView.vue");
 ok("号池页有自动签到设置弹窗", /autoDlg/.test(view) && /saveAutoCheckin/.test(view));
 ok("号池页行内三态与详情弹窗", /checkinRowState/.test(view) && /checkinDetailTag/.test(view));
+// fork：WorkBuddy AI 纳入自动签到/任务体系
+const adSrc = read("electron/backend/proxy/adapters.cjs");
+ok("行内按钮对 workbuddy_ai 显式传 trial 动作", /acc\.channel === "workbuddy_ai" \? "trial" : "checkin"/.test(view));
+ok("trial 成功提取 claimedCredit（任务日志记实际收益）", /claimedCredit: Number\(\(d && \(d\.credit \?\? d\.today_credit/.test(adSrc));
+ok("growthLog reward 兼容 claimedCredit", /x\.credit \|\| x\.claimedCredit/.test(idx));
 
 console.log(`\n全部通过：${pass} 项`);
