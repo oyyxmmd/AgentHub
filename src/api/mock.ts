@@ -71,6 +71,7 @@ function defaultConfig(): AppConfig {
       channelCooldownMs: 120000,
       channelCooldownCapMs: 900000,
       ccSwitchModel: "",
+      ccSwitchTiers: { sonnet: "", opus: "", haiku: "", subagent: "" },
       channelEnabled: {},
       pinnedAccount: {},
       checkinAuto: false,

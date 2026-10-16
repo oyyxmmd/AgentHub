@@ -58,6 +58,7 @@ const defaultConfig: AppConfig = {
     channelEnabled: {},
     pinnedAccount: {},
     ccSwitchModel: "",
+    ccSwitchTiers: { sonnet: "", opus: "", haiku: "", subagent: "" },
   },
   // 记忆中枢指针（其余配置在 <仓库>/config/memory.config.json，由 memory 模块页读取）
   memory: { enabled: true, rootDir: "" },

@@ -377,7 +377,7 @@ export const proxyVaultStatus = () => call<{ encrypted: boolean; driver: string;
 
 // ===== 反代网关：生态接入（CC Switch） =====
 export const proxyCcSwitchStatus = () => call<CcSwitchStatus>("proxy_ccswitch_status");
-export const proxyCcSwitchRegister = (opts: { appType: CcSwitchAppType; apiKey: string; model: string; port?: number }) =>
+export const proxyCcSwitchRegister = (opts: { appType: CcSwitchAppType; apiKey: string; model: string; tiers?: { sonnet: string; opus: string; haiku: string; subagent: string }; port?: number }) =>
   call<CcSwitchRegisterResult>("proxy_ccswitch_register", opts as unknown as Record<string, unknown>);
 
 // ===== 记忆中枢：配置 / 根目录 =====

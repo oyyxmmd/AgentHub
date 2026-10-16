@@ -185,6 +185,9 @@ function defaultConfig() {
       growthActivityAuto: true, // 积分任务·活跃地图自动跑（仅 WB CN，每日 ≥10 点一次：上报+连登奖励链）
       growthSchoolAuto: true,   // 积分任务·开学季自动领（仅 WB CN，每日 ≥12 点一次，活动期外自动跳过）
       ccSwitchModel: "",        // 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel）
+      ccSwitchTiers: { sonnet: "", opus: "", haiku: "", subagent: "" },
+                                // 生态接入 Claude 四档独立模型（Sonnet/Opus/Haiku/子代理；Desktop 四档角色路由同源，
+                                // subagent 档即 fable）：空串 = 该档跟随 ccSwitchModel/fallbackModel
     },
   };
 }

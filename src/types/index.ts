@@ -326,6 +326,16 @@ export interface ProxyConfig {
   growthSchoolAuto: boolean;
   /** 生态接入默认模型（注册进 CC Switch 时使用，缺省取 fallbackModel） */
   ccSwitchModel: string;
+  /** 生态接入 Claude 四档独立模型（Sonnet/Opus/Haiku/子代理）：空串 = 跟随 ccSwitchModel/fallbackModel */
+  ccSwitchTiers: CcSwitchTiers;
+}
+
+/** Claude 四档独立模型（CC Switch 条目：Code 走 env 五组键，Desktop 走四档角色路由，subagent 档即 fable） */
+export interface CcSwitchTiers {
+  sonnet: string;
+  opus: string;
+  haiku: string;
+  subagent: string;
 }
 
 /** 按渠道自动签到规则（proxy.checkinAutoRules 的值；号池页「自动签到」弹窗读写） */

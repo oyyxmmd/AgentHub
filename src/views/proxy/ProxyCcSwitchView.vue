@@ -4,7 +4,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import * as api from "../../api/ipc";
-import type { CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, ProxyKeyRow, ProxyModel } from "../../types";
+import type { CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, CcSwitchTiers, ProxyKeyRow, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
 
 const app = useAppStore();
@@ -13,6 +13,8 @@ const keys = ref<ProxyKeyRow[]>([]);
 const models = ref<ProxyModel[]>([]);
 const keyId = ref("");
 const model = ref("");
+/** Claude 四档独立模型：空串 = 跟随默认模型（Claude Code 走 env 五组键，Desktop 走四档角色路由） */
+const tiers = ref<CcSwitchTiers>({ sonnet: "", opus: "", haiku: "", subagent: "" });
 const busy = ref<CcSwitchAppType | "">("");
 const result = ref<CcSwitchRegisterResult | null>(null);
 const err = ref("");
@@ -45,6 +47,20 @@ const staleModel = computed(() => {
   if (!v || models.value.some((m) => m.id === v)) return "";
   return v;
 });
+/** 四档各自的失效占位（独立于默认模型的 staleModel） */
+function staleTier(k: keyof CcSwitchTiers): string {
+  const v = tiers.value[k].trim();
+  if (!v || models.value.some((m) => m.id === v)) return "";
+  return v;
+}
+
+/** 四档下拉的选项组数据（每档同源：全部模型 + 各自的失效占位） */
+const TIER_META: { key: keyof CcSwitchTiers; label: string }[] = [
+  { key: "sonnet", label: "Sonnet 档" },
+  { key: "opus", label: "Opus 档" },
+  { key: "haiku", label: "Haiku 档" },
+  { key: "subagent", label: "子代理档（Desktop 第四档 Fable）" },
+];
 
 function entry(appType: CcSwitchAppType) {
   return (st.value?.entries || []).find((x) => x.appType === appType);
@@ -122,6 +138,8 @@ async function register(appType: CcSwitchAppType) {
       appType,
       apiKey: key.secret,
       model: (model.value || fallback.value || "").trim(),
+      // Claude 系条目传四档独立模型（空档由后端回落默认）；Codex 忽略
+      tiers: { ...tiers.value },
       port: port.value,
     });
     if (r?.ok) {
@@ -140,23 +158,40 @@ async function register(appType: CcSwitchAppType) {
 /** 默认模型写回配置（缺省用 fallbackModel），下次注册生效。
  *  提示语在保存完成后保留 2 秒：落盘是本地 IPC，几乎瞬间返回，若在保存前置位会一闪而过 */
 let savedTimer: ReturnType<typeof setTimeout> | undefined;
-async function onModelChange() {
-  if (!app.config?.proxy) return;
+async function persistConfig() {
+  if (!app.config?.proxy) return false;
   app.config.proxy.ccSwitchModel = model.value.trim();
+  app.config.proxy.ccSwitchTiers = { ...tiers.value };
   saved.value = false;
   const r = await app.save();
   if (r && r.ok === false) {
-    err.value = r.message || "默认模型保存失败";
-    return;
+    err.value = r.message || "注册参数保存失败";
+    return false;
   }
   err.value = "";
   saved.value = true;
   clearTimeout(savedTimer);
   savedTimer = setTimeout(() => (saved.value = false), 2000);
+  return true;
+}
+async function onModelChange() {
+  await persistConfig();
+}
+async function onTierChange() {
+  await persistConfig();
 }
 
 onMounted(() => {
   model.value = ((app.config?.proxy?.ccSwitchModel || app.config?.proxy?.fallbackModel || "") as string).trim();
+  const savedTiers = app.config?.proxy?.ccSwitchTiers;
+  if (savedTiers && typeof savedTiers === "object") {
+    tiers.value = {
+      sonnet: String(savedTiers.sonnet || ""),
+      opus: String(savedTiers.opus || ""),
+      haiku: String(savedTiers.haiku || ""),
+      subagent: String(savedTiers.subagent || ""),
+    };
+  }
   refresh();
   loadKeys();
   loadModels();
@@ -249,8 +284,8 @@ onMounted(() => {
       <div class="card" style="margin-top: 12px">
         <div class="card-title">注册参数</div>
         <div class="set-desc" style="margin-bottom: 10px">
-          网关 Key 与默认模型会写入条目配置（Claude 条目同时覆盖 Sonnet / Opus / Haiku / 子代理等模型字段；Claude Desktop 条目将四档角色路由全映射到该模型，
-          菜单显示名同步为该模型以免与真实请求的模型不一致）；
+          网关 Key 与默认模型会写入条目配置：Claude 条目覆盖主模型与 Sonnet / Opus / Haiku / 子代理四档（可独立配置，留空的档跟随默认模型）；
+          Claude Desktop 条目将四档角色路由按档映射（子代理档即第四档 Fable），菜单显示名同步为各档模型以免与真实请求的模型不一致。
           参数在点击注册时写入 CC Switch，修改后请重新注册以同步。注册后需在 CC Switch 为该应用开启本地路由，
           再切换到该条目；无需重启 CC Switch。
         </div>
@@ -284,6 +319,28 @@ onMounted(() => {
             </el-option-group>
           </el-select>
           <span v-if="saved" class="tag tag-ok">已保存 · 重新注册后同步</span>
+        </div>
+        <!-- Claude 四档独立模型（Claude Code env 五组键 / Desktop 四档角色路由共用同一组值；Codex 不使用） -->
+        <div v-for="t in TIER_META" :key="t.key" class="co-row" style="margin-top: 10px">
+          <span class="co-label">{{ t.label }}</span>
+          <el-select
+            v-model="tiers[t.key]"
+            class="f-el-select"
+            popper-class="glass-popper"
+            style="width: 300px"
+            filterable
+            :placeholder="`跟随默认模型（${model || fallback || '—'}）`"
+            @change="onTierChange"
+          >
+            <el-option value="" :label="`跟随默认模型：${model || fallback || '—'}`" />
+            <el-option v-if="staleTier(t.key)" :key="staleTier(t.key)" :value="staleTier(t.key)" :label="`${staleTier(t.key)}（已不在模型目录）`" />
+            <el-option-group v-if="normalModels.length" label="对话模型">
+              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="m.enabled ? m.id : `${m.id}（已禁用）`" />
+            </el-option-group>
+            <el-option-group v-if="internalModels.length" label="内部条目">
+              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="m.id" />
+            </el-option-group>
+          </el-select>
         </div>
       </div>
     </div>

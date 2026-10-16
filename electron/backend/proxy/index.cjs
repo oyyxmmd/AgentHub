@@ -1193,8 +1193,8 @@ function register(ipcMain) {
 
   // ===== 生态接入：CC Switch =====
   ipcMain.handle("proxy_ccswitch_status", handle(() => ccswitch.status()));
-  ipcMain.handle("proxy_ccswitch_register", handle(({ appType, apiKey, model, port }) => {
-    const r = ccswitch.register({ appType, apiKey, model, port });
+  ipcMain.handle("proxy_ccswitch_register", handle(({ appType, apiKey, model, tiers, port }) => {
+    const r = ccswitch.register({ appType, apiKey, model, tiers, port });
     oplog.log(r && r.ok === false ? "error" : "info", "生态接入",
       r && r.ok ? `CC Switch 已注册（${String(appType || "")}，${r.action === "updated" ? "更新条目" : "新增条目"}）` : r && r.message || "注册失败",
       { target: String(appType || "") });

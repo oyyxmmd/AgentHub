@@ -154,26 +154,35 @@ function rotateBackups(dir, keep) {
   return removed;
 }
 
-/** 组装条目的 settings_config / meta（字符串化后入库） */
-function buildEntry(appType, { base, apiKey, model }) {
+/** 组装条目的 settings_config / meta（字符串化后入库）。
+ *  tiers：Claude 四档独立模型（{ sonnet, opus, haiku, subagent }，空串/缺省 = 跟随默认 model）。
+ *  claude 条目分档写 env 五组键；claude-desktop 条目分档写 claudeDesktopModelRoutes（subagent 档即 fable）。 */
+function buildEntry(appType, { base, apiKey, model }, tiers) {
+  const t = tiers && typeof tiers === "object" ? tiers : {};
+  const tierOf = (k) => String(t[k] || "").trim() || String(model);
   if (appType === "claude") {
     // 真实上游模型必须留在 *_MODEL：CC Switch 接管时会把 live 里的角色字段改写成
     // claude-sonnet-5 等别名，再由 model_mapper 用这里的 *_MODEL 映射回真实模型。
     // *_MODEL_NAME 仅供展示，写别名会导致接管后上游收到错误模型名。
+    // 四档独立配置（生态接入页可分别选择）：留空的档跟随默认模型
     const upstream = String(model);
+    const sonnet = tierOf("sonnet");
+    const opus = tierOf("opus");
+    const haiku = tierOf("haiku");
+    const subagent = tierOf("subagent");
     return {
       settings_config: {
         env: {
           ANTHROPIC_BASE_URL: base,
           ANTHROPIC_AUTH_TOKEN: apiKey,
           ANTHROPIC_MODEL: upstream,
-          ANTHROPIC_DEFAULT_SONNET_MODEL: upstream,
-          ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: upstream,
-          ANTHROPIC_DEFAULT_OPUS_MODEL: upstream,
-          ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: upstream,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: upstream,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: upstream,
-          CLAUDE_CODE_SUBAGENT_MODEL: upstream,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: sonnet,
+          ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: sonnet,
+          ANTHROPIC_DEFAULT_OPUS_MODEL: opus,
+          ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: opus,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: haiku,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: haiku,
+          CLAUDE_CODE_SUBAGENT_MODEL: subagent,
         },
       },
       meta: {
@@ -189,7 +198,11 @@ function buildEntry(appType, { base, apiKey, model }) {
     // 模型不写 env，统一放 meta.claudeDesktopModelRoutes（routeId → 真实上游模型），
     // 由 CC Switch 本地网关（127.0.0.1:15721/claude-desktop）做角色映射 + 协议转换。
     // Desktop 3P 不走 CC Switch 的通用配置 / MCP / Skills 同步，故不写 commonConfigEnabled。
-    const upstream = String(model);
+    // 四档独立配置（与 Claude Code 同一组 tiers，subagent 档即 fable 角色路由）
+    const sonnet = tierOf("sonnet");
+    const opus = tierOf("opus");
+    const haiku = tierOf("haiku");
+    const fable = tierOf("subagent");
     return {
       settings_config: {
         env: {
@@ -200,14 +213,14 @@ function buildEntry(appType, { base, apiKey, model }) {
       meta: {
         apiFormat: "openai_chat",
         claudeDesktopMode: "proxy",
-        // 四角色 routeId 全映射到同一上游模型（上游 CLAUDE_DESKTOP_ROLE_ROUTE_IDS；
+        // 四角色 routeId → 各档上游模型（上游 CLAUDE_DESKTOP_ROLE_ROUTE_IDS；
         // value 形态 { model, labelOverride } 对照上游 ClaudeDesktopProviderForm 的落库样板）
         // labelOverride 必须等于 model：留空时 Desktop 菜单显示的是角色名，看不出实际在跑哪个模型
         claudeDesktopModelRoutes: {
-          "claude-sonnet-5": { model: upstream, labelOverride: upstream },
-          "claude-opus-5": { model: upstream, labelOverride: upstream },
-          "claude-haiku-4-5": { model: upstream, labelOverride: upstream },
-          "claude-fable-5": { model: upstream, labelOverride: upstream },
+          "claude-sonnet-5": { model: sonnet, labelOverride: sonnet },
+          "claude-opus-5": { model: opus, labelOverride: opus },
+          "claude-haiku-4-5": { model: haiku, labelOverride: haiku },
+          "claude-fable-5": { model: fable, labelOverride: fable },
         },
       },
     };
@@ -331,8 +344,9 @@ function status() {
   }
 }
 
-/** 注册（upsert）固定 id 条目：备份 → 表自检 → UPDATE 优先，0 行则 INSERT */
-function register({ appType, apiKey, model, port } = {}) {
+/** 注册（upsert）固定 id 条目：备份 → 表自检 → UPDATE 优先，0 行则 INSERT。
+ *  tiers：Claude 四档独立模型（生态接入页传入），空档回落默认 model */
+function register({ appType, apiKey, model, tiers, port } = {}) {
   const t = String(appType || "");
   if (t !== "claude" && t !== "codex" && t !== "claude-desktop") return { ok: false, message: `未知应用类型 "${t}"` };
   const key = String(apiKey || "").trim();
@@ -370,7 +384,7 @@ function register({ appType, apiKey, model, port } = {}) {
 
     // 3) 组装并 upsert
     const base = `http://127.0.0.1:${port}`;
-    const entry = buildEntry(t, { base, apiKey: key, model: mdl });
+    const entry = buildEntry(t, { base, apiKey: key, model: mdl }, tiers);
     const now = Date.now();
     const name = APP_NAMES[t];
     const settings = JSON.stringify(entry.settings_config);

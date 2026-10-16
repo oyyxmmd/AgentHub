@@ -102,6 +102,20 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.strictEqual(r.name, "AgentHub 网关（Claude Desktop）", "claude-desktop 应回传真实条目名");
   console.log("✓ register claude-desktop inserted");
 
+  // 4.6) Claude 四档独立配置：tiers 传入后各档写各的模型，空档回落默认 model
+  // （key 沿用 sk-test-456，与第 3 步「重复注册更新 key」的终态断言保持一致）
+  r = ccswitch.register({
+    appType: "claude", apiKey: "sk-test-456", model: "deepseek-v4-flash", port: 9527,
+    tiers: { sonnet: "glm-5.3", opus: "", haiku: "kimi-k3", subagent: "sub_agent_x" },
+  });
+  assert.strictEqual(r.ok, true, "register claude with tiers 应 ok: " + JSON.stringify(r));
+  r = ccswitch.register({
+    appType: "claude-desktop", apiKey: "sk-test-456", model: "deepseek-v4-flash", port: 9527,
+    tiers: { sonnet: "glm-5.3", opus: "", haiku: "kimi-k3", subagent: "sub_agent_x" },
+  });
+  assert.strictEqual(r.ok, true, "register claude-desktop with tiers 应 ok: " + JSON.stringify(r));
+  console.log("✓ register claude / claude-desktop with tiers");
+
   // 5) 校验最终库内容
   const db2 = new Database(dbFile);
   const rows = db2.prepare("SELECT * FROM providers ORDER BY sort_index").all();
@@ -134,13 +148,14 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.strictEqual(cs.env.ANTHROPIC_API_KEY, undefined, "claude 只写 AUTH_TOKEN，避免双变量鉴权告警");
   // *_MODEL 是接管后 model_mapper 的上游真值；*_MODEL_NAME 只是展示名，不能写角色别名。
   assert.strictEqual(cs.env.ANTHROPIC_MODEL, "deepseek-v4-flash", "默认模型为真实上游模型");
-  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "deepseek-v4-flash", "Sonnet 映射目标须为真实模型");
-  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, "deepseek-v4-flash", "Sonnet 显示名");
-  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "deepseek-v4-flash", "Opus 映射目标须为真实模型");
-  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, "deepseek-v4-flash", "Opus 显示名");
-  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "deepseek-v4-flash", "Haiku 映射目标须为真实模型");
-  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME, "deepseek-v4-flash", "Haiku 显示名");
-  assert.strictEqual(cs.env.CLAUDE_CODE_SUBAGENT_MODEL, "deepseek-v4-flash", "子代理模型");
+  // 四档独立配置：tiers 传入了 sonnet/haiku/subagent，opus 留空回落默认
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "glm-5.3", "Sonnet 档应为独立配置的模型");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, "glm-5.3", "Sonnet 显示名与该档模型同值");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "deepseek-v4-flash", "Opus 档留空应回落默认模型");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, "deepseek-v4-flash", "Opus 显示名与该档模型同值");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "kimi-k3", "Haiku 档应为独立配置的模型");
+  assert.strictEqual(cs.env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME, "kimi-k3", "Haiku 显示名与该档模型同值");
+  assert.strictEqual(cs.env.CLAUDE_CODE_SUBAGENT_MODEL, "sub_agent_x", "子代理模型应为独立配置");
   const metaC = JSON.parse(claudeRow.meta);
   assert.strictEqual(metaC.apiFormat, "openai_chat", "claude 上游格式须为 openai_chat");
   assert.strictEqual(metaC.commonConfigEnabled, true, "claude 须并入用户通用配置，否则切换后全局配置丢失");
@@ -177,7 +192,7 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   // Desktop 3P 不走通用配置同步，故无 commonConfigEnabled。
   const cdd = JSON.parse(desktopRow.settings_config);
   assert.strictEqual(cdd.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:9527", "claude-desktop base url");
-  assert.strictEqual(cdd.env.ANTHROPIC_AUTH_TOKEN, "sk-test-123", "claude-desktop token");
+  assert.strictEqual(cdd.env.ANTHROPIC_AUTH_TOKEN, "sk-test-456", "claude-desktop token（4.6 节重新注册已更新为最新）");
   assert.strictEqual(cdd.env.ANTHROPIC_API_KEY, undefined, "claude-desktop 只写 AUTH_TOKEN，避免双变量鉴权告警");
   assert.strictEqual(cdd.env.ANTHROPIC_MODEL, undefined, "claude-desktop 模型不写 env，走 meta 角色路由映射");
   const metaD = JSON.parse(desktopRow.meta);
@@ -190,9 +205,13 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
     "四角色 routeId 应全映射",
   );
   for (const [rid, route] of Object.entries(metaD.claudeDesktopModelRoutes)) {
-    assert.strictEqual(route.model, "deepseek-v4-flash", `角色 ${rid} 应映射到同一上游模型`);
-    assert.strictEqual(route.labelOverride, "deepseek-v4-flash", `角色 ${rid} 的菜单显示名应与实际请求模型一致`);
+    assert.strictEqual(route.labelOverride, route.model, `角色 ${rid} 的菜单显示名应与实际请求模型一致`);
   }
+  // 四档独立路由：subagent 档即 fable；opus 留空回落默认
+  assert.strictEqual(metaD.claudeDesktopModelRoutes["claude-sonnet-5"].model, "glm-5.3", "Desktop Sonnet 路由应为独立配置的模型");
+  assert.strictEqual(metaD.claudeDesktopModelRoutes["claude-opus-5"].model, "deepseek-v4-flash", "Desktop Opus 路由留空应回落默认模型");
+  assert.strictEqual(metaD.claudeDesktopModelRoutes["claude-haiku-4-5"].model, "kimi-k3", "Desktop Haiku 路由应为独立配置的模型");
+  assert.strictEqual(metaD.claudeDesktopModelRoutes["claude-fable-5"].model, "sub_agent_x", "Desktop fable 路由应取 tiers.subagent");
   console.log("✓ claude-desktop 条目 env 形态 + proxy 模式 + 四角色路由映射（显示名对齐上游模型）");
 
   // 6) 校验报错分支：未知 appType / 空 key / 空 model（不落库）
