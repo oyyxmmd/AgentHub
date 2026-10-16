@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { proxyGrowthLog, proxyIdeStatus, proxyPinnedAccountSet, proxyPool, proxyStatsOverview } from "../api/ipc";
+import { proxyGrowthLog, proxyPinnedAccountSet, proxyPool, proxyStatsOverview } from "../api/ipc";
 import type { ProxyAccount, ProxyChannelView, ProxyGrowthLogEntry } from "../types";
 
-/** 托盘弹出面板（iStat Menus 风格）：今日用量 / 任务状态 / 当前节点 / 账号积分（按渠道分组，支持指定账号）。
+/** 托盘弹出面板（iStat Menus 风格）：今日用量 / 任务状态 / 网关调度账号 / 账号积分。
+ *  账号行点击即切换该渠道的网关指定账号（一次点击完成，切换后「网关调度」立即刷新）；
  *  数据全部复用现有 IPC，窗口由主进程定位到托盘图标下方，失焦自动隐藏 */
 
 const loading = ref(true);
 const channels = ref<ProxyChannelView[]>([]);
 const usage = ref<{ req: number; tokens: number } | null>(null);
-const currentNode = ref("");
 const todayTasks = ref<Record<string, { ok: number; total: number; at: string }>>({});
+/** 正在写回的账号 id（行内转圈防重复点击） */
+const switchingId = ref("");
 
 const TASK_META: { key: string; label: string }[] = [
   { key: "checkin", label: "签到" },
@@ -20,33 +22,50 @@ const TASK_META: { key: string; label: string }[] = [
   { key: "school", label: "开学" },
 ];
 
-/** 正在点选指定账号的渠道 id（空 = 无）；点选模式下该渠道账号行可点，点中即写回 */
-const pinningChannel = ref("");
-
-/** 指定账号可见的渠道（有账号且有 token 的；关闭渠道不出现在托盘，天然被 proxyPool 过滤） */
+/** 有可用账号的渠道（关闭渠道不出现在托盘，天然被 proxyPool 过滤） */
 const pinnableChannels = computed(() =>
   channels.value.filter((ch) => (ch.accounts || []).some((a) => a.hasToken && a.status !== "disabled"))
 );
+
+/** 各渠道当前被网关调度的账号名（pinned 优先；未指定时显示策略首号——与选号口径一致的近似值） */
+const gatewayAccounts = computed(() => {
+  const map: Record<string, string> = {};
+  for (const ch of channels.value) {
+    const accs = (ch.accounts || []).filter((a) => a.hasToken && a.status === "online");
+    if (!accs.length) { map[ch.id] = ""; continue; }
+    if (ch.pinnedAccountId) {
+      const p = accs.find((a) => a.id === ch.pinnedAccountId);
+      map[ch.id] = p ? p.name || p.uid || "" : "";
+      continue;
+    }
+    // 未指定：按渠道策略近似取下一号（expire_first=先到期 / credit_first=余额最高 / round_robin=最久未用）
+    const sorted = [...accs];
+    if (ch.poolStrategy === "credit_first") sorted.sort((a, b) => (Number(b.credits) || 0) - (Number(a.credits) || 0));
+    else if (ch.poolStrategy === "round_robin") sorted.sort((a, b) => (Number(a.lastUsed) || 0) - (Number(b.lastUsed) || 0));
+    else sorted.sort((a, b) => (Number(a.expiresAt) || Infinity) - (Number(b.expiresAt) || Infinity));
+    map[ch.id] = sorted[0] ? sorted[0].name || sorted[0].uid || "" : "";
+  }
+  return map;
+});
 
 function pinnedName(ch: ProxyChannelView): string {
   const acc = (ch.accounts || []).find((a) => a.id === ch.pinnedAccountId);
   return acc ? acc.name || acc.uid || "" : "";
 }
 
-/** 进入/退出该渠道的指定账号点选模式 */
-function togglePinning(ch: ProxyChannelView) {
-  pinningChannel.value = pinningChannel.value === ch.id ? "" : ch.id;
-}
-
-/** 点选账号 = 写回指定；再点当前指定账号 = 取消；取消后自动退出点选模式 */
-async function pickPinned(ch: ProxyChannelView, acc: ProxyAccount) {
+/** 点击账号行 = 一键把网关调度切到这个账号；点当前指定账号 = 取消指定恢复策略调度 */
+async function switchAccount(ch: ProxyChannelView, acc: ProxyAccount) {
+  if (switchingId.value) return;
+  switchingId.value = acc.id;
   const next = ch.pinnedAccountId === acc.id ? "" : acc.id;
   try {
     const r = await proxyPinnedAccountSet(ch.id, next);
     if (r && (r as { ok?: boolean }).ok === false) return;
-    pinningChannel.value = "";
-    await refresh();
-  } catch { /* 刷新失败保留现状，下次弹出重试 */ }
+  } catch { /* 写入失败保留现状 */ }
+  finally {
+    switchingId.value = "";
+  }
+  await refresh();
 }
 
 function fmt(n: number): string {
@@ -59,10 +78,9 @@ async function refresh() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   })();
-  const [pool, log, ide, stats] = await Promise.all([
+  const [pool, log, stats] = await Promise.all([
     proxyPool().catch(() => null),
     proxyGrowthLog().catch(() => null),
-    proxyIdeStatus().catch(() => null),
     proxyStatsOverview().catch(() => null),
   ]);
   channels.value = pool || [];
@@ -76,16 +94,6 @@ async function refresh() {
     latest[e.action] = { ok: e.okCount, total: e.total, at: `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}` };
   }
   todayTasks.value = latest;
-  if (ide?.currentUid) {
-    let node = "";
-    for (const ch of channels.value) {
-      const acc = (ch.accounts || []).find((a) => a.uid === ide.currentUid);
-      if (acc) { node = `${acc.name || acc.uid}（${ch.display || ch.id}）`; break; }
-    }
-    currentNode.value = node || ide.currentUid;
-  } else {
-    currentNode.value = "";
-  }
   loading.value = false;
 }
 
@@ -135,36 +143,36 @@ onBeforeUnmount(() => {
           {{ m.label }} {{ todayTasks[m.key] ? `${todayTasks[m.key].ok}/${todayTasks[m.key].total}` : "—" }}
         </span>
       </div>
-      <div v-if="currentNode" class="node">当前节点：<b>{{ currentNode }}</b></div>
-      <div v-else class="node dim">当前节点：未设置</div>
     </section>
 
     <section class="card grow">
       <div class="card-title">
-        账号积分
-        <span class="title-side" v-if="!pinningChannel">点击「指定」切换网关优先账号</span>
-        <button v-else class="pin-cancel" @click="pinningChannel = ''">取消选择</button>
+        网关账号
+        <span class="title-side">点账号行即切换调度</span>
       </div>
       <div class="accounts">
         <div v-if="!pinnableChannels.length" class="empty">暂无可用账号</div>
         <div v-for="ch in pinnableChannels" :key="ch.id" class="ch-group">
           <div class="ch-head">
             <span class="ch-name">{{ ch.display }}</span>
-            <span v-if="pinnedName(ch)" class="pin-badge" :title="`网关优先走「${pinnedName(ch)}」，该账号不可用时自动回落策略调度`">📌 {{ pinnedName(ch) }}</span>
-            <button class="pin-btn" :class="{ active: pinningChannel === ch.id }" @click="togglePinning(ch)">
-              {{ pinningChannel === ch.id ? "选择中…" : ch.pinnedAccountId ? "改指定" : "指定" }}
-            </button>
+            <span class="gw-now" :title="ch.pinnedAccountId
+              ? `已指定「${pinnedName(ch)}」：调度优先走它，该账号不可用时自动回落策略`
+              : '未指定：按渠道策略自动选号'">
+              调度 → <b>{{ gatewayAccounts[ch.id] || "无可用账号" }}</b>
+            </span>
           </div>
           <div
             v-for="a in ch.accounts.filter((x) => x.hasToken && x.status !== 'disabled')"
             :key="a.id"
             class="acc-row"
-            :class="{ pickable: pinningChannel === ch.id, pinned: ch.pinnedAccountId === a.id }"
-            @click="pinningChannel === ch.id && pickPinned(ch, a)"
+            :class="{ pinned: ch.pinnedAccountId === a.id, busy: switchingId === a.id }"
+            :title="ch.pinnedAccountId === a.id ? '当前网关调度账号，点击取消指定（恢复策略调度）' : '点击切换：网关调度优先走这个账号'"
+            @click="switchAccount(ch, a)"
           >
-            <span v-if="pinningChannel === ch.id" class="pick-mark">{{ ch.pinnedAccountId === a.id ? "✓" : "" }}</span>
+            <span class="pick-mark">{{ ch.pinnedAccountId === a.id ? "✓" : "" }}</span>
             <span class="dot" :class="a.status === 'online' ? 'on' : 'cool'"></span>
-            <span class="acc-name" :title="`${a.name || a.uid}（${ch.display}）`">{{ a.name || a.uid }}</span>
+            <span class="acc-name">{{ a.name || a.uid }}</span>
+            <span v-if="switchingId === a.id" class="switching">切换中…</span>
             <span class="acc-credits">{{ (Number(a.credits) || 0).toLocaleString("zh-CN") }}</span>
           </div>
         </div>
@@ -232,27 +240,21 @@ header { display: flex; align-items: center; justify-content: space-between; }
 .pill.partial { color: #ff9f0a; border-color: rgba(255, 159, 10, 0.4); }
 .pill.fail { color: #ff453a; border-color: rgba(255, 69, 58, 0.4); }
 
-.node { margin-top: 8px; font-size: 12px; color: var(--sub); }
-.node b { color: var(--txt); font-weight: 600; }
-.node.dim { opacity: 0.7; }
-
 .grow { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .accounts { flex: 1; overflow-y: auto; min-height: 0; }
 .ch-group { margin-bottom: 6px; }
 .ch-group:last-child { margin-bottom: 0; }
 .ch-head { display: flex; align-items: center; gap: 6px; padding: 3px 0 2px; }
-.ch-name { font-size: 11px; font-weight: 600; color: var(--sub); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pin-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: #34c759; border: 1px solid rgba(52, 199, 89, 0.4); border-radius: 999px; padding: 1px 7px; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pin-btn { flex: none; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--sub); cursor: pointer; }
-.pin-btn:hover { color: var(--txt); border-color: var(--sub); }
-.pin-btn.active { color: #34c759; border-color: rgba(52, 199, 89, 0.5); }
-.pin-cancel { font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(52, 199, 89, 0.5); background: transparent; color: #34c759; cursor: pointer; }
-.acc-row { display: flex; align-items: center; gap: 7px; padding: 5px 0; font-size: 12.5px; border-bottom: 1px solid var(--line); }
+.ch-name { font-size: 11px; font-weight: 600; color: var(--sub); flex: none; }
+.gw-now { flex: 1; min-width: 0; text-align: right; font-size: 10px; color: var(--sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gw-now b { color: var(--txt); font-weight: 600; }
+.acc-row { display: flex; align-items: center; gap: 7px; padding: 5px 4px; font-size: 12.5px; border-bottom: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.acc-row:hover { background: var(--card); }
 .acc-row:last-child { border-bottom: none; }
-.acc-row.pickable { cursor: pointer; border-radius: 6px; padding-left: 5px; padding-right: 5px; }
-.acc-row.pickable:hover { background: var(--card); }
 .acc-row.pinned .acc-name { color: #34c759; font-weight: 600; }
+.acc-row.busy { opacity: 0.55; pointer-events: none; }
 .pick-mark { width: 12px; flex: none; font-size: 11px; color: #34c759; font-weight: 700; text-align: center; }
+.switching { font-size: 10px; color: var(--sub); flex: none; }
 .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
 .dot.on { background: #34c759; }
 .dot.cool { background: #ff9f0a; }
