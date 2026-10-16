@@ -1426,6 +1426,12 @@ onUnmounted(() => {
                           <span class="tag tag-info acc-live"><i class="ph ph-desktop-tower"></i>本机登录</span>
                         </el-tooltip>
                       </template>
+                      <template v-if="ch.pinnedAccountId === acc.id">
+                        <i>·</i>
+                        <el-tooltip content="网关调度优先走这个账号（托盘面板「指定」设置）；该账号不可用时自动回落策略调度" placement="top">
+                          <span class="tag tag-info acc-live"><i class="ph ph-push-pin"></i>网关指定</span>
+                        </el-tooltip>
+                      </template>
                     </span>
                   </td>
                   <td>

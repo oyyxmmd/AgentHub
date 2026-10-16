@@ -178,6 +178,8 @@ function defaultConfig() {
                                 // 号池页各渠道工具栏各自设置（时间/抖动独立；默认全关）
       channelEnabled: {},       // 渠道启闭（「上游启闭」弹窗）：{ [渠道 id]: true|false }，缺省 = 启用。
                                 // 关闭的渠道在反代网关全部页面隐藏，路由/调用/调度也不再使用，重新打开立即恢复
+      pinnedAccount: {},        // 渠道指定账号（托盘面板设置）：{ [渠道 id]: 账号 id }，缺省 = 走池策略。
+                                // 选号时该渠道优先用指定账号（绕过策略排序）；账号冷却/耗尽/停用时自动回落策略选号
       growthTravelAuto: true,   // 积分任务·猫猫旅行自动派/领（仅 WB CN，15 分钟轮询状态机）
       growthCatAuto: true,      // 积分任务·夜猫子自动领（仅 WB CN，23:00~08:00 窗口）
       growthActivityAuto: true, // 积分任务·活跃地图自动跑（仅 WB CN，每日 ≥10 点一次：上报+连登奖励链）

@@ -761,6 +761,7 @@ function poolView(opts) {
   const health = server.channelHealthSnapshot(); // 渠道降级快照一次取全（循环内逐渠道取是全表快照 ×5）
   const channelEnabled = settings().channelEnabled || {};
   const checkinRules = settings().checkinAutoRules || {};
+  const pinnedAccount = settings().pinnedAccount || {};
   return store.CHANNELS.filter((c) => all || channelOn(c.id)).map((c) => {
     const summary = pool.poolSummary(c.id);
     const localUid = String((localLogins[c.id] && localLogins[c.id].uid) || "");
@@ -781,6 +782,8 @@ function poolView(opts) {
       checkinAuto: { enabled: !!(rule && rule.enabled), time: (rule && rule.time) || "09:00", jitterMin: Number((rule && rule.jitterMin) || 0) },
       // 渠道启闭（「上游启闭」弹窗）：缺省 = 启用
       enabled: channelOn(c.id),
+      // 渠道指定账号（托盘「指定」点选的读源）：空串 = 未指定走策略
+      pinnedAccountId: String(pinnedAccount[c.id] || ""),
       summary,
       accounts,
       health: health[c.id] || null, // 降级状态（until/reason/streak），null=正常
@@ -943,6 +946,14 @@ function register(ipcMain) {
     // 先写墓碑再删本机：删除要经 WebDAV 传播到其他设备（号池同步拉取时按墓碑移除）
     poolsync.noteRemoved(poolsync.accountKeyOf(acc));
     if (!store.removeAccount(id)) return fail("账号不存在");
+    // 被删账号若是某渠道的指定账号，清掉引用防悬挂（选号侧找不到该 id 自然回落策略，这里做诚实清理）
+    const cfg = config.loadConfig();
+    const pinned = cfg.proxy.pinnedAccount || {};
+    if (pinned[acc.channel] === id) {
+      delete pinned[acc.channel];
+      cfg.proxy.pinnedAccount = pinned;
+      config.saveConfig(cfg);
+    }
     oplog.log("info", "号池账号", `移除 ${store.channelDisplay(acc.channel)} 账号「${acc.name}」`, { channel: acc.channel, target: acc.name });
     return ok({});
   }));
@@ -996,6 +1007,27 @@ function register(ipcMain) {
     config.saveConfig(cfg);
     oplog.log("info", "网关配置", `${store.channelDisplay(channel)} 自动签到改为${enabled ? `每天 ${config.normalizeHm(time)}${Number(jitterMin) ? `（抖动 ${Number(jitterMin)} 分钟）` : ""}` : "关闭"}`, { channel });
     return ok({ channel, ...rules[channel] });
+  }));
+
+  // 渠道指定账号（托盘面板「指定」点选）：accountId 为空 = 取消指定恢复策略调度。
+  // 选号在 pool.pickAccount 内优先命中（server 每请求读 settings.pinnedAccount）——保存即热生效
+  ipcMain.handle("proxy_pinned_account_set", handle(({ channel, accountId }) => {
+    if (!store.CHANNELS.some((c) => c.id === channel)) return fail("渠道不存在");
+    const id = String(accountId || "");
+    let accName = "";
+    if (id) {
+      const acc = store.getAccount(id);
+      if (!acc || acc.channel !== channel) return fail("账号不存在或不属于该渠道");
+      accName = acc.name || acc.uid || id;
+    }
+    const cfg = config.loadConfig();
+    const pinned = { ...(cfg.proxy.pinnedAccount || {}) };
+    if (id) pinned[channel] = id;
+    else delete pinned[channel];
+    cfg.proxy.pinnedAccount = pinned;
+    config.saveConfig(cfg);
+    oplog.log("info", "网关配置", `${store.channelDisplay(channel)} ${id ? `指定账号「${accName}」（该账号不可用时自动回落策略调度）` : "取消指定账号，恢复策略调度"}`, { channel, target: accName || undefined });
+    return ok({ channel, accountId: id });
   }));
 
   // ===== 积分任务（仅 WorkBuddy CN：travel 猫猫旅行 / cat 夜猫子 / activity 活跃地图 / school 开学季） =====

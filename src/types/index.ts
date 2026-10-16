@@ -314,6 +314,8 @@ export interface ProxyConfig {
   checkinAutoRules: Record<string, ProxyCheckinAutoRule>;
   /** 渠道启闭（「上游启闭」弹窗）：{ [渠道 id]: true|false }，缺省 = 启用；关闭的渠道全部页面动态隐藏 */
   channelEnabled: Record<string, boolean>;
+  /** 渠道指定账号（托盘「指定」点选写它）：{ [渠道 id]: 账号 id }，缺省 = 走池策略 */
+  pinnedAccount: Record<string, string>;
   /** 积分任务·猫猫旅行自动派/领（仅 WB CN，15 分钟轮询状态机） */
   growthTravelAuto: boolean;
   /** 积分任务·夜猫子自动领（仅 WB CN，23:00~08:00 窗口） */
@@ -457,6 +459,8 @@ export interface ProxyChannelView {
   health: ProxyChannelHealth | null;
   /** 渠道启闭（「上游启闭」弹窗）：缺省/true = 启用；false = 已关闭（全部页面动态隐藏） */
   enabled?: boolean;
+  /** 渠道指定账号（托盘「指定」点选的读源）：空串 = 未指定走策略；选号时优先命中，不可用自动回落 */
+  pinnedAccountId: string;
 }
 
 export interface ProxyGatewayStatus {

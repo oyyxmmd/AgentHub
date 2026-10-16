@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { proxyGrowthLog, proxyIdeStatus, proxyPool, proxyStatsOverview } from "../api/ipc";
-import type { ProxyChannelView, ProxyGrowthLogEntry } from "../types";
+import { proxyGrowthLog, proxyIdeStatus, proxyPinnedAccountSet, proxyPool, proxyStatsOverview } from "../api/ipc";
+import type { ProxyAccount, ProxyChannelView, ProxyGrowthLogEntry } from "../types";
 
-/** 托盘弹出面板（iStat Menus 风格）：今日用量 / 任务状态 / 当前节点 / 账号积分。
+/** 托盘弹出面板（iStat Menus 风格）：今日用量 / 任务状态 / 当前节点 / 账号积分（按渠道分组，支持指定账号）。
  *  数据全部复用现有 IPC，窗口由主进程定位到托盘图标下方，失焦自动隐藏 */
 
 const loading = ref(true);
@@ -20,18 +20,34 @@ const TASK_META: { key: string; label: string }[] = [
   { key: "school", label: "开学" },
 ];
 
-const accounts = computed(() => {
-  const rows: { name: string; channel: string; credits: number; online: boolean }[] = [];
-  for (const ch of channels.value) {
-    for (const a of ch.accounts || []) {
-      if (!a.hasToken || a.status === "disabled") continue;
-      rows.push({ name: a.name || a.uid || "", channel: ch.display || ch.id, credits: Number(a.credits) || 0, online: a.status === "online" });
-    }
-  }
-  return rows.sort((x, y) => y.credits - x.credits);
-});
+/** 正在点选指定账号的渠道 id（空 = 无）；点选模式下该渠道账号行可点，点中即写回 */
+const pinningChannel = ref("");
 
-const totalCredits = computed(() => accounts.value.reduce((s, a) => s + a.credits, 0));
+/** 指定账号可见的渠道（有账号且有 token 的；关闭渠道不出现在托盘，天然被 proxyPool 过滤） */
+const pinnableChannels = computed(() =>
+  channels.value.filter((ch) => (ch.accounts || []).some((a) => a.hasToken && a.status !== "disabled"))
+);
+
+function pinnedName(ch: ProxyChannelView): string {
+  const acc = (ch.accounts || []).find((a) => a.id === ch.pinnedAccountId);
+  return acc ? acc.name || acc.uid || "" : "";
+}
+
+/** 进入/退出该渠道的指定账号点选模式 */
+function togglePinning(ch: ProxyChannelView) {
+  pinningChannel.value = pinningChannel.value === ch.id ? "" : ch.id;
+}
+
+/** 点选账号 = 写回指定；再点当前指定账号 = 取消；取消后自动退出点选模式 */
+async function pickPinned(ch: ProxyChannelView, acc: ProxyAccount) {
+  const next = ch.pinnedAccountId === acc.id ? "" : acc.id;
+  try {
+    const r = await proxyPinnedAccountSet(ch.id, next);
+    if (r && (r as { ok?: boolean }).ok === false) return;
+    pinningChannel.value = "";
+    await refresh();
+  } catch { /* 刷新失败保留现状，下次弹出重试 */ }
+}
 
 function fmt(n: number): string {
   return n >= 10000 ? `${(n / 10000).toFixed(1)}万` : n.toLocaleString("zh-CN");
@@ -126,15 +142,31 @@ onBeforeUnmount(() => {
     <section class="card grow">
       <div class="card-title">
         账号积分
-        <span class="title-side">合计 {{ fmt(totalCredits) }}</span>
+        <span class="title-side" v-if="!pinningChannel">点击「指定」切换网关优先账号</span>
+        <button v-else class="pin-cancel" @click="pinningChannel = ''">取消选择</button>
       </div>
       <div class="accounts">
-        <div v-if="!accounts.length" class="empty">暂无可用账号</div>
-        <div v-for="a in accounts" :key="a.name + a.channel" class="acc-row">
-          <span class="dot" :class="a.online ? 'on' : 'cool'"></span>
-          <span class="acc-name" :title="`${a.name}（${a.channel}）`">{{ a.name }}</span>
-          <span class="acc-channel">{{ a.channel }}</span>
-          <span class="acc-credits">{{ a.credits.toLocaleString("zh-CN") }}</span>
+        <div v-if="!pinnableChannels.length" class="empty">暂无可用账号</div>
+        <div v-for="ch in pinnableChannels" :key="ch.id" class="ch-group">
+          <div class="ch-head">
+            <span class="ch-name">{{ ch.display }}</span>
+            <span v-if="pinnedName(ch)" class="pin-badge" :title="`网关优先走「${pinnedName(ch)}」，该账号不可用时自动回落策略调度`">📌 {{ pinnedName(ch) }}</span>
+            <button class="pin-btn" :class="{ active: pinningChannel === ch.id }" @click="togglePinning(ch)">
+              {{ pinningChannel === ch.id ? "选择中…" : ch.pinnedAccountId ? "改指定" : "指定" }}
+            </button>
+          </div>
+          <div
+            v-for="a in ch.accounts.filter((x) => x.hasToken && x.status !== 'disabled')"
+            :key="a.id"
+            class="acc-row"
+            :class="{ pickable: pinningChannel === ch.id, pinned: ch.pinnedAccountId === a.id }"
+            @click="pinningChannel === ch.id && pickPinned(ch, a)"
+          >
+            <span v-if="pinningChannel === ch.id" class="pick-mark">{{ ch.pinnedAccountId === a.id ? "✓" : "" }}</span>
+            <span class="dot" :class="a.status === 'online' ? 'on' : 'cool'"></span>
+            <span class="acc-name" :title="`${a.name || a.uid}（${ch.display}）`">{{ a.name || a.uid }}</span>
+            <span class="acc-credits">{{ (Number(a.credits) || 0).toLocaleString("zh-CN") }}</span>
+          </div>
         </div>
       </div>
     </section>
@@ -206,13 +238,25 @@ header { display: flex; align-items: center; justify-content: space-between; }
 
 .grow { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .accounts { flex: 1; overflow-y: auto; min-height: 0; }
+.ch-group { margin-bottom: 6px; }
+.ch-group:last-child { margin-bottom: 0; }
+.ch-head { display: flex; align-items: center; gap: 6px; padding: 3px 0 2px; }
+.ch-name { font-size: 11px; font-weight: 600; color: var(--sub); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pin-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: #34c759; border: 1px solid rgba(52, 199, 89, 0.4); border-radius: 999px; padding: 1px 7px; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pin-btn { flex: none; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--sub); cursor: pointer; }
+.pin-btn:hover { color: var(--txt); border-color: var(--sub); }
+.pin-btn.active { color: #34c759; border-color: rgba(52, 199, 89, 0.5); }
+.pin-cancel { font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(52, 199, 89, 0.5); background: transparent; color: #34c759; cursor: pointer; }
 .acc-row { display: flex; align-items: center; gap: 7px; padding: 5px 0; font-size: 12.5px; border-bottom: 1px solid var(--line); }
 .acc-row:last-child { border-bottom: none; }
+.acc-row.pickable { cursor: pointer; border-radius: 6px; padding-left: 5px; padding-right: 5px; }
+.acc-row.pickable:hover { background: var(--card); }
+.acc-row.pinned .acc-name { color: #34c759; font-weight: 600; }
+.pick-mark { width: 12px; flex: none; font-size: 11px; color: #34c759; font-weight: 700; text-align: center; }
 .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
 .dot.on { background: #34c759; }
 .dot.cool { background: #ff9f0a; }
-.acc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
-.acc-channel { color: var(--sub); font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
 .acc-credits { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
 .empty { color: var(--sub); font-size: 12px; text-align: center; padding: 18px 0; }
 

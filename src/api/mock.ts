@@ -72,6 +72,7 @@ function defaultConfig(): AppConfig {
       channelCooldownCapMs: 900000,
       ccSwitchModel: "",
       channelEnabled: {},
+      pinnedAccount: {},
       checkinAuto: false,
       checkinAutoTime: "09:00",
       checkinAutoRules: {},
@@ -1102,7 +1103,21 @@ export const mock = {
       case "proxy_oauth_submit_callback":
         return { ok: true };
       case "proxy_pool":
-        return JSON.parse(JSON.stringify(PROXY_POOL));
+        return (JSON.parse(JSON.stringify(PROXY_POOL)) as (typeof PROXY_POOL[number])[]).map((c) => ({
+          ...c,
+          pinnedAccountId: (read().proxy.pinnedAccount || {})[c.id] || "",
+        }));
+      case "proxy_pinned_account_set": {
+        const cfg = read();
+        const map = { ...(cfg.proxy.pinnedAccount || {}) } as Record<string, string>;
+        const ch = String(args?.channel || "");
+        const accId = String(args?.accountId || "");
+        if (accId) map[ch] = accId;
+        else delete map[ch];
+        cfg.proxy.pinnedAccount = map;
+        localStorage.setItem(KEY, JSON.stringify(cfg));
+        return { ok: true, channel: ch, accountId: accId };
+      }
       // 渠道启闭（预览）：list 全量带 enabled；toggle 写 mock 配置即生效
       case "proxy_channel_list":
         return JSON.parse(JSON.stringify(PROXY_POOL)).map((c: Record<string, unknown>) => ({

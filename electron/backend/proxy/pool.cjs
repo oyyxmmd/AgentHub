@@ -38,7 +38,7 @@ function poolAccounts(channel) {
  * maxInFlight > 0 时在途数已达上限的账号不参与候选（参考项目租约语义），
  * 全部忙时降级取在途最小者（不过载拒绝）；100ms 内刚选中过的账号让位给其他候选（防惊群）。
  */
-function pickAccount(channel, strategy, excludeIds, maxInFlight) {
+function pickAccount(channel, strategy, excludeIds, maxInFlight, pinnedId) {
   const now = Date.now();
   const exclude = new Set(excludeIds || []);
   const candidates = [];
@@ -86,7 +86,13 @@ function pickAccount(channel, strategy, excludeIds, maxInFlight) {
       pool2.sort((a, b) => (a.expiresAt || Number.MAX_SAFE_INTEGER) - (b.expiresAt || Number.MAX_SAFE_INTEGER));
       break;
   }
+  // 渠道指定账号（托盘「指定账号」写 proxy.pinnedAccount）：在候选集里则直接用它（绕过策略排序）。
+  // pinned 不在 pool2 = 被候选过滤（冷却/耗尽/停用/排除）或租约滤掉——自然回落策略选号，无需单独回退分支
   let picked = pool2[0];
+  if (pinnedId) {
+    const p = pool2.find((a) => a.id === pinnedId);
+    if (p) picked = p;
+  }
   // 防惊群：100ms 内刚选中过同一账号且还有其他候选 → 让位重选（并发突发不再集中打一个号）
   if (pool2.length > 1 && now - (lastPickAt.get(picked.id) || 0) < 100) {
     const alt = pool2.find((a) => now - (lastPickAt.get(a.id) || 0) >= 100);

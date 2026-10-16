@@ -173,5 +173,14 @@ const adSrc = read("electron/backend/proxy/adapters.cjs");
 ok("行内按钮对 workbuddy_ai 显式传 trial 动作", /acc\.channel === "workbuddy_ai" \? "trial" : "checkin"/.test(view));
 ok("trial 成功提取 claimedCredit（任务日志记实际收益）", /claimedCredit: Number\(\(d && \(d\.credit \?\? d\.today_credit/.test(adSrc));
 ok("growthLog reward 兼容 claimedCredit", /x\.credit \|\| x\.claimedCredit/.test(idx));
+// fork：渠道指定账号（托盘面板写 proxy.pinnedAccount，选号优先命中）
+const poolSrc = read("electron/backend/proxy/pool.cjs");
+ok("pickAccount 支持 pinnedId 优先命中", /function pickAccount\(channel, strategy, excludeIds, maxInFlight, pinnedId\)/.test(poolSrc) && /a\.id === pinnedId/.test(poolSrc));
+ok("server 选号传 pinnedAccount", /\(settings\.pinnedAccount \|\| \{\}\)\[chan\]/.test(read("electron/backend/proxy/server.cjs")));
+ok("IPC proxy_pinned_account_set 已注册", /ipcMain\.handle\("proxy_pinned_account_set"/.test(idx));
+ok("poolView 输出 pinnedAccountId", /pinnedAccountId: String\(pinnedAccount\[c\.id\] \|\| ""\)/.test(idx));
+ok("账号删除清理 pinned 引用", /pinned\[acc\.channel\] === id/.test(idx));
+ok("preload 白名单含 proxy_pinned_account_set", /"proxy_pinned_account_set"/.test(pre));
+ok("托盘面板有指定账号交互", /proxyPinnedAccountSet/.test(read("src/tray/TrayPanel.vue")));
 
 console.log(`\n全部通过：${pass} 项`);

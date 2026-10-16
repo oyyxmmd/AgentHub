@@ -714,7 +714,7 @@ async function handleChat(req, res, settings) {
         let budgetOut = false; // 上游尝试预算用尽跳出（不是渠道的错，不降级）
         for (let attempt = 0; attempt <= 2 && !done; attempt++) {
           if (upstreamTries >= maxTries) { budgetOut = true; break; }
-          const acc = pool.pickAccount(chan, strategy, [...tried], perAccountLimit);
+          const acc = pool.pickAccount(chan, strategy, [...tried], perAccountLimit, (settings.pinnedAccount || {})[chan]);
           if (!acc) { poolEmpty = true; break; }
           tried.add(acc.id);
           // 模型级负缓存（6004 模型级限流 / 11102 该号不支持此模型）：直接换号，不浪费一次上游请求。

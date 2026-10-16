@@ -281,6 +281,12 @@ export const proxyCheckinAutoSet = (opts: { channel: ProxyChannelId; enabled: bo
     "proxy_checkin_auto_set",
     opts as unknown as Record<string, unknown>
   );
+/** 渠道指定账号（托盘面板「指定」点选）：accountId 为空 = 取消指定恢复策略调度；保存即热生效 */
+export const proxyPinnedAccountSet = (channel: ProxyChannelId, accountId: string) =>
+  call<{ ok: boolean; channel: ProxyChannelId; accountId: string; message?: string }>(
+    "proxy_pinned_account_set",
+    { channel, accountId } as unknown as Record<string, unknown>
+  );
 /** 扫描本机已装软件的登录态（凭据不出主进程，只回候选信息） */
 export const proxyScan = () => call<ProxyScanCandidate[]>("proxy_scan");
 /** 导入本机候选；file/uid 用于身份核对（两次扫描之间文件变化时不至于导错账号） */
