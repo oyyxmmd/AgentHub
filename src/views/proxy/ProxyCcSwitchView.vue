@@ -185,7 +185,13 @@ async function directPreview(appType: DirectAppType) {
 async function directConfirm() {
   const p = directProbe.value;
   if (!p || busy.value) return;
-  const appType = p.appType as DirectAppType;
+  // 两阶段（预检/写入）返回形状一致：appType 在顶层；旧版只放在 probe 里，故两个位置都兜
+  const appType = (p.appType || p.probe?.appType || "") as DirectAppType;
+  if (!appType) {
+    directErr.value = "预检结果缺少应用类型，请重新发起";
+    directProbe.value = null;
+    return;
+  }
   busy.value = appType as CcSwitchAppType;
   directErr.value = "";
   try {
@@ -401,7 +407,7 @@ onMounted(() => {
       <div v-if="mode === 'direct' && directProbe" class="card warn-card">
         <div class="card-title">
           {{ directProbe.probe?.conflict ? "注意：CC Switch 正在接管" : "确认写入" }}
-          <span class="right"><span class="tag tag-dim">{{ APP_LABELS[directProbe.appType as CcSwitchAppType] }}</span></span>
+          <span class="right"><span class="tag tag-dim">{{ APP_LABELS[directProbe.probe?.appType as CcSwitchAppType] }}</span></span>
         </div>
         <div class="set-desc">{{ directProbe.probe?.confirmText }}</div>
         <div v-if="directProbe.probe" class="set-desc" style="margin-top: 8px">

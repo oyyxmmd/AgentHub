@@ -452,7 +452,8 @@ function apply({ appType, apiKey, model, tiers, port, confirmAck } = {}) {
       : `将写入 ${app.files.join("、")}（写前自动备份，只改 AgentHub 负责的键，其它配置保持不变）。`,
   };
   if (!confirmAck) {
-    return { ok: true, needConfirm: true, probe, message: probe.confirmText };
+    // 顶层也带 appType：前端两阶段（预检/写入）用同一个字段取值，避免只在 probe 里出现导致的读空
+    return { ok: true, appType: t, needConfirm: true, probe, message: probe.confirmText };
   }
 
   // 备份 → 写入 → 校验，任一步失败回滚

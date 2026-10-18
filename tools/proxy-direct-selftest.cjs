@@ -59,6 +59,10 @@ console.log("2. Claude Code 合并写");
 
   const pre = direct.apply({ appType: "claude", apiKey: KEY, model: "glm-5.3", tiers: { sonnet: "kimi-k3", opus: "", haiku: "", subagent: "sub_agent_x" }, port: 9527 });
   ok("首调返回 needConfirm（不落盘）", pre.ok === true && pre.needConfirm === true && pre.probe.conflict === false);
+  // 两阶段返回形状必须一致：前端用同一个 appType 字段走「预检 → 确认写入」，
+  // 只在 probe 里给会让前端读到 undefined → 空串 → 后端报「不支持的应用类型 ""」
+  ok("预检顶层带 appType（与写入阶段一致）", pre.appType === "claude" && pre.probe.appType === "claude");
+  ok("预检带目标文件与提示", Array.isArray(pre.probe.files) && !!pre.probe.confirmText && !!pre.probe.hint);
   const beforeWrite = JSON.parse(fs.readFileSync(f, "utf8"));
   ok("预检未修改文件", beforeWrite.env.ANTHROPIC_API_KEY === "old-key-should-be-removed");
 
