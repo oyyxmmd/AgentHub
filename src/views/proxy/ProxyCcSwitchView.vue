@@ -418,6 +418,7 @@ onMounted(() => {
           <template v-if="directProbe.probe.currentUrl"> · 当前指向：<span class="mono">{{ directProbe.probe.currentUrl }}</span></template>
         </div>
         <div v-if="directProbe.probe" class="set-desc" style="margin-top: 4px">{{ directProbe.probe.hint }}</div>
+        <div v-if="directProbe.probe?.warn" class="set-desc err-text" style="margin-top: 8px">{{ directProbe.probe.warn }}</div>
         <div class="p-actions" style="margin-top: 12px">
           <button class="btn" :disabled="!!busy" @click="directProbe = null">取消</button>
           <button class="btn btn-primary" :disabled="!!busy" @click="directConfirm">{{ busy ? "写入中…" : "确认写入（自动备份）" }}</button>

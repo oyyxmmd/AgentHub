@@ -137,8 +137,6 @@ console.log("3. Codex TOML 合并");
   ok("保留 projects 段", toml.includes("[projects.") && toml.includes('trust_level = "trusted"'));
 
   ok("auth.json 写 OPENAI_API_KEY", JSON.parse(fs.readFileSync(authPath, "utf8")).OPENAI_API_KEY === KEY);
-  const cat = JSON.parse(fs.readFileSync(catPath, "utf8"));
-  ok("catalog 至少一条模型", Array.isArray(cat.models) && cat.models.length >= 1 && cat.models[0].slug === "glm-5.3");
 
   // 重复写入幂等：不应产生第二个 agenthub 段
   direct.apply({ appType: "codex", apiKey: KEY, model: "glm-5.3", port: 9527, confirmAck: true });
@@ -146,6 +144,62 @@ console.log("3. Codex TOML 合并");
   const cnt = (toml2.match(/\[model_providers\.agenthub\]/g) || []).length;
   ok("重复写入不重复 provider 段", cnt === 1, `实际 ${cnt} 个`);
   ok("重复写入后 mcp 段仍在", toml2.includes("[mcp_servers.my-tool]"));
+}
+
+// ===== 3b. Codex 模型目录：克隆内置条目，不能手写 =====
+// 手写字段会被下个客户端版本判成「无法加载配置」（0.163 就在 reasoning 档位上改过结构），
+// 而 instructions_template 会顶替内置系统提示，漏写等于给用户一个没有系统提示的 Codex。
+console.log("3b. Codex 模型目录");
+{
+  const [tomlPath, , catPath] = direct.targetsOf("codex").files;
+
+  // 本机没装 Codex 时跳过（沙箱里取不到内置目录）
+  const catalog = direct.buildCodexCatalog("glm-5.3", {
+    slug: "gpt-5.5",
+    display_name: "GPT-5.5",
+    description: "Frontier",
+    visibility: "hide",
+    priority: 2,
+    supported_in_api: true,
+    comp_hash: "abc123",
+    shell_type: "unified_exec",
+    supported_reasoning_levels: [{ effort: "high", description: "Greater reasoning depth" }],
+    model_messages: { instructions_template: "You are Codex." },
+  });
+  ok("目录条目沿用模板的必需字段", catalog.models[0].shell_type === "unified_exec"
+    && Array.isArray(catalog.models[0].supported_reasoning_levels)
+    && catalog.models[0].model_messages.instructions_template === "You are Codex.");
+  ok("slug / 展示名换成用户选的模型", catalog.models[0].slug === "glm-5.3" && catalog.models[0].display_name === "glm-5.3");
+  ok("克隆后模型在列表可见", catalog.models[0].visibility === "list");
+  ok("丢弃模板的内容哈希", !("comp_hash" in catalog.models[0]));
+  ok("取不到模板时不出目录（调用方据此不写该键）", direct.buildCodexCatalog("glm-5.3", null) === null);
+
+  // 偏好列表优先，其次取指令最长的（信息最全）
+  const picked = direct.pickCodexTemplate([
+    { slug: "other", base_instructions: "short" },
+    { slug: "gpt-5.5", base_instructions: "长一点的指令" },
+  ]);
+  ok("模板优先取偏好模型", picked && picked.slug === "gpt-5.5");
+  const byLen = direct.pickCodexTemplate([
+    { slug: "a", base_instructions: "x" },
+    { slug: "b", base_instructions: "xxxx" },
+  ]);
+  ok("没有偏好模型时取指令最长的一条", byLen && byLen.slug === "b");
+
+  // 写不进目录时：TOML 不能留 model_catalog_json（否则 Codex 会去读不存在的文件）
+  const noCat = direct.buildCodexToml("model_catalog_json = \"old.json\"\n", { withCatalog: false });
+  ok("降级时不写 model_catalog_json", !/model_catalog_json/.test(noCat), noCat);
+  ok("降级不影响 provider 段", /\[model_providers\.agenthub\]/.test(noCat));
+  if (!fs.existsSync(catPath)) {
+    console.log("  skip 本机未安装 Codex，跳过真实目录断言");
+  } else {
+    const cat = JSON.parse(fs.readFileSync(catPath, "utf8"));
+    const e = cat.models[0];
+    ok("真实写入的目录带指令模板（否则 Codex 没有系统提示）",
+      !!((e.model_messages || {}).instructions_template || e.base_instructions));
+    ok("真实写入的目录带当前版本要求的结构", !!e.shell_type && Array.isArray(e.supported_reasoning_levels)
+      && typeof e.supported_reasoning_levels[0] === "object");
+  }
 }
 
 // ===== 4. Claude Desktop：模型名必须符合客户端校验 =====

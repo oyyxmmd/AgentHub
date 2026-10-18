@@ -483,6 +483,8 @@ export interface DirectProbe {
   /** 写入后的生效提示（需重启哪个客户端） */
   hint: string;
   confirmText: string;
+  /** 降级警告（当前仅 Codex：取不到本机客户端时无法生成模型目录） */
+  warn?: string;
 }
 
 export interface DirectApplyResult {

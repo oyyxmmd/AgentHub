@@ -11,7 +11,9 @@
 //   ② Codex（CLI 与桌面端共用）：$CODEX_HOME|~/.codex 下的
 //        config.toml（顶层 model_provider/model + [model_providers.<name>] 段）
 //        auth.json（OPENAI_API_KEY）
-//        model-catalog.json（/model 列表；文件名自建，不抢 CC Switch 的 cc-switch-model-catalog.json）
+//        model-catalog.json（模型目录：不给它，Codex 对自定义模型只按回退元数据跑，
+//          每次启动都警告「metadata not found」；给了它，条目里的指令模板会**顶替**内置系统提示，
+//          所以条目必须从一个可用的内置条目克隆，见 buildCodexCatalog）
 //   ③ Claude Desktop：<userData>/configLibrary/<profileId>.json + _meta.json 的 appliedId，
 //      inferenceProvider="gateway" + inferenceGatewayBaseUrl 直接指向网关。
 //      ⚠ Desktop 的模型名校验（逆向 app.asar）：
@@ -27,6 +29,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 
 const config = require("../config.cjs");
 
@@ -42,6 +45,8 @@ const DESKTOP_PROFILE_ID = "a6e1b7c2-4d3f-4a58-9e21-7b5c8d0f1a34";
 const DESKTOP_PROFILE_NAME = "AgentHub 直连";
 /** Codex model catalog 文件名（自建，不抢 CC Switch 的 cc-switch-model-catalog.json） */
 const CODEX_CATALOG_FILE = "agenthub-model-catalog.json";
+/** 克隆指令模板时优先挑的模型：偏通用的编码模型，措辞与自定义上游最接近 */
+const CODEX_CLONE_PREFER = ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol"];
 
 /** Desktop 四档角色名：必须匹配客户端校验正则 (sonnet|opus|haiku|fable|mythos)(-数字)。
  *  同时这些名字会被登记进网关 modelAliases（见 applyDesktopAliases）——客户端发的是
@@ -238,9 +243,10 @@ function buildClaudeSettings(existing, { base, apiKey, model, tiers }) {
   return { data: next, text: JSON.stringify(next, null, 2) + "\n", env };
 }
 
-/** Codex TOML：文本级替换三个顶层键 + [model_providers.<id>] 段，其它段一个字节不动 */
-function buildCodexToml(existingText) {
+/** Codex TOML：文本级替换四个顶层键 + [model_providers.<id>] 段，其它段一个字节不动 */
+function buildCodexToml(existingText, opts) {
   const text = String(existingText || "");
+  const withCatalog = !(opts && opts.withCatalog === false);
   const block = [
     `[model_providers.${CODEX_PROVIDER_ID}]`,
     `name = "AgentHub"`,
@@ -262,7 +268,8 @@ function buildCodexToml(existingText) {
   };
   body = setTop(body, "model_provider", `"${CODEX_PROVIDER_ID}"`);
   body = setTop(body, "model", `"{{MODEL}}"`);
-  body = setTop(body, "model_catalog_json", `"${CODEX_CATALOG_FILE}"`);
+  if (withCatalog) body = setTop(body, "model_catalog_json", `"${CODEX_CATALOG_FILE}"`);
+  else body = body.replace(/^\s*model_catalog_json\s*=.*\n?/m, "");
 
   // 3) 追加 provider 段到文末（子表写在哪个位置都合法，文末对用户已有内容零扰动）
   body = body.replace(/\s+$/, "");
@@ -270,26 +277,89 @@ function buildCodexToml(existingText) {
   return body;
 }
 
-/** Codex model catalog：至少一条，否则配置了 model_catalog_json 时 Codex 会报错 */
-function buildCodexCatalog(model) {
-  return {
-    models: [
-      {
-        slug: String(model),
-        display_name: String(model),
-        description: "",
-        context_window: 300000,
-        max_context_window: 300000,
-        effective_context_window_percent: 95,
-        default_reasoning_level: "high",
-        supported_reasoning_levels: ["low", "medium", "high", "xhigh"],
-        supports_reasoning_summaries: true,
-        visibility: "list",
-        supported_in_api: true,
-        priority: 1000,
-      },
-    ],
-  };
+/**
+ * 取本机 Codex 自带的内置模型目录（纯净的，不含用户配的 model_catalog_json）。
+ *
+ * 为什么要问二进制而不是手写字段：目录条目的 schema 随客户端版本走
+ * （0.163 把 supported_reasoning_levels 从字符串数组改成 ReasoningEffortPreset 对象，
+ *  同时新增强制的 shell_type / truncation_policy / support_verbosity / 指令模板），
+ * 手写的条目在下一次升级后又会被判「无法加载配置」，而客户端自己的条目永远跟自己的 schema 对得上。
+ *
+ * 候选顺序：PATH 上的 codex → 桌面端（ChatGPT.app）自带的 codex-cli。
+ * macOS 的图形应用不继承 shell 的 PATH，只装了桌面端时第一条会落空，靠第二条兜住。
+ */
+function codexBundledCatalog() {
+  const home = os.homedir();
+  const candidates = [];
+  const exts = process.platform === "win32" ? [".cmd", ".exe", ""] : [""];
+  for (const dir of String(process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) candidates.push(path.join(dir, `codex${ext}`));
+  }
+  if (process.platform === "darwin") {
+    for (const app of ["ChatGPT", "Codex"]) {
+      candidates.push(`/Applications/${app}.app/Contents/Resources/codex-cli/bin/codex`);
+      candidates.push(path.join(home, "Applications", `${app}.app`, "Contents", "Resources", "codex-cli", "bin", "codex"));
+    }
+  }
+  for (const bin of candidates) {
+    let out = "";
+    try {
+      if (!fs.existsSync(bin)) continue;
+      out = execFileSync(bin, ["debug", "models", "--bundled"], {
+        encoding: "utf8",
+        timeout: 15000,
+        maxBuffer: 8 << 20,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+        // 隔离 CODEX_HOME：--bundled 只是"不刷新"，仍会读用户的 config.toml
+        env: { ...process.env, CODEX_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "agenthub-cx-")) },
+      });
+    } catch {
+      continue; // 装的是别的 codex / 版本太老不认 debug models，换下一个候选
+    }
+    try {
+      const models = (JSON.parse(out) || {}).models;
+      if (Array.isArray(models) && models.length) return models;
+    } catch { /* 输出不是 JSON，换下一个候选 */ }
+  }
+  return null;
+}
+
+/** 从内置目录挑一条做模板：优先偏好列表，其次取 base_instructions 最长的（信息最多） */
+function pickCodexTemplate(models) {
+  for (const slug of CODEX_CLONE_PREFER) {
+    const hit = models.find((m) => m && m.slug === slug && (m.base_instructions || (m.model_messages || {}).instructions_template));
+    if (hit) return hit;
+  }
+  return models
+    .filter((m) => m && m.slug && !/auto-review/.test(m.slug) && (m.base_instructions || (m.model_messages || {}).instructions_template))
+    .sort((a, b) => String((b.model_messages || {}).instructions_template || b.base_instructions || "").length
+      - String((a.model_messages || {}).instructions_template || a.base_instructions || "").length)[0] || null;
+}
+
+/**
+ * Codex model catalog：按本机客户端自带的条目克隆一条，只换 slug/展示名与我们要的档位。
+ *
+ * 为什么必须克隆而不是手写：条目的 instructions_template 会**替换**（不是追加）内置系统提示，
+ * 漏写就得到一个没有系统提示的 Codex；而字段又随版本增加，手写迟早会缺字段导致启动即报错。
+ *
+ * 取不到内置目录时返回 null：调用方据此不写 model_catalog_json。
+ * 退化成「元数据未找到，使用回退元数据」的警告——功能可用，比让客户端开不起来好。
+ */
+function buildCodexCatalog(model, template) {
+  const src = template;
+  if (!src) return null;
+  const entry = JSON.parse(JSON.stringify(src));
+  const mdl = String(model);
+  entry.slug = mdl;
+  entry.display_name = mdl;
+  entry.description = "";
+  delete entry.comp_hash; // 内置条目的内容哈希，克隆后已不成立
+  if ("visibility" in entry) entry.visibility = "list";
+  if ("supported_in_api" in entry) entry.supported_in_api = true;
+  if ("priority" in entry) entry.priority = 1000;
+  return { models: [entry] };
 }
 
 /**
@@ -361,11 +431,11 @@ function verifyClaude(before, after) {
   return problems;
 }
 
-/** Codex：三个顶层键 + provider 段里的 base_url/wire_api 落位 */
-function verifyCodex(toml) {
+/** Codex：顶层键 + provider 段里的 base_url/wire_api 落位（目录键由 withCatalog 决定是否要求） */
+function verifyCodex(toml, opts) {
   const problems = [];
   if (!/^\s*model_provider\s*=\s*"agenthub"/m.test(toml)) problems.push("model_provider 未指向 agenthub");
-  if (!/^\s*model_catalog_json\s*=/m.test(toml)) problems.push("model_catalog_json 未写入");
+  if (!(opts && opts.withCatalog === false) && !/^\s*model_catalog_json\s*=/m.test(toml)) problems.push("model_catalog_json 未写入");
   const sec = new RegExp(`\\[model_providers\\.${CODEX_PROVIDER_ID}\\]([\\s\\S]*?)(?:\\n\\[|$)`).exec(toml);
   if (!sec) problems.push("provider 段缺失");
   else {
@@ -473,6 +543,16 @@ function apply({ appType, apiKey, model, tiers, port, confirmAck } = {}) {
       ? `当前 ${app.url} 由 CC Switch 本地路由接管。写入直连配置后，需要到 CC Switch 里停用该应用的本地路由，否则它会在下次切换时把你的配置覆盖回去。`
       : `将写入 ${app.files.join("、")}（写前自动备份，只改 AgentHub 负责的键，其它配置保持不变）。`,
   };
+  // Codex 的模型目录要从本机客户端克隆（预检与写入共用这一次结果，别为同一件事起两次子进程）；
+  // 取不到就降级成不写目录，Codex 用回退元数据并告警。提前告知，免得用户以为写入失败或漏配了什么。
+  let codexCatalog = null;
+  if (t === "codex") {
+    codexCatalog = buildCodexCatalog(mdl, pickCodexTemplate(codexBundledCatalog() || []));
+    if (!codexCatalog) {
+      probe.warn = "未找到本机 Codex 客户端（PATH 或 ChatGPT.app），无法生成模型元数据：将不写模型目录，"
+        + "Codex 启动时会提示「Model metadata not found」并按回退元数据运行；装好 Codex 后重新写入可消除。";
+    }
+  }
   if (!confirmAck) {
     // 顶层也带 appType：前端两阶段（预检/写入）用同一个字段取值，避免只在 probe 里出现导致的读空
     return { ok: true, appType: t, needConfirm: true, probe, message: probe.confirmText };
@@ -500,12 +580,18 @@ function apply({ appType, apiKey, model, tiers, port, confirmAck } = {}) {
       const before = (() => {
         try { return fs.readFileSync(tomlPath, "utf8"); } catch { return ""; }
       })();
-      const toml = buildCodexToml(before).replace(/\{\{BASE\}\}/g, base).replace(/\{\{MODEL\}\}/g, mdl);
+      // 目录在预检阶段就克隆好了：字段随版本增加，手写会被下个版本判成无法加载；
+      // 取不到就不写目录，让 Codex 用回退元数据跑——可用但会警告，好过开不起来。
+      const catalog = codexCatalog;
+      const withCatalog = !!catalog;
+      const toml = buildCodexToml(before, { withCatalog })
+        .replace(/\{\{BASE\}\}/g, base)
+        .replace(/\{\{MODEL\}\}/g, mdl);
       writeAtomic(tomlPath, toml);
       writeAtomic(path.join(root, "auth.json"), JSON.stringify({ OPENAI_API_KEY: key }, null, 2) + "\n", { secret: true });
-      writeAtomic(path.join(root, CODEX_CATALOG_FILE), JSON.stringify(buildCodexCatalog(mdl), null, 2) + "\n");
+      if (withCatalog) writeAtomic(path.join(root, CODEX_CATALOG_FILE), JSON.stringify(catalog, null, 2) + "\n");
       const after = fs.readFileSync(tomlPath, "utf8");
-      const problems = verifyCodex(after);
+      const problems = verifyCodex(after, { withCatalog });
       if (problems.length) return rollback(t, backup, `写入校验失败：${problems.join("；")}`);
     } else {
       const lib = path.join(userDataRoot(), "Claude-3p", "configLibrary");
@@ -590,4 +676,18 @@ function restoreLatest({ appType } = {}) {
   return { ok: true, restored: n, backupPath: dir, message: n ? `已从 ${dir} 恢复 ${n} 个文件` : "备份目录里没有匹配的文件" };
 }
 
-module.exports = { status, apply, restoreLatest, DIRECT_APPS, targetsOf, gatewayBase, buildCodexToml, buildDesktopProfile, buildDesktopAliases, DESKTOP_TIER_NAMES, desktopNameOk };
+module.exports = {
+  status,
+  apply,
+  restoreLatest,
+  DIRECT_APPS,
+  targetsOf,
+  gatewayBase,
+  buildCodexToml,
+  buildCodexCatalog,
+  pickCodexTemplate,
+  buildDesktopProfile,
+  buildDesktopAliases,
+  DESKTOP_TIER_NAMES,
+  desktopNameOk,
+};
