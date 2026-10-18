@@ -182,6 +182,9 @@ ok("号池页行内三态与详情弹窗", /checkinRowState/.test(view) && /chec
 const adSrc = read("electron/backend/proxy/adapters.cjs");
 ok("行内按钮对 workbuddy_ai 显式传 trial 动作", /acc\.channel === "workbuddy_ai" \? "trial" : "checkin"/.test(view));
 ok("trial 成功提取 claimedCredit（任务日志记实际收益）", /claimedCredit: Number\(\(d && \(d\.credit \?\? d\.today_credit/.test(adSrc));
+// trial 幂等报文识别：上游英文 has applied trial / already applied 与中文「已领取」都必须认成 already，
+// 只认错误码 14051 会把幂等显示成红色「领取失败」
+ok("trial 幂等识别覆盖英文与中文报文", /has\\s\+applied/.test(adSrc) && /applied\\s\+trial/.test(adSrc) && /already\\s\+\(applied\|claimed\|used\)/.test(adSrc) && /已领取\|已领过/.test(adSrc));
 ok("growthLog reward 兼容 claimedCredit", /x\.credit \|\| x\.claimedCredit/.test(idx));
 // fork：渠道指定账号（托盘面板写 proxy.pinnedAccount，选号优先命中）
 const poolSrc = read("electron/backend/proxy/pool.cjs");

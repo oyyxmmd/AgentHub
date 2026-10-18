@@ -1651,7 +1651,9 @@ function makeWorkBuddy(channelId) {
     },
 
     /** 国际版一次性 trial 加油包（CN 无此端点）：幂等码 14051 = 已领过。
-     *  成功时从响应体提取 claimedCredit（领取到账的积分），供任务日志/托盘展示实际收益 */
+     *  成功时从响应体提取 claimedCredit（领取到账的积分），供任务日志/托盘展示实际收益。
+     *  already 判定要覆盖上游多种报文形态——实测英文 has applied trial / already applied
+     *  与中文「已领取/已领过」都出现过，只认 14051 会把幂等当成领取失败（红「领取失败」） */
     async trial(account, secrets) {
       const r = await this.billingCall(account, secrets, ["/billing/ide/trial", "/v2/billing/ide/trial"], "{}");
       const code = Number((r.data && r.data.code) ?? 0);
@@ -1665,7 +1667,16 @@ function makeWorkBuddy(channelId) {
           message: msg || "加油包领取成功",
         };
       }
-      if (/\b14051\b/.test(msg) || /已领取|已领过|already/i.test(msg)) return { ok: true, claimed: false, already: true, message: msg || "已领取过" };
+      // 已被应用/已领取 = 幂等语义（成功，不算失败）
+      if (
+        /\b14051\b/.test(msg) ||
+        /已领取|已领过|已申请|已经领取/i.test(msg) ||
+        /already\s+(applied|claimed|used)/i.test(msg) ||
+        /has\s+applied/i.test(msg) ||
+        /\bapplied\s+trial\b/i.test(msg)
+      ) {
+        return { ok: true, claimed: false, already: true, message: msg || "已领取过" };
+      }
       return { ok: false, message: msg || `领取失败 HTTP ${r.status}` };
     },
 
