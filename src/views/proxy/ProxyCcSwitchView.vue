@@ -470,6 +470,76 @@ onMounted(() => {
         <div v-else class="set-desc">正在检测本机客户端配置…</div>
       </div>
 
+      <!-- 注册参数：Key / 默认模型 / 四档（CC Switch 与直连共用） -->
+      <div class="card" style="margin-top: 12px">
+        <div class="card-title">
+          注册参数
+          <span class="right"><span class="tag tag-dim">{{ mode === "ccswitch" ? "两种模式共用" : "两种模式共用" }}</span></span>
+        </div>
+        <div class="set-desc" style="margin-bottom: 10px">
+          网关 Key 与默认模型是两种接入方式共用的参数：Claude 覆盖主模型与 Sonnet / Opus / Haiku / 子代理四档
+          （可独立配置，留空的档跟随默认模型）；Codex 只用默认模型。
+          <template v-if="mode === 'ccswitch'">
+            参数在点击注册时写入 CC Switch，修改后请重新注册以同步；注册后需在 CC Switch 为该应用开启本地路由再切换到该条目。
+          </template>
+          <template v-else>
+            参数在点击「直连」时写入客户端配置；Claude Desktop 的四档角色名会自动登记到网关别名表，改完重新写入即可生效。
+          </template>
+        </div>
+        <div v-if="keyOpts.length" class="co-row">
+          <span class="co-label">网关 API Key</span>
+          <el-select v-model="keyId" class="f-el-select" popper-class="glass-popper" style="width: 300px" placeholder="选择 API Key">
+            <el-option v-for="k in keyOpts" :key="k.id" :value="k.id" :label="`${k.name} · ${k.mask}`" />
+          </el-select>
+        </div>
+        <div v-else class="set-desc err-text">还没有可用的网关 Key，请先到「API Keys」页生成</div>
+        <div class="co-row" style="margin-top: 10px">
+          <span class="co-label">默认模型</span>
+          <el-select
+            v-model="model"
+            class="f-el-select"
+            popper-class="glass-popper"
+            style="width: 300px"
+            filterable
+            placeholder="默认模型"
+            @change="onModelChange"
+          >
+            <!-- 空值 = 跟随全局回退模型（等价旧 placeholder 提示） -->
+            <el-option value="" :label="`跟随全局回退模型：${fallback || '—'}`" />
+            <!-- 当前值已不在目录：补项显示，避免下拉空白让人误以为没配置 -->
+            <el-option v-if="staleModel" :key="staleModel" :value="staleModel" :label="`${staleModel}（已不在模型目录）`" />
+            <el-option-group v-if="normalModels.length" label="对话模型">
+              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="m.enabled ? m.id : `${m.id}（已禁用）`" />
+            </el-option-group>
+            <el-option-group v-if="internalModels.length" label="内部条目">
+              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="m.id" />
+            </el-option-group>
+          </el-select>
+          <span v-if="saved" class="tag tag-ok">已保存 · 重新注册后同步</span>
+        </div>
+        <!-- Claude 四档独立模型（Claude Code env 五组键 / Desktop 四档角色路由共用同一组值；Codex 不使用） -->
+        <div v-for="t in TIER_META" :key="t.key" class="co-row" style="margin-top: 10px">
+          <span class="co-label">{{ t.label }}</span>
+          <el-select
+            v-model="tiers[t.key]"
+            class="f-el-select"
+            popper-class="glass-popper"
+            style="width: 300px"
+            filterable
+            :placeholder="`跟随默认模型（${model || fallback || '—'}）`"
+            @change="onTierChange"
+          >
+            <el-option value="" :label="`跟随默认模型：${model || fallback || '—'}`" />
+            <el-option v-if="staleTier(t.key)" :key="staleTier(t.key)" :value="staleTier(t.key)" :label="`${staleTier(t.key)}（已不在模型目录）`" />
+            <el-option-group v-if="normalModels.length" label="对话模型">
+              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="m.enabled ? m.id : `${m.id}（已禁用）`" />
+            </el-option-group>
+            <el-option-group v-if="internalModels.length" label="内部条目">
+              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="m.id" />
+            </el-option-group>
+          </el-select>
+        </div>
+      </div>
       <template v-if="mode === 'ccswitch'">
       <div v-if="result && result.ok" class="card ok-card">
         <div class="set-desc">
@@ -543,69 +613,6 @@ onMounted(() => {
         </div>
       </div>
 
-      <!-- 注册参数：Key / 默认模型 -->
-      <div class="card" style="margin-top: 12px">
-        <div class="card-title">注册参数</div>
-        <div class="set-desc" style="margin-bottom: 10px">
-          网关 Key 与默认模型会写入条目配置：Claude 条目覆盖主模型与 Sonnet / Opus / Haiku / 子代理四档（可独立配置，留空的档跟随默认模型）；
-          Claude Desktop 条目将四档角色路由按档映射（子代理档即第四档 Fable），菜单显示名同步为各档模型以免与真实请求的模型不一致。
-          参数在点击注册时写入 CC Switch，修改后请重新注册以同步。注册后需在 CC Switch 为该应用开启本地路由，
-          再切换到该条目；无需重启 CC Switch。
-        </div>
-        <div v-if="keyOpts.length" class="co-row">
-          <span class="co-label">网关 API Key</span>
-          <el-select v-model="keyId" class="f-el-select" popper-class="glass-popper" style="width: 300px" placeholder="选择 API Key">
-            <el-option v-for="k in keyOpts" :key="k.id" :value="k.id" :label="`${k.name} · ${k.mask}`" />
-          </el-select>
-        </div>
-        <div v-else class="set-desc err-text">还没有可用的网关 Key，请先到「API Keys」页生成</div>
-        <div class="co-row" style="margin-top: 10px">
-          <span class="co-label">默认模型</span>
-          <el-select
-            v-model="model"
-            class="f-el-select"
-            popper-class="glass-popper"
-            style="width: 300px"
-            filterable
-            placeholder="默认模型"
-            @change="onModelChange"
-          >
-            <!-- 空值 = 跟随全局回退模型（等价旧 placeholder 提示） -->
-            <el-option value="" :label="`跟随全局回退模型：${fallback || '—'}`" />
-            <!-- 当前值已不在目录：补项显示，避免下拉空白让人误以为没配置 -->
-            <el-option v-if="staleModel" :key="staleModel" :value="staleModel" :label="`${staleModel}（已不在模型目录）`" />
-            <el-option-group v-if="normalModels.length" label="对话模型">
-              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="m.enabled ? m.id : `${m.id}（已禁用）`" />
-            </el-option-group>
-            <el-option-group v-if="internalModels.length" label="内部条目">
-              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="m.id" />
-            </el-option-group>
-          </el-select>
-          <span v-if="saved" class="tag tag-ok">已保存 · 重新注册后同步</span>
-        </div>
-        <!-- Claude 四档独立模型（Claude Code env 五组键 / Desktop 四档角色路由共用同一组值；Codex 不使用） -->
-        <div v-for="t in TIER_META" :key="t.key" class="co-row" style="margin-top: 10px">
-          <span class="co-label">{{ t.label }}</span>
-          <el-select
-            v-model="tiers[t.key]"
-            class="f-el-select"
-            popper-class="glass-popper"
-            style="width: 300px"
-            filterable
-            :placeholder="`跟随默认模型（${model || fallback || '—'}）`"
-            @change="onTierChange"
-          >
-            <el-option value="" :label="`跟随默认模型：${model || fallback || '—'}`" />
-            <el-option v-if="staleTier(t.key)" :key="staleTier(t.key)" :value="staleTier(t.key)" :label="`${staleTier(t.key)}（已不在模型目录）`" />
-            <el-option-group v-if="normalModels.length" label="对话模型">
-              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="m.enabled ? m.id : `${m.id}（已禁用）`" />
-            </el-option-group>
-            <el-option-group v-if="internalModels.length" label="内部条目">
-              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="m.id" />
-            </el-option-group>
-          </el-select>
-        </div>
-      </div>
       </template>
     </div>
   </section>

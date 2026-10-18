@@ -178,6 +178,19 @@ console.log("4. Claude Desktop profile");
   ok("_meta appliedId 指向 AgentHub profile", meta.appliedId !== "ccs-profile");
   ok("_meta 保留原有 CC Switch 条目", meta.entries.some((e) => e.id === "ccs-profile"));
   ok("_meta 含 AgentHub 条目", meta.entries.length === 2);
+
+  // ★ 网关别名登记：客户端发的是角色名，不登记会被判「不在任何渠道目录」400
+  const cfg = require("../electron/backend/config.cjs").loadConfig();
+  const aliases = cfg.proxy.modelAliases || {};
+  for (const m of prof.inferenceModels) {
+    ok(`别名表登记了角色名 "${m.name}"`, typeof aliases[m.name] === "string" && aliases[m.name].length > 0, `实际 ${aliases[m.name]}`);
+    ok(`角色名 "${m.name}" 映射到与该档 labelOverride 一致的模型`, aliases[m.name] === m.labelOverride);
+  }
+  ok("sonnet 角色名映射到自定义模型", aliases["sonnet-4-5"] === "kimi-k3");
+  ok("opus 角色名映射到默认模型（该档留空）", aliases["opus-4-5"] === "glm-5.3");
+  // 复用校验：buildDesktopAliases 不破坏用户已有别名
+  const merged = direct.buildDesktopAliases({ "my-custom-alias": "glm-5" }, { model: "deepseek-v4", tiers: {} });
+  ok("登记别名不影响用户已有别名", merged["my-custom-alias"] === "glm-5" && merged["sonnet-4-5"] === "deepseek-v4");
 }
 
 // ===== 5. 回滚 =====

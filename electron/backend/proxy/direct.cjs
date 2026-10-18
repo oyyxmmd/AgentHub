@@ -43,7 +43,9 @@ const DESKTOP_PROFILE_NAME = "AgentHub 直连";
 /** Codex model catalog 文件名（自建，不抢 CC Switch 的 cc-switch-model-catalog.json） */
 const CODEX_CATALOG_FILE = "agenthub-model-catalog.json";
 
-/** Desktop 四档角色名：必须匹配客户端校验正则 (sonnet|opus|haiku|fable|mythos)(-数字) */
+/** Desktop 四档角色名：必须匹配客户端校验正则 (sonnet|opus|haiku|fable|mythos)(-数字)。
+ *  同时这些名字会被登记进网关 modelAliases（见 applyDesktopAliases）——客户端发的是
+ *  角色名，网关按别名表映射回真实模型；不登记会得到 400「不在任何渠道目录中」。 */
 const DESKTOP_TIER_NAMES = {
   sonnet: "sonnet-4-5",
   opus: "opus-4-5",
@@ -322,6 +324,26 @@ function buildDesktopMeta(existing) {
   return meta;
 }
 
+/**
+ * Desktop 直连必需：把四档角色名登记进网关 modelAliases。
+ *
+ * 为什么必须有：客户端发出去的 model 是角色名（sonnet-4-5），网关拿它去渠道目录里找
+ * → 找不到 → 400「模型 "sonnet-4-5" 不在任何渠道目录中」。别名解析在 server.cjs 里
+ * 早于目录校验执行，所以登记别名后即可路由到真实模型。
+ *
+ * 反方向（modelReverseAliases）不写：Desktop 只发角色名，不需要把真实模型名映射回去。
+ * 返回本次写入的别名表，供调用方判断是否需要落盘。
+ */
+function buildDesktopAliases(existingAliases, { model, tiers }) {
+  const upstream = String(model);
+  const tierOf = (k) => String((tiers && tiers[k]) || "").trim() || upstream;
+  const next = { ...(existingAliases || {}) };
+  for (const [tier, name] of Object.entries(DESKTOP_TIER_NAMES)) {
+    next[name] = tierOf(tier);
+  }
+  return next;
+}
+
 // ===== 写后校验 =====
 
 /** Claude Code：env 目标键全部落位 + 原有顶层键一个不少 */
@@ -504,6 +526,13 @@ function apply({ appType, apiKey, model, tiers, port, confirmAck } = {}) {
       const lost = (beforeMeta.entries || []).filter((e) => e && e.id !== DESKTOP_PROFILE_ID && !(afterMeta.entries || []).some((x) => x && x.id === e.id));
       if (lost.length) problems.push(`原有 profile 条目丢失：${lost.map((e) => e.name || e.id).join("、")}`);
       if (problems.length) return rollback(t, backup, `写入校验失败：${problems.join("；")}`);
+
+      // 角色名必须登记进网关别名表，否则客户端发 sonnet-4-5 会被判「不在任何渠道目录」400。
+      // 放在客户端文件全部校验通过之后写：配置写失败就不该留下半套别名。
+      const cfgAll = config.loadConfig();
+      const aliases = buildDesktopAliases(cfgAll.proxy.modelAliases, { model: mdl, tiers });
+      cfgAll.proxy.modelAliases = aliases;
+      config.saveConfig(cfgAll);
     }
   } catch (e) {
     return rollback(t, backup, `写入失败：${(e && e.message) || e}`);
@@ -561,4 +590,4 @@ function restoreLatest({ appType } = {}) {
   return { ok: true, restored: n, backupPath: dir, message: n ? `已从 ${dir} 恢复 ${n} 个文件` : "备份目录里没有匹配的文件" };
 }
 
-module.exports = { status, apply, restoreLatest, DIRECT_APPS, targetsOf, gatewayBase, buildCodexToml, buildDesktopProfile, desktopNameOk };
+module.exports = { status, apply, restoreLatest, DIRECT_APPS, targetsOf, gatewayBase, buildCodexToml, buildDesktopProfile, buildDesktopAliases, DESKTOP_TIER_NAMES, desktopNameOk };
