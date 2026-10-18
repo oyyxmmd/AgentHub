@@ -7,7 +7,7 @@ import type {
   ProxyGatewayStatus, ProxyKeyRow, ProxyChannelView, ProxyAccount, ProxyStatsOverview, ProxyStatsDetail,
   ProxyStatsDim, ProxyStatsAggRow, ProxyStatsKeyRow,
   ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy, ProxyCostTier,
-  ProxyCheckinRow, ProxyGrowthRow, ProxyGrowthLogEntry, CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, ZcodeDeviceStatusResult, ZcodeClaimModeResult,
+  ProxyCheckinRow, ProxyGrowthRow, ProxyGrowthLogEntry, CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, DirectAppType, DirectStatus, DirectApplyResult, DirectRestoreResult, ZcodeDeviceStatusResult, ZcodeClaimModeResult,
   ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   ProxyOpLogList,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
@@ -23,6 +23,7 @@ export type {
   ProxyStatsDim, ProxyStatsAggRow, ProxyStatsKeyRow,
   ProxyUsageRow, ProxyModel, ProxyScanCandidate, ProxyRuleFile, ProxyRoute, ProxyChannelId, ProxyPoolStrategy, ProxyCostTier,
   ProxyAccountStatus, ProxyEvent, ProxyCheckinRow, ProxyGrowthRow, ProxyGrowthLogEntry, CcSwitchStatus, CcSwitchRegisterResult,
+  DirectAppType, DirectStatus, DirectApplyResult, DirectRestoreResult,
   ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   ProxyOpLogList, ProxyOpLogRow,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
@@ -504,10 +505,22 @@ export const proxyOpenRulesDir = () => call<{ ok: boolean }>("proxy_open_rules_d
 export const proxyOpenDataDir = () => call<{ ok: boolean }>("proxy_open_data_dir");
 export const proxyVaultStatus = () => call<{ encrypted: boolean; driver: string; dataDir: string }>("proxy_vault_status");
 
-// ===== 反代网关：生态接入（CC Switch） =====
+// ===== 反代网关：生态接入（CC Switch / 直连） =====
 export const proxyCcSwitchStatus = () => call<CcSwitchStatus>("proxy_ccswitch_status");
 export const proxyCcSwitchRegister = (opts: { appType: CcSwitchAppType; apiKey: string; model: string; tiers?: { sonnet: string; opus: string; haiku: string; subagent: string }; port?: number }) =>
   call<CcSwitchRegisterResult>("proxy_ccswitch_register", opts as unknown as Record<string, unknown>);
+/** 直连模式状态（读各客户端配置文件的实际指向） */
+export const proxyDirectStatus = (port?: number) =>
+  call<DirectStatus>("proxy_direct_status", (port ? { port } : {}) as Record<string, unknown>);
+/** 直连写入：首调只预检（needConfirm + probe），带 confirmAck 重调才真正落盘 */
+export const proxyDirectApply = (opts: {
+  appType: DirectAppType; apiKey: string; model: string;
+  tiers?: { sonnet: string; opus: string; haiku: string; subagent: string };
+  port?: number; confirmAck?: boolean;
+}) => call<DirectApplyResult>("proxy_direct_apply", opts as unknown as Record<string, unknown>);
+/** 直连回滚：用最近一次备份恢复该应用的配置 */
+export const proxyDirectRestore = (appType: DirectAppType) =>
+  call<DirectRestoreResult>("proxy_direct_restore", { appType });
 
 // ===== 记忆中枢：配置 / 根目录 =====
 export const memoryConfigGet = () => call<MemoryConfigEnvelope>("memory_config_get");

@@ -21,6 +21,7 @@ const ideswitch = require("./ideswitch.cjs");
 const poolsync = require("./poolsync.cjs");
 const poolsched = require("./poolsched.cjs");
 const ccswitch = require("./ccswitch.cjs");
+const direct = require("./direct.cjs");
 const oplog = require("./oplog.cjs");
 const xlsx = require("./xlsx.cjs"); // xlsx 写入器在本目录（v1.57.0 误写 ../xlsx.cjs，顶层 require 抛错 → 启动即崩）
 const zcodeLocal = require("./zcodeLocal.cjs");
@@ -1372,6 +1373,26 @@ function register(ipcMain) {
     const r = ccswitch.register({ appType, apiKey, model, tiers, port });
     oplog.log(r && r.ok === false ? "error" : "info", "生态接入",
       r && r.ok ? `CC Switch 已注册（${String(appType || "")}，${r.action === "updated" ? "更新条目" : "新增条目"}）` : r && r.message || "注册失败",
+      { target: String(appType || "") });
+    return r;
+  }));
+
+  // ===== 生态接入：直连模式（不经 CC Switch，直接写客户端配置） =====
+  // 预检 → needConfirm（展示目标文件/冲突/备份）→ 带 confirmAck 重调才落盘
+  ipcMain.handle("proxy_direct_status", handle(({ port } = {}) => direct.status({ port })));
+  ipcMain.handle("proxy_direct_apply", handle(({ appType, apiKey, model, tiers, port, confirmAck }) => {
+    const r = direct.apply({ appType, apiKey, model, tiers, port, confirmAck: !!confirmAck });
+    // 预检（needConfirm）不记日志——用户可能取消，不该留痕迹
+    if (r && r.needConfirm) return r;
+    oplog.log(r && r.ok === false ? "error" : "info", "生态接入",
+      r && r.ok ? `直连配置已写入（${String(appType || "")}）` : r && r.message || "直连配置写入失败",
+      { target: String(appType || "") });
+    return r;
+  }));
+  ipcMain.handle("proxy_direct_restore", handle(({ appType }) => {
+    const r = direct.restoreLatest({ appType });
+    oplog.log(r && r.ok === false ? "error" : "warn", "生态接入",
+      r && r.ok ? `直连配置已回滚（${String(appType || "")}）` : r && r.message || "回滚失败",
       { target: String(appType || "") });
     return r;
   }));

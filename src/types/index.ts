@@ -446,6 +446,64 @@ export interface CcSwitchRegisterResult {
   message?: string;
 }
 
+/** 直连模式（不经 CC Switch，直接写客户端配置）支持的应用 */
+export type DirectAppType = "claude" | "claude-desktop" | "codex";
+
+/** 单个应用的直连状态（目标文件 + 当前指向 + 是否与 CC Switch 冲突） */
+export interface DirectAppStatus {
+  appType: DirectAppType;
+  /** 要写入的文件绝对路径（Codex 三个：config.toml / auth.json / model-catalog） */
+  files: string[];
+  /** 各文件是否已存在（区分「新建」与「修改」） */
+  exists: boolean[];
+  /** 当前实际指向的 base URL（读客户端自己的配置，空 = 未配置） */
+  url: string;
+  /** 是否已指向 AgentHub 网关 */
+  pointingGateway: boolean;
+  /** 是否由 CC Switch 本地路由（15721）接管——直连写入会被它下次切换覆盖 */
+  pointingCcSwitch: boolean;
+  /** Claude Desktop 专用：当前 applied profile 名 */
+  profileName?: string;
+}
+
+export interface DirectStatus {
+  port: number;
+  apps: Record<DirectAppType, DirectAppStatus>;
+}
+
+/** 直连写入的预检信息（confirmAck 前返回） */
+export interface DirectProbe {
+  appType: DirectAppType;
+  base: string;
+  files: string[];
+  exists: boolean[];
+  currentUrl: string;
+  pointingGateway: boolean;
+  conflict: boolean;
+  /** 写入后的生效提示（需重启哪个客户端） */
+  hint: string;
+  confirmText: string;
+}
+
+export interface DirectApplyResult {
+  ok?: boolean;
+  /** 需要用户确认（首调只做只读预检，带 confirmAck 重调才落盘） */
+  needConfirm?: boolean;
+  probe?: DirectProbe;
+  appType?: DirectAppType;
+  backupPath?: string;
+  files?: string[];
+  base?: string;
+  message?: string;
+}
+
+export interface DirectRestoreResult {
+  ok?: boolean;
+  restored?: number;
+  backupPath?: string;
+  message?: string;
+}
+
 /** 单个积分包/加油包明细：上游按包发放，逐包各有面值/已用/到期。
  *  expired / expiringSoon 是「时间态」，由主进程按 proxy.expiringSoonDays 出视图时现算，
  *  不落库——写进库的"今天"会被刷新时刻冻结，隔天再看全是旧的。 */

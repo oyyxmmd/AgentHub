@@ -1,14 +1,18 @@
-<!-- 反代网关 · 生态接入（CC Switch）：把 AgentHub 网关注册为 CC Switch 的 provider 条目，
-     上游格式 = OpenAI Chat Completions（http://127.0.0.1:{port}/v1），Claude Code / Codex / Claude Desktop 的原生协议
-     由 CC Switch 翻译后再打到网关；注册前自动备份 CC Switch 数据库，且只 upsert 固定 id 条目 -->
+<!-- 反代网关 · 生态接入：两种接入方式
+     ① CC Switch：把网关注册为它的 provider 条目，原生协议由 CC Switch 翻译（需要它的本地路由常驻）
+     ② 直连：直接写各客户端自己的配置（Claude Code / Claude Desktop / Codex），
+        协议翻译由网关自己完成（/v1/messages、/v1/responses），不依赖 CC Switch -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import * as api from "../../api/ipc";
-import type { CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, CcSwitchTiers, CcSwitchLiveRoute, ProxyKeyRow, ProxyModel } from "../../types";
+import type { CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, CcSwitchTiers, CcSwitchLiveRoute, DirectAppType, DirectStatus, DirectApplyResult, ProxyKeyRow, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
 
 const app = useAppStore();
+/** 接入方式：ccswitch = 注册到 CC Switch；direct = 直接写客户端配置 */
+const mode = ref<"ccswitch" | "direct">("ccswitch");
 const st = ref<CcSwitchStatus | null>(null);
+const dst = ref<DirectStatus | null>(null);
 const keys = ref<ProxyKeyRow[]>([]);
 const models = ref<ProxyModel[]>([]);
 const keyId = ref("");
@@ -17,6 +21,10 @@ const model = ref("");
 const tiers = ref<CcSwitchTiers>({ sonnet: "", opus: "", haiku: "", subagent: "" });
 const busy = ref<CcSwitchAppType | "">("");
 const result = ref<CcSwitchRegisterResult | null>(null);
+/** 直连写入的预检结果（用户确认后带 confirmAck 重调） */
+const directProbe = ref<DirectApplyResult | null>(null);
+const directResult = ref<DirectApplyResult | null>(null);
+const directErr = ref("");
 const err = ref("");
 const saved = ref(false); // 默认模型已写回配置
 
@@ -25,6 +33,12 @@ const APP_LABELS: Record<CcSwitchAppType, string> = {
   codex: "Codex",
   "claude-desktop": "Claude Desktop",
 };
+/** 直连模式的三端（顺序按使用频率） */
+const DIRECT_APPS: { id: DirectAppType; label: string; note: string }[] = [
+  { id: "claude", label: "Claude Code", note: "写 ~/.claude/settings.json" },
+  { id: "codex", label: "Codex（CLI + 桌面端）", note: "写 ~/.codex/config.toml" },
+  { id: "claude-desktop", label: "Claude Desktop", note: "写 Claude-3p profile" },
+];
 
 const installed = computed(() => !!st.value?.installed);
 const incompatible = computed(() => !!st.value?.incompatible);
@@ -109,15 +123,118 @@ const refreshTip = ref<"" | "ok" | "fail">("");
 async function refresh(): Promise<boolean> {
   refreshing.value = true;
   try {
-    st.value = await api.proxyCcSwitchStatus();
+    if (mode.value === "direct") {
+      dst.value = await api.proxyDirectStatus(port.value);
+    } else {
+      st.value = await api.proxyCcSwitchStatus();
+    }
     return true;
   } catch (e) {
     err.value = String((e as Error).message || e);
+    if (mode.value === "direct") dst.value = null;
     // 失败也要结束「检测中」态：否则 st 恒为 null，卡片会永远停在检测中
-    st.value = { installed: false };
+    else st.value = { installed: false };
     return false;
   } finally {
     refreshing.value = false;
+  }
+}
+
+/** 切换接入方式：清掉另一模式的残留提示，并重读状态 */
+async function switchMode(m: "ccswitch" | "direct") {
+  if (mode.value === m) return;
+  mode.value = m;
+  err.value = "";
+  result.value = null;
+  directProbe.value = null;
+  directResult.value = null;
+  directErr.value = "";
+  await refresh();
+}
+
+/** 直连写入第一步：预检（不落盘），成功后把 probe 交给确认卡片 */
+async function directPreview(appType: DirectAppType) {
+  if (busy.value) return;
+  busy.value = appType as CcSwitchAppType;
+  directErr.value = "";
+  directResult.value = null;
+  directProbe.value = null;
+  try {
+    const key = keys.value.find((k) => k.id === keyId.value);
+    if (!key || !key.secret) {
+      directErr.value = "请选择可用的网关 API Key（列表中的 Key 需要带完整密钥）";
+      return;
+    }
+    const r = await api.proxyDirectApply({
+      appType,
+      apiKey: key.secret,
+      model: (model.value || fallback.value || "").trim(),
+      tiers: { ...tiers.value },
+      port: port.value,
+    });
+    if (r?.ok && r.needConfirm) directProbe.value = r;
+    else directErr.value = r?.message || "预检失败";
+  } catch (e) {
+    directErr.value = String((e as Error).message || e);
+  } finally {
+    busy.value = "";
+  }
+}
+
+/** 直连写入第二步：用户确认后带 confirmAck 落盘 */
+async function directConfirm() {
+  const p = directProbe.value;
+  if (!p || busy.value) return;
+  const appType = p.appType as DirectAppType;
+  busy.value = appType as CcSwitchAppType;
+  directErr.value = "";
+  try {
+    const key = keys.value.find((k) => k.id === keyId.value);
+    if (!key || !key.secret) {
+      directErr.value = "请选择可用的网关 API Key";
+      return;
+    }
+    const r = await api.proxyDirectApply({
+      appType,
+      apiKey: key.secret,
+      model: (model.value || fallback.value || "").trim(),
+      tiers: { ...tiers.value },
+      port: port.value,
+      confirmAck: true,
+    });
+    if (r?.ok) {
+      directResult.value = r;
+      directProbe.value = null;
+      await refresh();
+    } else {
+      directErr.value = r?.message || "写入失败";
+      directProbe.value = null;
+      await refresh();
+    }
+  } catch (e) {
+    directErr.value = String((e as Error).message || e);
+  } finally {
+    busy.value = "";
+  }
+}
+
+/** 直连回滚：用最近一次备份恢复 */
+async function directRestore(appType: DirectAppType) {
+  if (busy.value) return;
+  busy.value = appType as CcSwitchAppType;
+  directErr.value = "";
+  try {
+    const r = await api.proxyDirectRestore(appType);
+    if (r?.ok) {
+      directResult.value = { ok: true, appType, message: r.message, backupPath: r.backupPath };
+      await refresh();
+    } else {
+      directErr.value = r?.message || "回滚失败";
+    }
+  } catch (e) {
+    directErr.value = String((e as Error).message || e);
+  } finally {
+    busy.value = "";
   }
 }
 
@@ -227,23 +344,127 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-title">生态接入</div>
-        <div class="page-sub">把 AgentHub 网关注册为 CC Switch 的 provider，Claude Code / Codex / Claude Desktop 的协议翻译由 CC Switch 完成</div>
+        <div class="page-sub">
+          {{ mode === "ccswitch"
+            ? "把 AgentHub 网关注册为 CC Switch 的 provider，原生协议翻译由 CC Switch 完成"
+            : "直接写各客户端自己的配置，协议翻译由网关自己完成（不依赖 CC Switch）" }}
+        </div>
       </div>
       <div class="page-actions">
-        <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'claude'" @click="register('claude')">
-          {{ busy === "claude" ? "注册中…" : "注册 Claude Code" }}
-        </button>
-        <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'claude-desktop'" @click="register('claude-desktop')">
-          {{ busy === "claude-desktop" ? "注册中…" : "注册 Claude Desktop" }}
-        </button>
-        <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'codex'" @click="register('codex')">
-          {{ busy === "codex" ? "注册中…" : "注册 Codex" }}
-        </button>
+        <template v-if="mode === 'ccswitch'">
+          <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'claude'" @click="register('claude')">
+            {{ busy === "claude" ? "注册中…" : "注册 Claude Code" }}
+          </button>
+          <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'claude-desktop'" @click="register('claude-desktop')">
+            {{ busy === "claude-desktop" ? "注册中…" : "注册 Claude Desktop" }}
+          </button>
+          <button class="btn btn-primary" :disabled="!installed || incompatible || busy === 'codex'" @click="register('codex')">
+            {{ busy === "codex" ? "注册中…" : "注册 Codex" }}
+          </button>
+        </template>
+        <template v-else>
+          <button
+            v-for="a in DIRECT_APPS"
+            :key="a.id"
+            class="btn btn-primary"
+            :disabled="!!busy"
+            @click="directPreview(a.id)"
+          >
+            {{ busy === a.id ? "处理中…" : `直连 ${a.label}` }}
+          </button>
+        </template>
       </div>
     </div>
     <div class="page-body">
+      <!-- 接入方式切换 -->
+      <div class="card mode-card">
+        <div class="mode-row">
+          <span class="mode-label">接入方式</span>
+          <div class="mode-tabs">
+            <button class="mode-tab" :class="{ active: mode === 'ccswitch' }" @click="switchMode('ccswitch')">
+              CC Switch
+              <em>经它的本地路由做协议翻译</em>
+            </button>
+            <button class="mode-tab" :class="{ active: mode === 'direct' }" @click="switchMode('direct')">
+              直连
+              <em>网关直接对接客户端，少一层依赖</em>
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div v-if="err" class="card err-card"><div class="set-desc err-text">{{ err }}</div></div>
 
+      <!-- ===== 直连模式：错误 / 预检确认 / 结果 ===== -->
+      <div v-if="mode === 'direct' && directErr" class="card err-card"><div class="set-desc err-text">{{ directErr }}</div></div>
+
+      <div v-if="mode === 'direct' && directProbe" class="card warn-card">
+        <div class="card-title">
+          {{ directProbe.probe?.conflict ? "注意：CC Switch 正在接管" : "确认写入" }}
+          <span class="right"><span class="tag tag-dim">{{ APP_LABELS[directProbe.appType as CcSwitchAppType] }}</span></span>
+        </div>
+        <div class="set-desc">{{ directProbe.probe?.confirmText }}</div>
+        <div v-if="directProbe.probe" class="set-desc" style="margin-top: 8px">
+          目标文件：<span class="mono">{{ directProbe.probe.files.join("、") }}</span>
+        </div>
+        <div v-if="directProbe.probe" class="set-desc" style="margin-top: 4px">
+          网关地址：<span class="mono">{{ directProbe.probe.base }}</span>
+          <template v-if="directProbe.probe.currentUrl"> · 当前指向：<span class="mono">{{ directProbe.probe.currentUrl }}</span></template>
+        </div>
+        <div v-if="directProbe.probe" class="set-desc" style="margin-top: 4px">{{ directProbe.probe.hint }}</div>
+        <div class="p-actions" style="margin-top: 12px">
+          <button class="btn" :disabled="!!busy" @click="directProbe = null">取消</button>
+          <button class="btn btn-primary" :disabled="!!busy" @click="directConfirm">{{ busy ? "写入中…" : "确认写入（自动备份）" }}</button>
+        </div>
+      </div>
+
+      <div v-if="mode === 'direct' && directResult && directResult.ok" class="card ok-card">
+        <div class="set-desc">
+          已写入：<b>{{ APP_LABELS[directResult.appType as CcSwitchAppType] }}</b>
+          <template v-if="directResult.base"> · 网关 <span class="mono">{{ directResult.base }}</span></template>
+        </div>
+        <div v-if="directResult.backupPath" class="set-desc" style="margin-top: 6px">
+          写前备份：<span class="mono">{{ directResult.backupPath }}</span>
+        </div>
+        <div v-if="directResult.message" class="set-desc" style="margin-top: 6px">{{ directResult.message }}</div>
+      </div>
+
+      <!-- ===== 直连模式：三端状态 ===== -->
+      <div v-if="mode === 'direct'" class="card">
+        <div class="card-title">
+          直连状态
+          <span class="right" style="display: inline-flex; align-items: center; gap: 8px">
+            <span v-if="!dst" class="tag tag-dim">检测中…</span>
+            <button class="btn btn-sm" :disabled="refreshing" @click="manualRefresh">
+              {{ refreshing ? "刷新中…" : refreshTip === "ok" ? "已刷新" : refreshTip === "fail" ? "刷新失败" : "刷新状态" }}
+            </button>
+          </span>
+        </div>
+        <div class="set-desc" style="margin-bottom: 10px">
+          直连不经过 CC Switch：网关自身提供 <span class="mono">/v1/messages</span>（Claude）与
+          <span class="mono">/v1/responses</span>（Codex）两个协议面，客户端直接填网关地址即可。
+          写入只改 AgentHub 负责的键，其它配置保持原样，并自动备份。
+        </div>
+        <div v-if="dst" class="direct-rows">
+          <div v-for="a in DIRECT_APPS" :key="a.id" class="direct-row">
+            <div class="direct-name">
+              <b>{{ a.label }}</b>
+              <span class="direct-note">{{ a.note }}</span>
+            </div>
+            <div class="direct-state">
+              <span v-if="dst.apps[a.id]?.pointingGateway" class="tag tag-ok">已直连网关</span>
+              <span v-else-if="dst.apps[a.id]?.pointingCcSwitch" class="tag tag-warn">由 CC Switch 接管</span>
+              <span v-else-if="dst.apps[a.id]?.url" class="tag tag-dim">指向其它地址</span>
+              <span v-else class="tag tag-dim">未配置</span>
+              <span v-if="dst.apps[a.id]?.url" class="mono direct-url">{{ dst.apps[a.id].url }}</span>
+            </div>
+            <button class="btn btn-sm" :disabled="!!busy" @click="directRestore(a.id)">回滚</button>
+          </div>
+        </div>
+        <div v-else class="set-desc">正在检测本机客户端配置…</div>
+      </div>
+
+      <template v-if="mode === 'ccswitch'">
       <div v-if="result && result.ok" class="card ok-card">
         <div class="set-desc">
           {{ result.action === "updated" ? "已更新已有条目（配置已同步）" : "已注册新条目" }}：<b>{{ registeredName(result) }}</b>
@@ -379,6 +600,7 @@ onMounted(() => {
           </el-select>
         </div>
       </div>
+      </template>
     </div>
   </section>
 </template>
@@ -388,9 +610,110 @@ onMounted(() => {
   margin-bottom: 12px;
   border-color: var(--err, #e05555);
 }
+.warn-card {
+  margin-bottom: 12px;
+  border-color: var(--warn, #e5b454);
+}
 .ok-card {
   margin-bottom: 12px;
   border-color: var(--ok, #2fa977);
+}
+
+/* ===== 接入方式切换 ===== */
+.mode-card {
+  margin-bottom: 12px;
+}
+.mode-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.mode-label {
+  font-size: 13px;
+  color: var(--text-2);
+  flex: none;
+}
+.mode-tabs {
+  display: flex;
+  gap: 8px;
+}
+.mode-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-soft);
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+.mode-tab em {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.mode-tab:hover {
+  border-color: var(--accent-line);
+}
+.mode-tab.active {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+.mode-tab.active em {
+  color: var(--accent-strong);
+  opacity: 0.75;
+}
+
+/* ===== 直连状态行 ===== */
+.direct-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.direct-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-soft);
+}
+.direct-name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: none;
+  min-width: 160px;
+}
+.direct-name b {
+  font-size: 13px;
+  color: var(--text-1);
+}
+.direct-note {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.direct-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+.direct-url {
+  font-size: 11px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .err-text {
   color: var(--err, #e05555);

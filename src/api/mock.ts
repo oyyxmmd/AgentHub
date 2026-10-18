@@ -1239,6 +1239,45 @@ export const mock = {
           dbPath: "~/.cc-switch/cc-switch.db",
           appType: args?.appType,
         };
+      case "proxy_direct_status": {
+        const port = Number(args?.port) || 9527;
+        const mk = (appType: string, files: string[], url: string) => ({
+          appType, files, exists: files.map(() => true), url,
+          pointingGateway: url.includes(`:${port}`) && !url.includes("15721"),
+          pointingCcSwitch: url.includes("15721"),
+        });
+        return {
+          port,
+          apps: {
+            claude: mk("claude", ["~/.claude/settings.json"], "http://127.0.0.1:15721"),
+            codex: mk("codex", ["~/.codex/config.toml", "~/.codex/auth.json", "~/.codex/agenthub-model-catalog.json"], "http://127.0.0.1:15721/v1"),
+            "claude-desktop": { ...mk("claude-desktop", ["~/Library/Application Support/Claude-3p/configLibrary/agenthub-direct.json"], "http://127.0.0.1:15721/claude-desktop"), profileName: "CC Switch" },
+          },
+        };
+      }
+      case "proxy_direct_apply": {
+        const appType = String(args?.appType || "claude");
+        if (!args?.confirmAck) {
+          return {
+            ok: true,
+            needConfirm: true,
+            probe: {
+              appType,
+              base: "http://127.0.0.1:9527",
+              files: appType === "codex" ? ["~/.codex/config.toml", "~/.codex/auth.json"] : appType === "claude" ? ["~/.claude/settings.json"] : ["~/Library/Application Support/Claude-3p/configLibrary/agenthub-direct.json"],
+              exists: [true],
+              currentUrl: "http://127.0.0.1:15721",
+              pointingGateway: false,
+              conflict: true,
+              hint: "预览模式：写入后需重启客户端生效",
+              confirmText: "当前由 CC Switch 本地路由接管，写入直连配置后需在 CC Switch 里停用本地路由。",
+            },
+          };
+        }
+        return { ok: true, appType, backupPath: "~/AgentHub/proxy/direct-backup/demo", base: "http://127.0.0.1:9527", message: "预览模式：已模拟写入" };
+      }
+      case "proxy_direct_restore":
+        return { ok: true, restored: 1, backupPath: "~/AgentHub/proxy/direct-backup/demo", message: "预览模式：已模拟恢复" };
       case "proxy_key_create":
         return { id: "k-new", name: String(args?.name || "新 Key"), mask: "sk-demo···0000", route: args?.route || "auto", routeOrder: args?.routeOrder || "", dailyQuota: args?.dailyQuota || 0, rateLimit: 0, enabled: true, createdAt: NOW, todayReq: 0, todayTokens: 0, secret: "sk-demo0000000000000000000000000000000000000000000000" };
       case "proxy_key_update":
