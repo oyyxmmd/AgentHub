@@ -118,22 +118,43 @@ function ensureMachineId(product) {
 const RISK_CACHE_TTL_MS = 10 * 60 * 1000;
 const riskCache = new Map(); // product -> { at, value }
 
+/** 从 stdout 里抠出 JSON：CN 版 machine-info 前面会打若干 INFO 日志行（时间戳 + 级别），
+ *  JSON 是最后一行；Windows/国际版 runtime-info 只有纯 JSON。两种都覆盖。 */
+function parseIdentityJson(out) {
+  const text = String(out || "").trim();
+  if (!text) return null;
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    const start = line.indexOf("{");
+    if (start < 0) continue;
+    try {
+      const j = JSON.parse(line.slice(start));
+      if (j && typeof j === "object" && typeof j.machineToken === "string" && j.machineToken) return j;
+    } catch { /* 非 JSON 行，继续往前找 */ }
+  }
+  return null;
+}
+
 function readRiskIdentity(product, uid) {
-  const exe = riskIdentityPath(product);
-  if (!exe || !fs.existsSync(exe)) return null;
+  const runner = qoderInstall.riskIdentityRunner(product);
+  if (!runner || !fs.existsSync(runner.bin)) return null;
   const hit = riskCache.get(product);
   if (hit && Date.now() - hit.at < RISK_CACHE_TTL_MS) return hit.value;
   try {
-    const out = execFileSync(exe, ["--account-stdin"], {
-      input: JSON.stringify({ account: String(uid || "") }),
+    // 两种调用形态（见 qoderInstall.riskIdentityRunner）：
+    //   runtime-info：stdin 传 {"account":"<uid>"}
+    //   machine-info（CN 版 macOS）：无 stdin，账号用 -u <uid>（实测机器级身份与 uid 无关）
+    const args = runner.stdin ? runner.args : (uid ? [...runner.args, "-u", String(uid)] : runner.args);
+    const out = execFileSync(runner.bin, args, {
+      input: runner.stdin ? JSON.stringify({ account: String(uid || "") }) : undefined,
       encoding: "utf8",
       timeout: 20000, // 实测单次约 3.6s；留足余量（慢机器/杀软扫描时会更长）
       windowsHide: true,
       maxBuffer: 1 << 20,
     }).trim();
-    if (!out) return null;
-    const j = JSON.parse(out);
-    if (!j || typeof j.machineToken !== "string" || !j.machineToken) return null;
+    const j = parseIdentityJson(out);
+    if (!j) return null;
     const value = { machineToken: j.machineToken, machineType: j.machineType || "", machineCode: j.machineCode || "", vmInfo: j.vmInfo || null };
     riskCache.set(product, { at: Date.now(), value });
     return value;
