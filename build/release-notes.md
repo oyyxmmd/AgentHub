@@ -1,6 +1,13 @@
-# v1.44.8 更新说明
+# v1.44.9 更新说明
 
-本版合并上游 v1.61.0 → v1.74.0（247 个提交），并修复 WorkBuddy AI 加油包的幂等误判。
+本版合并上游 v1.61.0 → v1.74.0（247 个提交），并修复 Qoder 在 macOS 上无法领取 Credits、WorkBuddy AI 加油包幂等误判两个问题。
+
+## 本 Fork 修复
+
+- **Qoder 风控身份支持 macOS**（此前在 macOS 上一律报「需安装 Qoder 客户端」）：客户端定位只实现了 Windows 路径（`%LOCALAPPDATA%\Programs` + 注册表 + launcher 的 `state.ini`），macOS 上必然失明。已按实测形态分别支持——
+  - 国际版 `/Applications/Qoder.app/Contents/Resources/umid/runtime-info`（无 `.exe` 后缀，`--account-stdin` + stdin 传 uid）
+  - 国内版 `/Applications/Qoder CN IDE.app/Contents/Resources/app/resources/bin/<arch>_darwin/QoderCN machine-info`（无 `--account-stdin`，账号走 `-u`；输出前带 INFO 日志行，JSON 在最后一行）。国内版既无 `umid/` 也无 `app.asar.unpacked`，沿用国际版判据会永远定位不到
+- **WorkBuddy AI 加油包幂等误判**：上游 trial 端点除错误码 `14051` 与中文「已领取」外，还会回英文 `has applied trial` / `already applied`；原判定匹配不到就落到失败分支，UI 显示红色「领取失败」。已补齐幂等识别，命中即按「已完成（幂等）」处理
 
 ## 新增能力（来自上游）
 
@@ -21,10 +28,6 @@
 - **号池同步加速**：跨机同步合并快照时消除逐账号查询（几百个账号每轮少几百次数据库查询）
 - **设备指纹强化**：改用强随机算法生成，避免因随机性不足被上游误判为「同设备多账号」而触发风控
 - 反代网关白名单 403 错误类型对齐 OpenAI 同构；缺列库 / 表不存在等兼容性报错更准确
-
-## 本 Fork 修复
-
-- **WorkBuddy AI 加油包幂等误判**：上游 trial 端点除错误码 `14051` 与中文「已领取」外，还会回英文 `has applied trial` / `already applied`；原判定匹配不到就落到失败分支，UI 显示红色「领取失败」。已补齐幂等识别（含 `already applied/claimed/used`、`applied trial`、中文「已申请/已经领取」），命中即按「已完成（幂等）」处理
 
 ## 本 Fork 保留特性
 
