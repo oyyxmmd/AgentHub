@@ -1,18 +1,11 @@
-// 反代网关 · 事件广播：请求完成 / OAuth 结果等推送到渲染层（app:event，与更新推送同通道）
+// 反代网关 · 事件广播：请求完成 / OAuth 结果等按运行形态分发——Electron 推渲染层 IPC，
+// headless 走结构化日志（见 platform/index.cjs）
 "use strict";
 
-let electronWindows = null;
-try {
-  electronWindows = require("electron").BrowserWindow;
-} catch { /* 纯 Node 自测环境 */ }
+const platform = require("./platform/index.cjs");
 
 function emit(payload) {
-  if (!electronWindows) return;
-  try {
-    for (const win of electronWindows.getAllWindows()) {
-      if (!win.isDestroyed()) win.webContents.send("app:event", { event: "proxy", ...payload });
-    }
-  } catch { /* 无窗口时静默 */ }
+  platform.emit(payload);
 }
 
 module.exports = { emit };

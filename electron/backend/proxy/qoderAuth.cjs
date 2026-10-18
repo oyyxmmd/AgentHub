@@ -219,6 +219,19 @@ function encryptV10(plain, key) {
 
 // ===== 读 / 写凭据 =====
 
+/** 时间戳双形态解析（毫秒）：数字/纯数字串按 epoch 毫秒，字符串按 Date.parse。
+ *  参考（agent2api qoder/refresh.rs）实测 expires_at 是毫秒数——只走 Date.parse 时
+ *  数字串解析失败落 0，临期预刷新静默失效。解析不出返回 0（不造数）。 */
+function parseTimestampMs(v) {
+  if (v == null || v === "") return 0;
+  const n = Number(v);
+  if (Number.isFinite(n) && String(v).trim() !== "" && !/[^\d.]/.test(String(v).trim())) {
+    return n > 0 ? Math.floor(n) : 0;
+  }
+  const t = Date.parse(String(v));
+  return Number.isFinite(t) ? t : 0;
+}
+
 /** 读渠道凭据：{ token, refreshToken, expiresAt(ms), refreshTokenExpiresAt(ms), user, machineId } */
 function readCredentials(product) {
   const p = pathsOf(product);
@@ -236,8 +249,8 @@ function readCredentials(product) {
   return {
     token: String(store.token || ""),
     refreshToken: String(store.refreshToken || ""),
-    expiresAt: Date.parse(store.expiresAt || "") || 0,
-    refreshTokenExpiresAt: Date.parse(store.refreshTokenExpiresAt || "") || 0,
+    expiresAt: parseTimestampMs(store.expiresAt),
+    refreshTokenExpiresAt: parseTimestampMs(store.refreshTokenExpiresAt),
     user: store.user || {},
     machineId,
     product,
@@ -261,7 +274,7 @@ function writeCredentials(product, cred) {
     refreshTokenExpiresAt: iso(cred.refreshTokenExpiresAt),
     user: cred.user || {},
   };
-  const tmp = p.authFile + ".agenthub.tmp";
+  const tmp = `${p.authFile}.agenthub.tmp.${process.pid}`;
   fs.writeFileSync(tmp, encryptV10(Buffer.from(JSON.stringify(store), "utf8"), key));
   fs.renameSync(tmp, p.authFile); // 原子替换，避免桌面端读到半截文件
   return true;
@@ -299,8 +312,11 @@ async function refreshDeviceToken(product, refreshToken, machineId, opts = {}) {
       ok: true,
       token: String(data.device_token),
       refreshToken: String(data.refresh_token || refreshToken),
-      expiresAt: Date.parse(data.expires_at || "") || 0,
-      refreshTokenExpiresAt: Date.parse(data.refresh_token_expires_at || "") || 0,
+      // expires_at 双形态（参考实测：设备端点回 2591999994 = epoch 毫秒数字）：
+      // 数字/数字串按毫秒，字符串按 Date.parse——只走 Date.parse 时毫秒数解析失败落 0，
+      // 临期预刷新（靠落库的 expiresAt 判断）静默失效
+      expiresAt: parseTimestampMs(data.expires_at),
+      refreshTokenExpiresAt: parseTimestampMs(data.refresh_token_expires_at),
     };
   } finally {
     clearTimeout(timer);

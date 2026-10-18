@@ -124,6 +124,19 @@ export type ConflictDiff = {
   item: ConflictItem;
   left: { label: string; path: string; md: string };
   right: { label: string; path: string; md: string };
+  /** diff-link 专有：链接现状（指向哪份、还在不在、中央有没有），面板据此决定给哪几个动词 */
+  link?: {
+    linkPath: string;
+    target: string;
+    resolved: string | null;
+    isLink: boolean;
+    resolves: boolean;
+    hasSkillMd: boolean;
+    centralPath: string;
+    centralExists: boolean;
+    sameAsCentral: boolean;
+    targetInsideHub: boolean;
+  };
 };
 
 export type ToolRow = {
@@ -224,6 +237,9 @@ export interface AppConfig {
       关闭后恢复系统指针，业务逻辑不受影响 */
   fxCursor: boolean;
   moduleOrder: ModuleKey[];
+  /** 四大板块启用开关（issue #91）：关闭后左上角置灰不可点、后台完全不运行；
+      唯一写入口是 module_toggle IPC，这里的值只作展示同步 */
+  modules: Record<ModuleKey, { enabled: boolean }>;
   tools: Record<string, { enabled: boolean; paths: string[]; name?: string; icon?: string }>;
   customDirs: string[];
   mountMode: "junction" | "copy";
@@ -241,6 +257,13 @@ export interface AppConfig {
   };
   schedule: {
     minimizeToTray: boolean;
+    /** 全局快捷键：唤起/收起主窗口（默认 Alt+`，两键）。必须是「功能键+字符键」组合；
+     *  注意 ~ 会被归一成 `（~ 需要 Shift，实际是三键组合）；空串 = 不注册。
+     *  冲突时弹气泡提示并持续重试，解除后自动恢复。 */
+    shortcutToggle: string;
+    /** 轻量模式：关窗时销毁窗口（释放整个渲染进程），托盘常驻期间后端照旧跑。
+     *  仅在 minimizeToTray 开启时有意义。默认关（与改造前行为一致）。 */
+    lightweightMode: boolean;
     autoStart: boolean;
     hourly: boolean;
     daily: boolean;
@@ -279,6 +302,15 @@ export interface ProxyConfig {
   rateLimitPerMin: number;
   concurrency: number;
   creditsRefreshMin: number;
+  /** 请求流水保留期（天，1~3650）：启动 GC 与用量统计页「清理」共用，
+   *  默认 90 = 该保留期此前在 proxy/store.cjs 的 gc() 里写死的那个数 */
+  usageRetentionDays: number;
+  /** 积分包「即将到期」预警阈值（天，0~3650，0=关闭预警）。号池到期徽标与逐包明细共用这一个值，
+   *  默认 1 = 该阈值此前在 pool.cjs 里硬编码的那个数 */
+  expiringSoonDays: number;
+  /** 号池定时同步（poolsyncSchedule）：hourly 每小时档 / daily 每天固定时刻，全关 = 仅手动；
+   *  API Keys 与模型映射随号池同步走，自动同步让新设备开箱即得 */
+  poolsyncSchedule: { hourly: boolean; hourlyInterval: number; daily: boolean; dailyTime: string };
   debugStatus: boolean;
   /** 模型 → 渠道 id 的 per-model 覆盖（渠道可扩充，故为字符串值） */
   modelOverrides: Record<string, string>;
@@ -300,7 +332,7 @@ export interface ProxyConfig {
   fallbackModel: string;
   /** 跨渠道故障转移：渠道降级/耗尽时请求内自动跳其他渠道（默认开） */
   channelFailover: boolean;
-  /** 单请求最多尝试渠道数（含主渠道；上游尝试预算按模型链放大，每模型 6 次、渠道间共享） */
+  /** 单请求最多尝试渠道数（含主渠道；范围 1~10、超出按 10；上游尝试预算随上限放大：每模型 max(6, 本值+1) 次、渠道间共享，failover 关闭恒 6） */
   channelFailoverMax: number;
   /** 渠道降级基础时长（毫秒），失败翻倍防半开震荡 */
   channelCooldownMs: number;
@@ -349,7 +381,7 @@ export interface ProxyCheckinAutoRule {
 
 // ===== 反代网关：数据结构（跟 electron/backend/proxy/* 返回一一对应） =====
 
-export type ProxyChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "modelscope" | "lobster" | "zcode" | "catpaw" | "qoder" | "qoder_intl";
+export type ProxyChannelId = "trae" | "workbuddy" | "workbuddy_ai" | "raccoon" | "modelscope" | "lobster" | "zcode" | "catpaw" | "qoder" | "qoder_intl" | "autoclaw" | "autoclaw_intl" | "cline_free" | "cline_pass";
 /** Key 路由：auto 或任一渠道 id（渠道后续扩充即为普通字符串，保留字面量仅为补全提示） */
 export type ProxyRoute = "auto" | ProxyChannelId | (string & {});
 export type ProxyAccountStatus = "online" | "cooling" | "exhausted" | "relogin" | "disabled";
@@ -384,14 +416,23 @@ export interface CcSwitchEntry {
   registered: boolean;
   name?: string;
 }
+/** live 配置的实际指向（真实流量路径的地面真相）：gateway=直连 AgentHub 网关；
+ *  ccswitch=经 CC Switch 本地代理（需其运行）；other=指向其它地址；unset=未配置服务地址 */
+export interface CcSwitchLiveRoute {
+  url: string;
+  target: "gateway" | "ccswitch" | "other" | "unset";
+}
 export interface CcSwitchStatus {
   installed: boolean;
   /** 库在但 providers 表缺失等异常（按未注册展示，注册时会被更准确的报错拦截） */
   incompatible?: boolean;
   dbPath?: string;
-  /** 各应用的本地代理接管状态：只有开启接管，OpenAI Chat 上游才会被 CC Switch 转换协议；
-   *  claudeDesktop 表示 CC Switch 全局代理网关在线（Desktop 映射模式依赖它常驻，借 claude 行 proxy_enabled 判断） */
+  /** proxy_config 两列语义（实测）：enabled=接管开关的持久化意图（CC Switch 退出仍为 1，下次启动自动恢复）；
+   *  claudeDesktop 借 claude 行 proxy_enabled=当前是否接管中（Desktop 映射依赖它常驻）。
+   *  即 enabled=1 而 CC Switch 未运行时，live 已被恢复为直连，此开关不代表流量正经过它 */
   takeover?: { claude: boolean; codex: boolean; claudeDesktop: boolean };
+  /** 各应用 live 配置当前实际指向（Claude Code 读 ~/.claude/settings.json，Codex 读 ~/.codex/config.toml） */
+  live?: { claude: CcSwitchLiveRoute; codex: CcSwitchLiveRoute };
   entries?: CcSwitchEntry[];
 }
 export interface CcSwitchRegisterResult {
@@ -403,6 +444,30 @@ export interface CcSwitchRegisterResult {
   /** 写入 CC Switch 的真实条目名（与列表里显示的一致，如「AgentHub 网关（Claude Code）」） */
   name?: string;
   message?: string;
+}
+
+/** 单个积分包/加油包明细：上游按包发放，逐包各有面值/已用/到期。
+ *  expired / expiringSoon 是「时间态」，由主进程按 proxy.expiringSoonDays 出视图时现算，
+ *  不落库——写进库的"今天"会被刷新时刻冻结，隔天再看全是旧的。 */
+export interface ProxyCreditPackage {
+  /** 包唯一标识（同账号内稳定，列表 key 用）；上游缺失时回落 pack{i} */
+  code: string;
+  /** 包名/来源（如 Trae 的 display_desc、WorkBuddy 的 PackageName） */
+  name: string;
+  /** ⚠ -1 = 「上游不给这一包的总额」（界面渲染「—」），**不是**「额度不限」；
+   *  后者只由 remaining === -1 表达。两者混为一谈时，一个只是缺面值字段的包会把整个
+   *  账号的余额派生成无限并绕开 cost-first 路由。 */
+  total: number;
+  /** 已用（total 未知时为 0） */
+  used: number;
+  /** 剩余；-1 = 额度不限 */
+  remaining: number;
+  /** 到期时间戳（毫秒）；0 = 无到期 / 长期有效 */
+  expiresAt: number;
+  /** 已过期（expiresAt > 0 且 <= now） */
+  expired?: boolean;
+  /** 即将到期（now < expiresAt < now + expiringSoonDays 天） */
+  expiringSoon?: boolean;
 }
 
 export interface ProxyAccount {
@@ -422,7 +487,11 @@ export interface ProxyAccount {
   checkin?: ProxyCheckinRecord | null;
   /** 生效中的模型级负缓存（6004/11102 只罚"账号×模型"不落账号状态；空数组 = 无） */
   modelCool?: { model: string; until: number; reason: string }[];
+  /** 逐包明细（有包的渠道才有；无包的渠道这个字段不出，界面回落账号级聚合行） */
+  packages?: ProxyCreditPackage[];
   source: "scan" | "oauth" | "paste";
+  /** 账号备注（备注弹窗写入；落 meta.note，副行展示 + 随 WebDAV 同步） */
+  note?: string;
   lastUsed: number;
   todayReq: number;
   todayTokens: number;
@@ -473,6 +542,76 @@ export interface ProxyChannelView {
   pinnedAccountId: string;
 }
 
+// ===== 自定义提供商（中转站 / 自建 OpenAI 兼容端点） =====
+
+/** 提供商的上游协议形态。值集合与后端 provider.cjs 的 KINDS 同源，漂移由
+ *  scripts/test-provider-ui.cjs 断言守住。这一版只做 OpenAI Chat 一种：另两种形态需要
+ *  入站协议面与出站互转模块，随后续 PR 进来。 */
+export type ProxyProviderKind = "openai_compat";
+/** 渠道 kind：内置生态渠道（builtin）或自建提供商的协议形态 */
+export type ProxyChannelKind = "builtin" | ProxyProviderKind;
+
+/** models 条目：字符串 = 裸名且上游同名；对象 = 可带「客户端名 → 上游真名」映射与目录元数据 */
+export type ProxyProviderModel = string | {
+  model: string;
+  /** 上游真实模型名，缺省 = model。`slug/model` 路由时发给上游的是这个 */
+  upstream?: string;
+  /** 额外的可请求名：原名与别名都命中同一上游模型，但别名不出现在 /v1/models */
+  aliases?: string[];
+  /** 思考档位声明：supportedEfforts 决定客户端要的档位能否原样透传，不支持时按此降级 */
+  reasoning?: { supportedEfforts?: string[]; defaultEffort?: string };
+  name?: string;
+  rate?: number;
+  capabilities?: Record<string, boolean | string | number>;
+  contextLength?: number;
+  maxOutputTokens?: number;
+};
+
+/** 提供商条目（管理页的模型表按对象处理；字符串简写只在读侧兼容，写侧一律展开成对象） */
+export type ProxyProviderModelRow = Exclude<ProxyProviderModel, string>;
+
+/** 「Key 管理」弹窗的运行态视图。刻意不复用 ProxyAccount：它的 channel 是
+ *  ProxyChannelId 那个闭合字面量联合，而提供商的 slug 是运行期数据、编译期无从枚举。 */
+export interface ProxyProviderKey {
+  id: string;
+  name: string;
+  status: ProxyAccountStatus;
+  hasToken: boolean;
+  coolUntil: number;
+  coolReason: string;
+  todayReq: number;
+  lastUsed: number;
+}
+
+export interface ProxyProvider {
+  /** 路由前缀，创建后不可改（accounts.channel 以它为键） */
+  id: string;
+  display: string;
+  domain?: string;
+  kind: ProxyChannelKind;
+  enabled: boolean;
+  baseUrl: string;
+  models: ProxyProviderModel[];
+  extraHeaders: Record<string, string>;
+  extraBody: Record<string, unknown>;
+  updatedAt: number;
+  keyCount?: number;
+  onlineCount?: number;
+  /** Key 管理的数据源：号池视图只按内置渠道迭代、不含提供商，列表顺带把脱敏运行态带回来 */
+  keys?: ProxyProviderKey[];
+}
+
+export interface ProxyProviderTestResult {
+  ok: boolean;
+  message?: string;
+  status?: number;
+  ms?: number;
+  model?: string;
+  sample?: string;
+  finishReason?: string;
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+}
+
 export interface ProxyGatewayStatus {
   running: boolean;
   port: number;
@@ -485,6 +624,23 @@ export interface ProxyGatewayStatus {
   keyCount: number;
   vaultOk: boolean;
   dbDriver: string;
+}
+
+/** 远程网关实例（桌面连远程 Docker 版）：令牌只在主进程存在，前端只见 hasToken */
+export interface RemoteTarget {
+  id: string;
+  alias: string;
+  baseUrl: string;
+  hasToken: boolean;
+  createdAt: number;
+}
+
+export interface RemoteTestResult {
+  ok: boolean;
+  message?: string;
+  version?: string;
+  platform?: string;
+  gatewayRunning?: boolean;
 }
 
 export interface ProxyUsageRow {
@@ -507,16 +663,90 @@ export interface ProxyUsageRow {
   error: string;
 }
 
+/** 统计区间：毫秒闭区间 + 生效粒度（auto 由后端按跨度决策后回填） */
+export interface ProxyStatsRange {
+  from: number;
+  to: number;
+  granularity: "hour" | "day";
+}
+
+/** 富字段聚合行：TOP 排行与各 Key 用量共用（tokens = prompt + completion，缓存 token 是 prompt 的子集） */
+export interface ProxyStatsAggRow {
+  name: string;
+  req: number;
+  ok: number;
+  err: number;
+  successRate: number;
+  promptTokens: number;
+  completionTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  tokens: number;
+  ttftAvg: number;
+  latencyAvg: number;
+}
+
+/** 各 Key 用量行：Key 名可改，keyId 才是身份；lastTs 供「最近使用」列 */
+export interface ProxyStatsKeyRow extends ProxyStatsAggRow {
+  keyId: string;
+  lastTs: number;
+}
+
+/** 时间序列点（后端已按粒度补零，图表 x 轴连续） */
+export interface ProxyStatsPoint {
+  t: number;
+  label: string;
+  req: number;
+  ok: number;
+  err: number;
+  successRate: number;
+  promptTokens: number;
+  completionTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  tokens: number;
+  ttftAvg: number;
+  latencyAvg: number;
+}
+
+/** 区间 KPI 汇总 */
+export interface ProxyStatsSummary {
+  req: number;
+  ok: number;
+  err: number;
+  successRate: number;
+  promptTokens: number;
+  completionTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+  ttftAvg: number;
+  ttftP50: number;
+  latencyAvg: number;
+  channels: number;
+  models: number;
+  keys: number;
+  accounts: number;
+}
+
+export type ProxyStatsDim = "channel" | "model" | "key" | "account";
+
 export interface ProxyStatsOverview {
-  today: { req: number; tokens: number; successRate: number; ttftAvg: number };
-  trend: { day: string; req: number; tokens: number }[];
-  tops: Record<"channel" | "model" | "key" | "account", { name: string; req: number; tokens: number }[]>;
+  range: ProxyStatsRange;
+  summary: ProxyStatsSummary;
+  series: ProxyStatsPoint[];
+  tops: Record<ProxyStatsDim, ProxyStatsAggRow[]>;
+  keys: ProxyStatsKeyRow[];
+  status: { name: string; key: string; value: number }[];
+  tokenMix: { name: string; key: string; value: number }[];
 }
 
 export interface ProxyStatsDetail {
   total: number;
   page: number;
   pageSize: number;
+  /** 当前筛选命中的 token 汇总（与 total 同口径，供表尾量化筛选结果） */
+  agg: { req: number; promptTokens: number; completionTokens: number; cacheReadTokens: number; cacheCreationTokens: number; tokens: number };
   rows: ProxyUsageRow[];
 }
 
@@ -556,6 +786,8 @@ export interface ProxyModel {
   created: number;
   owned_by: string;
   sources: ProxyChannelId[];
+  /** 各渠道适配器声明的原始模型 id；反向映射目标必须从这里选，不能从融合后的 sources 反推 */
+  channelModelIds?: Partial<Record<ProxyChannelId, string[]>>;
   /** 目录元数据（catalog.json）：显示名 / 倍率（积分倍率，null=未知）/ 能力 / 上下文长度 */
   name?: string;
   rate?: number | null;
@@ -830,7 +1062,9 @@ export const MODULES: ModuleDef[] = [
     name: "反代网关",
     pages: [
       { id: "home", name: "总览" },
+      { id: "providers", name: "自定义提供商" },
       { id: "agents", name: "号池" },
+      { id: "expiry", name: "积分日历" },
       { id: "keys", name: "API Keys" },
       { id: "models", name: "模型目录" },
       { id: "stats", name: "用量统计" },

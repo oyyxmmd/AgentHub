@@ -219,8 +219,13 @@ async function verifyAll(opts) {
   const list = agents.list(cfgAgents).filter((a) => a.enabled);
   const beats = opts && opts.beats ? opts.beats : [];
   const out = [];
-  for (const a of list) {
-    out.push(await verifyAgent(a, { ...(opts || {}), beats }));
+  // 限并发批量握手：串行时每个 agent 最坏 20s 超时，N 个 agent = N×20s 才能出结果
+  // （巡检页转圈半分钟起步）。握手是各自 spawn 独立子进程，无共享状态，4 路并发安全
+  const CONCURRENCY = 4;
+  for (let i = 0; i < list.length; i += CONCURRENCY) {
+    const batch = list.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(batch.map((a) => verifyAgent(a, { ...(opts || {}), beats })));
+    out.push(...results);
   }
   return out;
 }

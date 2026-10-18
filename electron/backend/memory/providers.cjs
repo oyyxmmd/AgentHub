@@ -295,7 +295,9 @@ class ProviderStore {
       });
       caps.stream = true;
       caps.tools = (model.caps && model.caps.tools) !== false;
-      caps.lastProbe = { at: Date.now(), ok: true, sample: r.text.slice(0, 20) };
+      // 只存探测结论，不落响应样本：配置文件会被同步/备份，模型回显的内容（哪怕是
+      // 测试 prompt 的复述）都不该进盘
+      caps.lastProbe = { at: Date.now(), ok: true };
     } catch (e) {
       caps.lastProbe = { at: Date.now(), ok: false, message: String(e.message || e) };
     }

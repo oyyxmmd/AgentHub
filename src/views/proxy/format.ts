@@ -73,20 +73,47 @@ export function fmtCredits(n: number): string {
 /** Qoder 双区共用一套展示口径（Credits 浮点 + 领 Credits 动作），判断收敛到一处 */
 export const isQoderChannel = (id?: string): boolean => id === "qoder" || id === "qoder_intl";
 
-/** 渠道余额格式化（智谱是 Token 不是积分，同走中文数量级换算；Qoder 保持浮点 Credits） */
+/** Cline 双池共用同一套展示口径（credit 是浮点计量、无签到活动） */
+export const isClineChannel = (id?: string): boolean => id === "cline_free" || id === "cline_pass";
+
+/** 渠道余额格式化（智谱是 Token 不是积分，同走中文数量级换算；Qoder / Cline 保持浮点 Credits） */
 export function fmtBalance(val: number, channel?: string): string {
   if (val === -1) return "不限";
-  // Qoder 的 credits 是浮点（实测 0.0066 级精度），整数化会丢计量
-  if (isQoderChannel(channel)) return fmtCredits(val);
+  // Qoder / Cline 的 credits 是浮点（实测 0.0066 / -0.0177 级精度），整数化会丢计量
+  if (isQoderChannel(channel) || isClineChannel(channel)) return fmtCredits(val);
   return fmtCnAmount(val);
 }
 
 /** 渠道余额单位标签 */
 export function balanceUnit(channel?: string): string {
   if (channel === "zcode") return "Tokens";
-  if (isQoderChannel(channel)) return "Credits";
+  if (isQoderChannel(channel) || isClineChannel(channel)) return "Credits";
   return "积分";
 }
+
+/** 「剩余 / 总额」一对，含两个 -1 哨兵的分工：
+ *  total === -1 是「上游不给这一包的总额」⇒ 右格给「—」（不是「不限」，那是 remaining=-1）；
+ *  两边都是 -1（整号不限）时单位标签也省掉，否则会出现「不限 / 不限 积分」。 */
+export function fmtBalancePair(remaining: number, total: number, channel?: string): string {
+  const right = total === -1 && remaining !== -1 ? "—" : fmtBalance(total, channel);
+  const unit = remaining === -1 && total === -1 ? "" : ` ${balanceUnit(channel)}`;
+  return `${fmtBalance(remaining, channel)} / ${right}${unit}`;
+}
+
+/** 上游没给包名时的回落名。判据跟着 balanceUnit 的**实际返回值**写：
+ *  zcode 的单位是 "Tokens"（复数），照单数 "Token" 比会静默掉进最后一个分支。 */
+export function pkgFallbackName(channel?: string): string {
+  const u = balanceUnit(channel);
+  return u === "Tokens" ? "套餐额度" : u === "积分" ? "积分包" : "额度包";
+}
+
+/** 号池逐包表的「总额」「已用」两格，与上面 fmtBalancePair 同一套哨兵口径（别在模板里各写一份）：
+ *  总额格直接走 fmtBalance 会把 total=-1 念成「不限」——那是 remaining=-1 的语义，
+ *  而 total=-1 是「上游不给这一包的面值」。没有面值 ⇒ 已用同样无从推算，一并给「—」。 */
+export function fmtPkgTotal(total: number, remaining: number, channel?: string): string {
+  return total === -1 ? (remaining === -1 ? "不限" : "—") : fmtBalance(total, channel);
+}
+export const fmtPkgUsed = (used: number, total: number, channel?: string) => (total === -1 ? "—" : fmtBalance(used, channel));
 
 /** 本地时区的今天（YYYY-MM-DD）：与主进程 store.dayStr 同口径，签到记录的跨天判定用 */
 export function todayStr(): string {
@@ -147,6 +174,10 @@ export const CHANNEL_NAMES: Record<string, string> = {
   catpaw: "CatPaw（美团）",
   qoder: "Qoder CN",
   qoder_intl: "Qoder International",
+  autoclaw: "AutoClaw 国内版",
+  autoclaw_intl: "AutoClaw 国际版",
+  cline_free: "Cline Free",
+  cline_pass: "Cline Pass",
 };
 export const channelName = (id: string) => CHANNEL_NAMES[id] || id || "-";
 

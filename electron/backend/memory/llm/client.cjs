@@ -316,7 +316,7 @@ class LlmClient {
 
       for (let attemptIdx = 0; attemptIdx <= maxRetries; attemptIdx++) {
         try {
-          const r = await attempt(null);
+          let r = await attempt(null);
           if (r.status >= 200 && r.status < 300) {
             let parsed;
             try {
@@ -358,6 +358,10 @@ class LlmClient {
               this._log({ provider: cand.provider.id, model: cand.model.modelId, task, tokensIn: result.usage.input, tokensOut: result.usage.output, ok: true, latencyMs: retry.latencyMs });
               return { ...result, providerId: cand.provider.id, modelId: cand.model.modelId, effort, source: cand.source, quirk: `已剥离 ${offending}` };
             }
+            // 剥离重试仍失败：后续的 401/403/404/400 判定与 lastError 必须基于
+            // 重试后的真实状态，否则会把重试的 500 当成首次请求的状态来处理，
+            // 换源/提示信息全部错乱
+            r = retry;
           }
 
           // 401/403：该供应商不可用，直接换下一个

@@ -2,7 +2,7 @@
 // 技能仓库后台能力：定时 WebDAV 同步调度、自动感知收纳、软件自更新
 "use strict";
 const path = require("node:path");
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain, nativeTheme, Notification, screen } = require("electron");
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain, nativeTheme, Notification, globalShortcut, screen } = require("electron");
 
 // ===== 闪退取证（本地补丁 __agenthubCrashTrace）=====
 // 1.42.0 出现静默退出：Windows 无 Application Error 事件、无 minidump、应用自身零日志，
@@ -69,6 +69,11 @@ const usagesync = require("./backend/sync.cjs");
 const proxy = require("./backend/proxy/index.cjs");
 const memory = require("./backend/memory/index.cjs");
 const usageScheduler = require("./backend/usage-scheduler.cjs");
+// 全局快捷键：唤起/释放界面。冲突时弹气泡并持续重试（见 backend/shortcut.cjs）
+const shortcut = require("./backend/shortcut.cjs");
+// 轻量模式：关窗决策（纯逻辑，可自测）+ 窗口几何持久化（销毁窗口后重建要回到原位）
+const windowMode = require("./backend/window-mode.cjs");
+const windowState = require("./backend/window-state.cjs");
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL || "http://localhost:1420";
 
@@ -130,9 +135,23 @@ function dockIcon() {
   return paddedIcon("dock", iconPath("icon.png"), 1024, 824, 1);
 }
 
-/** 应用主题同步到原生窗口框架（标题栏/边框）：否则外框颜色只跟系统主题走，不跟应用主题走 */
+/** 应用主题同步到原生窗口框架（标题栏/边框）：否则外框颜色只跟系统主题走，不跟应用主题走。
+ *
+ *  同时同步**窗口画布底色**：BrowserWindow 的 backgroundColor 是窗口在页面首帧渲染出来
+ *  之前铺的底色。此前写死为深色 #0a0c0f ✗ —— 浅色主题下每次窗口重建都会先铺黑底、
+ *  再被首帧覆盖 → **闪黑** ✗。而本 PR 的轻量模式恰恰会**销毁窗口**，
+ *  用户下次唤回必然走 createWindow() 重建 → 该闪烁会被明显放大 ✓ 故一并修掉。
+ *  与 src/styles/global.css 的 --bg 取值一致：dark #0a0c0f / light #f4f6f9。
+ *  setBackgroundColor 对已存在窗口即时生效；窗口不存在（已释放）时由 createWindow
+ *  在下次创建时按当前主题取色，故这里静默跳过即可。 */
+const WINDOW_BG = { dark: "#0a0c0f", light: "#f4f6f9" };
+
 function applyNativeTheme(theme) {
   if (theme === "dark" || theme === "light") nativeTheme.themeSource = theme;
+  const bg = WINDOW_BG[theme === "light" ? "light" : "dark"];
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setBackgroundColor(bg);
+  } catch { /* 窗口正在销毁等竞态：下次 createWindow 会用当前主题取色 */ }
 }
 
 // ===== 全局大小自适应 =====
@@ -142,6 +161,51 @@ function applyNativeTheme(theme) {
 const DESIGN_WIDTH = 1280;
 const ZOOM_MIN = 0.7;
 const ZOOM_MAX = 1.25;
+
+// ===== 轻量模式：窗口几何的读写 =====
+// 销毁窗口会丢掉窗口摆放，重建时若不还原，用户每次点托盘「显示主界面」都会
+// 得到一个居中大窗 —— 所以位置/尺寸/最大化必须落盘（见 backend/window-state.cjs）。
+// 越界收敛交给 clampBounds：显示器被拔掉后旧坐标会落在不存在的屏上（窗口"打开但看不见"）。
+
+/** 读取上次的窗口几何，并收敛到当前实际存在的屏幕上 */
+function restoreWindowBounds() {
+  const saved = windowState.load(config.dataDir());
+  const clamped = windowState.clampBounds(saved.bounds, safeDisplays(), { width: 1280, height: 820 });
+  return { clamped, maximized: saved.maximized === true };
+}
+
+/** screen.getAllDisplays() 的容错包装：拿不到就当没有屏幕信息（clampBounds 会退回默认尺寸） */
+function safeDisplays() {
+  try {
+    return require("electron").screen.getAllDisplays();
+  } catch {
+    return [];
+  }
+}
+
+/** 落盘当前窗口几何：仅在有窗口且未最小化时记录（最小化时 getBounds 会给出异常值） */
+function persistWindowBounds() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    const maximized = mainWindow.isMaximized();
+    // Windows 最小化时 getBounds 给 -32000 系异常值，写进盘会把用户原位置顶掉；
+    // getNormalBounds 对最大化/最小化都返回「恢复为普通窗口时」的 bounds，两种非常态都兜住
+    const bounds = maximized || mainWindow.isMinimized() ? mainWindow.getNormalBounds() : mainWindow.getBounds();
+    windowState.save(config.dataDir(), windowState.pickState({ bounds, maximized }));
+  } catch {
+    /* 记不住位置不该影响任何主流程 */
+  }
+}
+
+/** 几何变化的落盘节流：拖动窗口时 resize/move 会高频触发，别每次都写盘 */
+let boundsSaveTimer = null;
+function schedulePersistBounds() {
+  if (boundsSaveTimer) clearTimeout(boundsSaveTimer);
+  boundsSaveTimer = setTimeout(() => {
+    boundsSaveTimer = null;
+    persistWindowBounds();
+  }, 400);
+}
 
 function applyViewportZoom() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -155,16 +219,22 @@ function applyViewportZoom() {
 }
 
 function createWindow() {
+  const { clamped, maximized } = restoreWindowBounds();
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 820,
+    width: clamped.width,
+    height: clamped.height,
+    // x/y 可能为 undefined（无历史状态/无可用屏幕）→ 交给 Electron 居中
+    x: clamped.x,
+    y: clamped.y,
     minWidth: 920,
     minHeight: 640,
     title: "AgentHub",
     icon: iconPath("icon.png"),
     autoHideMenuBar: true,
-    // 深色底色的窗口画布：消除深色主题启动瞬间的白闪（否则原生窗口先白后黑闪一下）
-    backgroundColor: "#0a0c0f",
+    // 窗口画布底色随当前主题：写死深色时，浅色主题下窗口重建会先铺黑底再被首帧覆盖 → 闪黑 ✗
+    // （轻量模式会销毁窗口，唤回即重建，故这里必须按主题取色）
+    // 取值与 src/styles/global.css 的 --bg 对齐：dark #0a0c0f / light #f4f6f9。
+    backgroundColor: WINDOW_BG[config.loadConfig().theme === "light" ? "light" : "dark"],
     // 先隐藏，等页面渲染出首帧再显示：窗口出现时内容已就绪，避免空壳闪烁
     show: false,
     webPreferences: {
@@ -190,16 +260,49 @@ function createWindow() {
   mainWindow.once("ready-to-show", reveal);
   mainWindow.webContents.once("did-finish-load", reveal);
 
+  // 最大化状态要在窗口存在后设置；恢复越界过就记一笔，便于排查「窗口位置自己变了」
+  if (maximized) {
+    try { mainWindow.maximize(); } catch { /* 某些平台/时序下可能失败，不拦启动 */ }
+  }
+  if (clamped.adjusted && clamped.reason !== "no-position") {
+    __crashLog("window-bounds-adjusted", `${clamped.reason} → ${clamped.width}x${clamped.height}+${clamped.x},${clamped.y}`);
+  }
+
   // 窗口尺寸变化 / 页面（重）载入后按当前宽度重算缩放
   applyViewportZoom();
-  mainWindow.on("resize", applyViewportZoom);
+  mainWindow.on("resize", () => { applyViewportZoom(); schedulePersistBounds(); });
   mainWindow.webContents.on("did-finish-load", applyViewportZoom);
+  // 拖动/最大化切换都要记账（move 只在非最大化时有意义，maximize/unmaximize 各记一次）
+  mainWindow.on("move", schedulePersistBounds);
+  mainWindow.on("maximize", schedulePersistBounds);
+  mainWindow.on("unmaximize", schedulePersistBounds);
 
-  // 关闭 → 缩到托盘（设置可关；托盘菜单「退出」才是真正退出），后台才能持续跑定时同步
+  // 关闭 → 按三态决策：真退出 / 缩到托盘（保留渲染进程）/ 轻量模式（销毁窗口释放渲染进程）
   mainWindow.on("close", (e) => {
     const cfg = config.loadConfig();
-    if (!quitting && cfg.schedule && cfg.schedule.minimizeToTray) {
-      e.preventDefault();
+    const action = windowMode.decideCloseAction({
+      quitting,
+      minimizeToTray: !!(cfg.schedule && cfg.schedule.minimizeToTray),
+      lightweightMode: !!(cfg.schedule && cfg.schedule.lightweightMode),
+    });
+    if (action === "quit") return; // 放行：走正常退出流程
+    e.preventDefault();
+    // 无论藏还是销毁，都先把窗口位置记下来（销毁后再也读不到）
+    persistWindowBounds();
+    if (windowMode.releasesRenderer(action)) {
+      // 轻量模式：销毁窗口 → 渲染进程整只消失（实测省 ~298 MB）。
+      // 主进程/托盘/反代网关/定时同步/记忆中枢都不受影响（它们本就不依赖窗口）。
+      // 用 setImmediate 延到本次 close 事件派发结束之后再 destroy：
+      // 在 close 回调里同步销毁自己属于重入，交给下一轮事件循环更稳。
+      // （destroy() 不会再触发 close，故不会二次进入本分支）
+      __crashLog("lightweight-enter", `渲染进程释放（mode=${cfg.schedule.lightweightMode ? "lightweight" : "no-tray"}）`);
+      const w = mainWindow;
+      mainWindow = null;
+      setImmediate(() => {
+        try { w.destroy(); } catch { /* 已销毁 */ }
+      });
+      refreshTrayMenu();
+    } else {
       mainWindow.hide();
     }
   });
@@ -213,8 +316,62 @@ function showWindow() {
   if (!mainWindow) {
     createWindow();
   } else {
-    mainWindow.show();
+    // 从托盘唤回时窗口可能是隐藏态（hide 模式），先显示再聚焦
+    if (!mainWindow.isVisible()) mainWindow.show();
     mainWindow.focus();
+  }
+}
+
+// ===== 全局快捷键：唤起 / 释放界面 =====
+// 全局生效（应用在后台/托盘时也能唤起）。按下时是「开关」语义：
+//   窗口可见   → 隐藏（hide）
+//   窗口不可见 → 显示并聚焦（没有窗口时重建）
+//
+// 收起动作按「轻量模式」开关分派（见 collapseMainWindow）：开启走释放，关闭仅 hide。
+let shortcutRegistrar = null;
+
+/** 按当前配置注册快捷键；配置变更后由 ipc 的 onConfigSaved 钩子再次调用 */
+function setupShortcut() {
+  const cfg = config.loadConfig();
+  const acc = (cfg.schedule && cfg.schedule.shortcutToggle) || "";
+
+  if (!shortcutRegistrar) {
+    shortcutRegistrar = shortcut.createRegistrar({
+      globalShortcut,
+      onTrigger: onShortcutToggle,
+      notify: (title, body) => notify(title, body),
+      log: (kind, detail) => __crashLog(kind, detail),
+    });
+  }
+  const st = shortcutRegistrar.set(acc);
+  if (st.error) __crashLog("shortcut-invalid", String(st.error));
+  return st;
+}
+
+/** 收起主界面：按「轻量模式」开关决定是隐藏还是释放渲染进程。
+ *  恒为 hide → 用户开了轻量模式却省不到内存；恒为 destroy → 没开轻量也每次唤回闪黑重建。 */
+function collapseMainWindow(reason) {
+  const cfg = config.loadConfig();
+  const lightOn = !!(cfg.schedule && cfg.schedule.lightweightMode);
+  if (lightOn) {
+    releaseWindowNow(reason);
+    return;
+  }
+  try { mainWindow.hide(); } catch { /* 已销毁：下次唤回会重建 */ }
+  refreshTrayMenu();
+}
+
+/** 快捷键按下：可见则收起界面，不可见则唤回 */
+function onShortcutToggle() {
+  try {
+    const visible = !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible();
+    if (visible) {
+      collapseMainWindow("shortcut");
+    } else {
+      showWindow();
+    }
+  } catch (e) {
+    __crashLog("shortcut-toggle-failed", String((e && e.message) || e));
   }
 }
 
@@ -246,13 +403,13 @@ function triggerUsageSync() {
   });
 }
 
-/** 今日用量摘要（托盘菜单用）：请求数 + token；无数据时返回 null */
+/** 今日用量摘要（托盘菜单用）：返回今日 token 数；无数据时返回 null */
 function usageTodaySummary() {
   try {
     const cfg = usageConfig.loadConfig();
     const s = usagedb.getSummary(cfg.totalMode || "full");
     // 无记录时返回 null（托盘显示「今日用量 —」）；todayTokens 恒 >= 0，不能用其判断空态
-    return s && s.todayRecordCount > 0 ? { count: s.todayRecordCount, tokens: s.todayTokens } : null;
+    return s && s.todayRecordCount > 0 ? s.todayTokens : null;
   } catch {
     return null;
   }
@@ -285,39 +442,133 @@ function buildTrayMenu() {
   const cfg = config.loadConfig();
   const running = remotesync.isRunning();
   const p = remotesync.progress();
+  // 板块开关（issue #91）：关闭板块的托盘入口一并隐藏，避免绕过 UI 触发已停用模块
+  const on = (k) => {
+    const m = (cfg.modules || {})[k];
+    return !m || m.enabled !== false;
+  };
   const statusText = running
     ? `同步中…（${p.stageLabel}）`
     : remotesync.configured(cfg)
       ? `上次同步 ${fmtTime(remotesync.loadRemoteState().lastSyncAt) || "—"}`
       : "未配置 WebDAV";
-  const usageToday = usageTodaySummary();
-  const items = [
-    { label: `技能仓库：${statusText}`, enabled: false },
-    { label: usageToday ? `今日 ${usageToday.count} 次请求 · ${formatNum(usageToday.tokens)} token` : "今日用量 —", enabled: false },
-    { type: "separator" },
-  ];
+  const usageToday = on("sync") ? usageTodaySummary() : null;
+  const items = [];
+  if (on("skills")) items.push({ label: `技能仓库：${statusText}`, enabled: false });
+  if (on("sync")) items.push({ label: usageToday != null ? `今日用量 ${formatNum(usageToday)} token` : "今日用量 —", enabled: false });
+  if (items.length) items.push({ type: "separator" });
   const st = updater.getStatus();
   if (st.status === "available" || st.status === "downloaded") {
     items.push({ label: `发现新版本 v${st.latestVersion} →`, click: () => { showWindow(); focusSettingsUpdate(); } });
     items.push({ type: "separator" });
   }
+  // 轻量模式：关窗缩到托盘的用户，托盘是唯一入口，所以开关必须放这里
+  // （设置 · 通用里也有同一个开关，两处写的是同一份配置）
+  const lightOn = !!(cfg.schedule && cfg.schedule.lightweightMode);
+  const trayOn = !!(cfg.schedule && cfg.schedule.minimizeToTray);
+  const hasWindow = !!mainWindow && !mainWindow.isDestroyed();
   items.push(
     { label: "显示主界面", click: showWindow },
-    { label: "立即同步技能", enabled: remotesync.configured(cfg) && !running, click: triggerSync },
-    { label: "立即同步用量", click: triggerUsageSync },
     {
+      // 未开托盘常驻时该开关无意义（关窗本来就释放界面）→ 置灰并说明，而不是点了没反应
+      label: lightOn ? "轻量模式：已开启（关窗释放界面）" : "轻量模式：关窗释放界面",
+      type: "checkbox",
+      checked: lightOn,
+      enabled: trayOn,
+      click: () => { toggleLightweightMode(!lightOn); },
+    },
+    {
+      // 手动立即释放：不必真的去关窗（窗口当前可见时也能用）
+      label: hasWindow ? "立即释放界面内存" : "界面已释放（点上方可唤回）",
+      enabled: hasWindow,
+      click: () => { releaseWindowNow("tray-manual"); },
+    },
+    { type: "separator" },
+    ...(on("skills") ? [{
+      label: "立即同步技能",
+      enabled: remotesync.configured(cfg) && !running,
+      click: triggerSync,
+    }] : []),
+    ...(on("sync") ? [{ label: "立即同步用量", click: triggerUsageSync }] : []),
+    ...(on("skills") ? [{
       label: scheduler.isPaused() ? "恢复定时同步" : "暂停定时同步",
       enabled: remotesync.configured(cfg) && !!(cfg.schedule && (cfg.schedule.hourly || cfg.schedule.daily)),
-      click: () => { scheduler.setPaused(!scheduler.isPaused()); },
-    },
-    {
+      click: () => { scheduler.setPaused(!scheduler.isPaused()); refreshTrayMenu(); },
+    }] : []),
+    ...(on("sync") ? [{
       label: usageScheduler.isPaused() ? "恢复用量定时同步" : "暂停用量定时同步",
-      click: () => { usageScheduler.setPaused(!usageScheduler.isPaused()); },
-    },
+      click: () => { usageScheduler.setPaused(!usageScheduler.isPaused()); refreshTrayMenu(); },
+    }] : []),
     { type: "separator" },
     { label: "退出", click: () => { quitting = true; app.quit(); } },
   );
   return Menu.buildFromTemplate(items);
+}
+
+/**
+ * 四大板块启用开关（issue #91）唯一写入口：设置页与「模块顺序」区的开关都走这里。
+ * 放在 main 而非 ipc.cjs：运行时启停要调 scheduler/watch/usageScheduler/proxy/memory，
+ * 这些设施的启停本来就归本文件管（before-quit 同款收口）。
+ * 落盘走 config.saveConfig 直写；saveConfigFromUI 对 modules 做磁盘优先，
+ * 渲染层旧快照的整份保存不会把开关状态写回去。
+ */
+function registerModuleToggle() {
+  ipcMain.handle("module_toggle", async (_e, args) => {
+    try {
+      const m = String((args && args.module) || "");
+      const enabled = !!(args && args.enabled);
+      if (!["skills", "sync", "proxy", "memory"].includes(m)) return { ok: false, message: "未知板块" };
+      const cfg = config.loadConfig();
+      const next = { ...cfg.modules, [m]: { ...((cfg.modules || {})[m] || {}), enabled } };
+      if (!enabled && Object.values(next).every((x) => !x || x.enabled === false)) {
+        return { ok: false, message: "至少保留一个启用的板块" };
+      }
+      cfg.modules = next;
+      config.saveConfig(cfg);
+      // 运行时启停：关 = 停后台设施（定时器/监听/服务/库）；开 = 重新拉起（各处均幂等）
+      if (m === "skills") {
+        if (enabled) { scheduler.start(); watch.start(); }
+        else { scheduler.stop(); watch.stop(); }
+      } else if (m === "sync") {
+        if (enabled) usageScheduler.start();
+        else {
+          usageScheduler.stop();
+          // 在途同步一并取消（与 proxy 停用时 poolsync.cancel 对称）：否则收尾写库会把
+          // 刚关掉的库惰性重开，违背「停用后后台完全不运行」的语义
+          try { usagesync.cancel(); } catch { /* 无在途任务时无碍 */ }
+          try { usagedb.close(); } catch { /* 关闭失败无碍，重新启用时惰性重开 */ }
+        }
+      } else if (m === "proxy") {
+        // 只做运行时启停，不触碰「记住网关开关」（proxy.restoreOnLaunch）——那是用户的设置，
+        // 静默改写会与设置页提示「网关是否自启仍看『记住网关开关』」自相矛盾，且用户无法察觉
+        // 设置已被改动。模块停用后重启不拉起网关，由启动短路保证：
+        // whenReady 里 `if (on("proxy")) proxy.boot()`——不 boot 就走不到 boot() 内的
+        // restoreOnLaunch 分支，无需改写用户设置。
+        await proxy.setRuntime(enabled);
+      } else if (m === "memory") {
+        // 与 memory_toggle 同口径双写旧字段 memory.enabled：loadConfig 每次都会执行
+        // 「旧字段 false → modules.memory.enabled=false」的迁移，只写新字段的话
+        // 旧字段残留的 false 会把刚启用的开关在下一次任意 loadConfig 时打回（审查整改）
+        try {
+          const c2 = config.loadConfig();
+          c2.memory = { ...(c2.memory || {}), enabled };
+          config.saveConfig(c2);
+        } catch { /* 双写失败时迁移仍以旧字段为准，行为退化为旧版一致 */ }
+        if (enabled) await memory.boot().catch(() => {});
+        else await memory.shutdown().catch(() => {});
+      }
+      // 渲染层各页订阅该事件刷新（左栏灰态即时生效、统计数字停止轮询）
+      try {
+        for (const w of BrowserWindow.getAllWindows()) {
+          if (!w.isDestroyed()) w.webContents.send("app:event", { event: "module-toggled", module: m, enabled });
+        }
+      } catch { /* 通知失败不影响切换结果 */ }
+      refreshTrayMenu();
+      return { ok: true, message: enabled ? "已启用" : "已停用" };
+    } catch (e) {
+      return { ok: false, message: String((e && e.message) || e) };
+    }
+  });
 }
 
 /** 新版本提示点击 → 打开配置中心 · 通用并定位到「软件更新」卡片 */
@@ -371,6 +622,54 @@ function createTrayPanel() {
   }
 }
 
+function refreshTrayMenu() {
+  if (tray) tray.setContextMenu(buildTrayMenu());
+  if (tray) {
+    try {
+      const hasWindow = !!mainWindow && !mainWindow.isDestroyed();
+      tray.setToolTip(hasWindow ? "AgentHub · Agent中控台" : "AgentHub · 界面已释放（点此唤回）");
+    } catch { /* 托盘不可用时忽略 */ }
+  }
+}
+
+/** 立即销毁窗口释放渲染进程（托盘「立即释放界面内存」与自动触发共用）。
+ *  与关窗路径的区别：不经过 close 事件，供「窗口还开着也想省内存」的场景使用。 */
+function releaseWindowNow(reason) {
+  if (quitting || !mainWindow || mainWindow.isDestroyed()) return false;
+  persistWindowBounds();
+  __crashLog("lightweight-enter", `渲染进程释放（reason=${reason}）`);
+  const w = mainWindow;
+  mainWindow = null;
+  setImmediate(() => {
+    try { w.destroy(); } catch { /* 已销毁 */ }
+  });
+  refreshTrayMenu();
+  return true;
+}
+
+/** 托盘里切换轻量模式：写同一份配置（与设置 · 通用页共用），即时生效 */
+function toggleLightweightMode(next) {
+  try {
+    const cfg = config.loadConfig();
+    cfg.schedule = cfg.schedule || {};
+    cfg.schedule.lightweightMode = !!next;
+    config.saveConfig(cfg);
+    // 托盘直写不经 save_config：ipc 的内存快照与渲染层快照都不会自己更新。
+    // 只作废后端缓存还不够，渲染层旧快照在下次设置页整份保存时会把这里的改动冲掉
+    // （saveConfigFromUI 不保护 schedule 字段），故广播一次让渲染层重拉。
+    ipc.refreshConfigCache();
+    try {
+      const w = mainWindow;
+      if (w && !w.isDestroyed()) w.webContents.send("app:event", { event: "config-changed" });
+    } catch { /* 渲染层不在（界面已释放）时忽略：下次唤回 load() 会读到新值 */ }
+    __crashLog("lightweight-toggle", `lightweightMode=${cfg.schedule.lightweightMode}（来自托盘）`);
+  } catch (e) {
+    __crashLog("lightweight-toggle-failed", String((e && e.message) || e));
+    notify("AgentHub", "轻量模式开关写入失败，请到「设置 · 通用」重试");
+  }
+  refreshTrayMenu();
+}
+
 /** 面板定位到托盘图标附近：mac 菜单栏在下、Windows 托盘在上，水平夹在可视区内 */
 function positionTrayPanel() {
   if (!tray || !trayPanel) return;
@@ -402,10 +701,6 @@ function toggleTrayPanel() {
 function showTrayMenu() {
   if (tray) tray.popUpContextMenu(buildTrayMenu());
 }
-
-/** 菜单已改为右键时动态构建（数据即时最新），无需预刷新；
- *  保留函数作为 updater/通知的刷新挂点，避免散落的调用点失效 */
-function refreshTrayMenu() { /* no-op：保留挂点 */ }
 
 function createTray() {
   tray = new Tray(trayIcon());
@@ -505,23 +800,33 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     // 建窗前先应用主题，避免深色配置下标题栏先白后黑闪烁
-    applyNativeTheme(config.loadConfig().theme);
+    const bootCfg = config.loadConfig();
+    applyNativeTheme(bootCfg.theme);
+    // 四大板块启用开关（issue #91）：关闭的板块后台完全不运行（不装定时器/监听/服务/库）
+    const on = (k) => {
+      const m = (bootCfg.modules || {})[k];
+      return !m || m.enabled !== false;
+    };
 
     // 用量同步：初始化本地库（惰性打开），并确保本机设备登记在册（设备列表/本机口径立即可用）
-    usagedb.get();
-    const usageCfg0 = usageConfig.loadConfig();
-    const usageLocalId = usagesync.ensureLocalDeviceId(usageCfg0);
-    usagedb.upsertDevice(usageLocalId, usageCfg0.deviceName || "这台电脑", usagesync.enabledSourceIds(usageCfg0).join(","), usagedb.getLastSyncAt(usageLocalId));
+    if (on("sync")) {
+      usagedb.get();
+      const usageCfg0 = usageConfig.loadConfig();
+      const usageLocalId = usagesync.ensureLocalDeviceId(usageCfg0);
+      usagedb.upsertDevice(usageLocalId, usageCfg0.deviceName || "这台电脑", usagesync.enabledSourceIds(usageCfg0).join(","), usagedb.getLastSyncAt(usageLocalId));
+    }
 
     ipc.register({ ipcMain, app, shell, nativeTheme });
+    registerModuleToggle();
     remotesync.setOnFinish(notifySync);
     usagesync.setOnFinish(notifyUsageSync);
     // 反代网关：规则热加载 + 额度定时刷新 + 按配置自启网关服务（服务独立于窗口存续）
     // boot() 是 async：rules.init() / store.open() / credits.startScheduler() / startCheckinAuto()
     // 都是裸调用，抛错会变成 rejected promise。原先这里没有任何 catch，
     // 未处理的 rejection 会让主进程直接退出——症状是「窗口凭空消失、无崩溃事件、无 dump、无日志」。
-    proxy.boot().catch((e) => __crashLog("proxy-boot-failed", __describe(e)));
+    if (on("proxy")) proxy.boot().catch((e) => __crashLog("proxy-boot-failed", __describe(e)));
     // 记忆中枢：仓库初始化 + 本地 HTTP API（供 MCP 桥转发）+ 目录监听；失败只影响本模块
+    //（boot 内部有 modules.memory.enabled 短路，无需在此判断）
     memory.boot().catch(() => {});
     createWindow();
     createTray();
@@ -532,10 +837,18 @@ if (!gotLock) {
     if (process.platform === "darwin" && app.dock) {
       try { app.dock.setIcon(dockIcon()); } catch { /* 旧系统无 dock API */ }
     }
-    scheduler.start();
-    usageScheduler.start();
-    watch.start();
+    if (on("skills")) {
+      scheduler.start();
+      watch.start();
+    }
+    if (on("sync")) usageScheduler.start();
     updater.init({ onShowWindow: showWindow, onTrayRefresh: refreshTrayMenu });
+    // 全局快捷键（默认 Alt+`，两键）：冲突则弹气泡并持续重试，解除后自动恢复。
+    // 设置页改键后经 ipc.onConfigSaved 钩子重新注册，无需重启。
+    ipc.onConfigSaved(() => {
+      try { setupShortcut(); } catch (e) { __crashLog("shortcut-reload-failed", __describe(e)); }
+    });
+    try { setupShortcut(); } catch (e) { __crashLog("shortcut-setup-failed", __describe(e)); }
 
     // 依据配置启用开机自启（便携版不支持：注册的会是临时解压副本路径，退出即失效）。
     // 开关唯一来源是框架配置（设置 · 通用 · 应用行为），用量模块旧配置字段不再参与
@@ -552,24 +865,27 @@ if (!gotLock) {
   });
 
   app.on("before-quit", (e) => {
+    // 统一收尾：原先两条分支各自重复一遍 stop 调用，新增模块时极易漏改一处
+    const cleanup = () => {
+      scheduler.stop();
+      usageScheduler.stop();
+      watch.stop();
+      // 全局快捷键必须显式注销：更新重启是"拦下退出再重启"，
+      // 不注销会让旧键在重启窗口期内处于悬空占用状态
+      try { if (shortcutRegistrar) shortcutRegistrar.stop(); else shortcut.unregisterAll(globalShortcut); } catch { /* 忽略 */ }
+      proxy.shutdown();
+      memory.shutdown();
+    };
     // 下载完的更新：拦下这次退出，静默装完自动重启
     if (updater.pendingInstall()) {
       e.preventDefault();
       quitting = true;
-      scheduler.stop();
-      usageScheduler.stop();
-      watch.stop();
-      proxy.shutdown();
-      memory.shutdown();
+      cleanup();
       updater.triggerInstall();
       return;
     }
     quitting = true;
-    scheduler.stop();
-    usageScheduler.stop();
-    watch.stop();
-    proxy.shutdown();
-    memory.shutdown();
+    cleanup();
   });
 
   app.on("window-all-closed", () => {

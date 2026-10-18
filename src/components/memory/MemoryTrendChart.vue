@@ -9,7 +9,7 @@
      图上的零点与左上角合计始终是同一份数据，不会各算各的。 -->
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import * as echarts from "echarts";
+import { graphic, init, type ECharts } from "../../utils/echarts";
 import { useAppStore } from "../../stores/app";
 import { formatInteger } from "../../composables/useFormat";
 import { glassTooltip, tooltipCard, markerColor, type TooltipParam } from "../../utils/chart-tooltip";
@@ -24,7 +24,7 @@ const emit = defineEmits<{ (e: "change-range", days: number): void }>();
 
 const ui = useAppStore();
 const el = ref<HTMLDivElement | null>(null);
-let chart: echarts.ECharts | null = null;
+let chart: ECharts | null = null;
 
 // 与「用量统计」用量趋势同一套档位：label 给按钮，word 给左上角合计的小字
 const ranges = [
@@ -100,7 +100,7 @@ function render() {
         symbol: "none",
         lineStyle: { width: 2.2, color: accent, shadowColor: accent, shadowBlur: 8, shadowOffsetY: 3 },
         areaStyle: {
-          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          color: new graphic.LinearGradient(0, 0, 0, 1, [
             { offset: 0, color: accent + "4d" },
             { offset: 1, color: accent + "00" },
           ]),
@@ -123,7 +123,7 @@ onMounted(() => {
   if (!el.value) return;
   nextTick(() => {
     if (disposed || !el.value) return;
-    chart = echarts.init(el.value);
+    chart = init(el.value);
     render();
 
     // 记忆页是 v-show 保活的隐藏页：容器在切回本页时由 0 变宽，靠 ResizeObserver 补一次 resize

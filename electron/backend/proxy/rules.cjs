@@ -167,6 +167,33 @@ const DEFAULTS = {
         { id: "GLM-4.5-Air", name: "GLM-4.5-Air", rate: null, capabilities: { images: false, reasoning: true, tools: true }, contextLength: 131072, maxOutputTokens: 98304 },
       ],
     },
+    // ===== Cline 双池：静态兜底（远程目录拉取后整段覆盖对应渠道）=====
+    // 取自参考实现实测的 recommended-models 响应（2026-09）的稳定主力模型，**不抄全**：
+    // 上游清单会变（模型上下架频繁），抄全只会得到一份很快过时的表，其余靠拉取补齐。
+    // ⚠ 模型 id 必须带池前缀（cline-free/ / cline-pass/ 是计费通道选择器，剥掉转发 404
+    // model not found）；免费池那两条裸 id（z-ai/、poolside/）**同样是免费池成员**
+    // （实测免费账号打返回 200，走聚合通道转售）——归池看响应分组，不按前缀猜。
+    // 上下文窗口取 Cline 官方目录实测值；上游未声明输出上限者记 0（不编造）。
+    cline_free: {
+      syncedAt: 0,
+      models: [
+        { id: "cline-free/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash（免费）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "cline-free/muse-spark-1.3-contributor", name: "Muse Spark 1.3（免费）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "cline-free/solar-pro4", name: "Solar Pro 4（免费）", rate: null, capabilities: { images: true, reasoning: false, tools: true }, contextLength: 128000, maxOutputTokens: 0 },
+        { id: "z-ai/glm-5.3-flash", name: "GLM-5.3-Flash（免费）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1310720, maxOutputTokens: 0 },
+        { id: "poolside/laguna-s-2.1:free", name: "Laguna S 2.1（免费）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 262144, maxOutputTokens: 0 },
+      ],
+    },
+    cline_pass: {
+      syncedAt: 0,
+      models: [
+        { id: "cline-pass/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0 },
+        { id: "cline-pass/deepseek-v4-pro", name: "DeepSeek V4 Pro（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 128000, maxOutputTokens: 0 },
+        { id: "cline-pass/glm-5.3", name: "GLM-5.3（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0 },
+        { id: "cline-pass/kimi-k3", name: "Kimi K3（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
+        { id: "cline-pass/qwen3.8-max", name: "Qwen3.8 Max（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 256000, maxOutputTokens: 0 },
+      ],
+    },
   },
   // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：
   // 部分模型仅在 solo_agent 下可用，其余走 solo_work_lite；未命中默认 solo_work_lite）
@@ -263,6 +290,43 @@ const DEFAULTS = {
       pluginBase: "https://www.workbuddy.ai",
       refreshSource: "plugin",
       deviceToken: "",
+    },
+    // ===== Cline 双池（cline_free / cline_pass 共用同一段）=====
+    // 同域同协议同伪装头（api.cline.bot），两池只差「收哪个池的模型」，配置无需拆两份。
+    // 协议事实（2026-09 参考实现 agent2api 实测 + 本方案核实）：
+    // ① LLM 端点是 POST {apiBase}/chat/completions（完整路径 /api/v1/chat/completions，
+    //    路径只有一个 v1，发成 /api/v1/v1/... 是 404 Not Found）；
+    // ② X-CLIENT-TYPE: cline-sdk 是免费池硬门槛（缺它免费池一律 403
+    //    only available via Cline product surfaces；cline-cli 会走另一条兼容路径回 500）；
+    // ③ 鉴权 Authorization: Bearer workos:<JWT>，workos: 前缀必须原样带（去掉 401）；
+    // ④ 伪装头取自官方 CLI 通信实测（User-Agent 非必需，带上更贴近官方客户端，无代价）。
+    cline: {
+      apiBase: "https://api.cline.bot/api/v1",
+      // 模型目录（GET，无需鉴权实测）：一次返回 recommended/free/clinePass/clineCloud 四组
+      modelsPath: "/ai/cline/recommended-models",
+      // 登录第四步：WorkOS 令牌 → Cline 会话令牌（不能省，WorkOS 给的是身份令牌）
+      registerPath: "/auth/register",
+      refreshPath: "/auth/refresh",
+      // WorkOS 设备授权端点（RFC 8628）
+      workosBase: "https://api.workos.com",
+      workosClientId: "client_01K3A541FN8TA3EPPHTD2325AR",
+      workosDevicePath: "/user_management/authorize/device",
+      workosTokenPath: "/user_management/authenticate",
+      // 设备授权页兜底（正常情况用上游返回的 verification_uri）
+      deviceVerifyFallback: "https://authkit.cline.bot/device",
+      // 伪装头（默认值；逐键可覆盖，空串=该头不发）
+      upstreamHeaders: {
+        "User-Agent": "Cline/3.0.62",
+        "HTTP-Referer": "https://cline.bot",
+        "X-Title": "Cline",
+        "X-IS-MULTIROOT": "false",
+        "X-CLIENT-TYPE": "cline-sdk",
+        "X-CLIENT-VERSION": "3.0.62",
+        "X-PLATFORM": "terminal",
+        "X-PLATFORM-VERSION": "3.0.62",
+        "X-CORE-VERSION": "0.0.70",
+      },
+      requestTimeoutMs: 0,
     },
     // ===== 商汤小浣熊（Raccoon AI 桌面端）=====
     // 协议事实见 docs/raccoon-反代/会话1~5（静态逆向）。防伪强度低：无签名/无 HMAC/无 pinning。
@@ -499,6 +563,65 @@ const DEFAULTS = {
       requestTimeoutMs: 30000,
       stopTimeoutMs: 3000,
       sseTimeoutMs: 900000,
+    },
+    // ===== AutoClaw 双区（国内版 / 国际版）=====
+    // 两地同协议同签名指纹（appId/appKey 逐字相同），仅 userapiBase 与订阅端点不同。
+    // 两域版本号**不同**（实测）：llmVersion 进对话头 X-Version；apiVersion 进 userapi 域
+    // X-Version 且是版本门控——不带它时模型目录只下发部分条目。客户端升级后改这里即热生效。
+    // X-Auth-Sign 仅 userapi 域发：MD5(`${authAppId}&${秒级时间戳}&${authAppKey}`) 小写十六进制。
+    autoclaw: {
+      userapiBase: "https://autoglm-acceleration-api.zhipuai.cn",
+      llmProxyPath: "/autoclaw-proxy/proxy/autoclaw",
+      authAppId: "100003",
+      authAppKey: "38d2391985e2369a5fb8227d8e6cd5e5",
+      llmVersion: "1.17.8",
+      apiVersion: "1.18.5",
+      catalogPath: "/autoclaw-proxy/proxy/autoclaw-model-config",
+      taskCompletePath: "/autoclaw-proxy/proxy/autoclaw-task-complete",
+      taskListPath: "/autoclaw-proxy/proxy/autoclaw-task-list",
+      refreshPath: "/userapi/v1/refresh",
+      refreshFallbackPath: "/userapi/v1/agent-refresh",
+      sendCodePath: "/userapi/v1/agent-send-code",
+      // 结尾斜杠是上游要求的（带不带斜杠是两个路由）
+      loginPath: "/userapi/v1/agent-login/",
+      userProfilePath: "/userapi/v1/user-profile",
+      walletsPath: "/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw",
+      walletInstancesPath: "/agent-assetmgr/api/v1/wallet-instances?wallet_type=all&wallet_scope=all",
+      pointsExpiringPath: "/agent-assetmgr/api/v1/points/expiring?biz_app_id=autoclaw",
+      // 订阅端点两区不同（实测）：国内 subscribe-info / 国际 oversea-subscribe-info
+      subscribePath: "/agentpay/v1/assistant/subscribe-info",
+      oauthCaptchaConfigPath: "/userapi/overseasv1/oauth-captcha-config",
+      oauthUrlPath: "/userapi/overseasv1/zai-oauth-url",
+      oauthLoginPath: "/userapi/overseasv1/zai-oauth-login",
+      // Google 变体（国际版第二登录方式；回调端口按 RFC 8252 loopback 宽松匹配，端口任意）
+      oauthGoogleUrlPath: "/userapi/overseasv1/google-oauth-url",
+      oauthGoogleLoginPath: "/userapi/overseasv1/google-oauth-login",
+    },
+    autoclaw_intl: {
+      userapiBase: "https://autoglm-api.autoglm.ai",
+      llmProxyPath: "/autoclaw-proxy/proxy/autoclaw",
+      authAppId: "100003",
+      authAppKey: "38d2391985e2369a5fb8227d8e6cd5e5",
+      llmVersion: "1.17.8",
+      apiVersion: "1.18.5",
+      catalogPath: "/autoclaw-proxy/proxy/autoclaw-model-config",
+      taskCompletePath: "/autoclaw-proxy/proxy/autoclaw-task-complete",
+      taskListPath: "/autoclaw-proxy/proxy/autoclaw-task-list",
+      refreshPath: "/userapi/v1/refresh",
+      refreshFallbackPath: "/userapi/v1/agent-refresh",
+      sendCodePath: "/userapi/v1/agent-send-code",
+      loginPath: "/userapi/v1/agent-login/",
+      userProfilePath: "/userapi/v1/user-profile",
+      walletsPath: "/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw",
+      walletInstancesPath: "/agent-assetmgr/api/v1/wallet-instances?wallet_type=all&wallet_scope=all",
+      pointsExpiringPath: "/agent-assetmgr/api/v1/points/expiring?biz_app_id=autoclaw",
+      subscribePath: "/agentpay/v1/assistant/oversea-subscribe-info",
+      oauthCaptchaConfigPath: "/userapi/overseasv1/oauth-captcha-config",
+      oauthUrlPath: "/userapi/overseasv1/zai-oauth-url",
+      oauthLoginPath: "/userapi/overseasv1/zai-oauth-login",
+      // Google 变体（国际版第二登录方式；回调端口按 RFC 8252 loopback 宽松匹配，端口任意）
+      oauthGoogleUrlPath: "/userapi/overseasv1/google-oauth-url",
+      oauthGoogleLoginPath: "/userapi/overseasv1/google-oauth-login",
     },
   },
 };

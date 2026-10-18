@@ -10,8 +10,10 @@ const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g
 const BEARER_RE = /\b(bearer)\s+[A-Za-z0-9._~+/=-]{12,}/gi;
 // 键值对形态：refreshToken=… / "accessToken": "…" / authorization: …（值取 token 形态长串；
 // 键名后的闭引号一并保留；中文文案与短数字不受影响——\btoken\b 不会命中 "tokens"，
-// 值不足 12 位不打码）
-const KV_RE = /\b(access[-_]?token|refresh[-_]?token|api[-_]?key|authorization|password|secret|token|jwt)(["']?)(\s*[:=]\s*["']?)([A-Za-z0-9._~+/=-]{12,})/gi;
+// 值不足 12 位不打码）。交替清单补齐带前缀/驼峰的已知键：client_secret / clientSecret /
+// device_token / machineToken——\b 起始的交替匹配不到「前接下划线或驼峰」的键名
+// （\w 与 \w 之间无词边界），错误体回显这些键时凭据会原样落库
+const KV_RE = /\b(access[-_]?token|refresh[-_]?token|api[-_]?key|client[-_]?secret|clientSecret|device[-_]?token|machineToken|api[-_]?token|authorization|password|secret|token|jwt)(["']?)(\s*[:=]\s*["']?)([A-Za-z0-9._~+/=-]{12,})/gi;
 // 裸空格形态：token 1234567890abcdef（无 :/= 分隔）。只打码十六进制长串，
 // 避免 "token authentication failed" 这类正常英文文案被误伤
 const BARE_RE = /\b(token|jwt|apikey|api[-_]key)\s+([A-Fa-f0-9]{16,})\b/g;

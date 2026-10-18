@@ -51,6 +51,18 @@ class MemoryService {
     ensureSynonyms(this.root);
     this.index.open();
     if (!this.index.readOnly) this.index.setMeta("lastScanAt", String(Date.now()));
+    // 一次性迁移：file: 引用误标 kind='mem' 的存量行改标（2026-10-15）。
+    // 旧版 _replaceLinks 不认 file: 前缀，文件锚定引用全部落成 kind='mem'，而断链口径
+    // 「kind='mem' 且 dst 不在 mem 表」把每条文件链接都数成断链——仪表盘断链数虚高。
+    // src 分型修复只断新数据，存量行在这里启动时一次性收口；mem id 不会是 file: 开头，
+    // 这条 UPDATE 只会命中确实误标的行。meta 闸门保证只跑一次，失败不设闸门（下次启动
+    // 重试）；只读模式（库版本比本程序新）下跳过。
+    if (!this.index.readOnly && this.index.getMeta("mem_link_file_kind_v1") !== "done") {
+      try {
+        this.index.db.prepare("UPDATE mem_link SET kind = 'file' WHERE kind = 'mem' AND dst LIKE 'file:%'").run();
+        this.index.setMeta("mem_link_file_kind_v1", "done");
+      } catch { /* 迁移失败不阻塞启动，下次启动重试 */ }
+    }
     const projectFile = path.join(this.root, "projects", "_index.json");
     if (!fs.existsSync(projectFile)) {
       const r = this.registry;
@@ -218,15 +230,17 @@ class MemoryService {
           .catch(() => {});
       } else if (kind === "classify" && cfg["review.autoConfirmClassify"]) {
         if (payload.slug) {
+          // 与 supersede 分支同口径：执行结果不 ok 就不 resolve，建议回落收件箱
+          // （失败返回 {ok:false} 不是 reject，.then 里不判会静默吞掉）
           void this.projectAssign([payload.memoryId], payload.slug)
-            .then(() => this.index.reviewResolve(queueId, `assign:${payload.slug}`))
+            .then((r) => { if (r && r.ok !== false) this.index.reviewResolve(queueId, `assign:${payload.slug}`); })
             .catch(() => {});
         } else {
           this.index.reviewResolve(queueId, "dismissed");
         }
       } else if (kind === "dedup" && cfg["review.autoConfirmDedup"]) {
         void this.markSuperseded(payload.targetId, payload.newId, payload.reason || "自动按推荐采纳新记忆")
-          .then(() => this.index.reviewResolve(queueId, "adoptNew"))
+          .then((r) => { if (r && r.ok) this.index.reviewResolve(queueId, "adoptNew"); })
           .catch(() => {});
       }
     } catch { /* 开关判定或执行异常不影响建议入队 */ }
@@ -1664,6 +1678,90 @@ class MemoryService {
     };
   }
 
+  /**
+   * 记忆体检（2026-10-16 借鉴 causal-memory 的 drift/bias_audit 本地化）：纯 SQL 统计，不用 LLM。
+   * 五项：僵尸记忆 / 检索趋势 / 分布 / 演化链 / 回收站。任一段异常只让该段为空，不抛。
+   * 输出两份：完整报告（调度任务产出，落 mem_meta 供前端/IPC 取）；摘要进 memory_status。
+   */
+  healthReport() {
+    const db = this.index.db;
+    const now = Date.now();
+    const DAY = 86400000;
+    const out = { generatedAt: now, zombies: { count: 0, samples: [] }, trend: [], byType: [], byProject: [], chains: [], trash: { count: 0, bytes: 0 } };
+
+    // ① 僵尸记忆：仍有效、90 天前创建、从未被检索命中过（access_count = 0）。
+    //    上线头 90 天内存量记忆全部计为「未命中过」是真实状态，之后自然分化。
+    try {
+      const zombieSql = "SELECT id, title, project, created FROM mem WHERE (valid_to IS NULL OR valid_to > ?) AND created < ? AND (access_count = 0 OR access_count IS NULL) ORDER BY created DESC";
+      out.zombies.samples = db.prepare(zombieSql + " LIMIT 10").all(now, now - 90 * DAY)
+        .map((r) => ({ id: r.id, title: r.title, project: r.project, created: r.created }));
+      out.zombies.count = db.prepare("SELECT COUNT(*) AS c FROM mem WHERE (valid_to IS NULL OR valid_to > ?) AND created < ? AND (access_count = 0 OR access_count IS NULL)").get(now, now - 90 * DAY).c;
+    } catch { /* 段级防御 */ }
+
+    // ② 检索趋势：recall_log 近 4 周按周聚合（含零命中检索占比——「搜了什么没搜到」的量化）
+    try {
+      out.trend = db.prepare(`
+        SELECT CAST((? - ts) / ? AS INTEGER) AS weeksAgo,
+               COUNT(*) AS queries,
+               AVG(hits) AS avgHits,
+               SUM(CASE WHEN hits = 0 THEN 1 ELSE 0 END) AS emptyQueries
+        FROM recall_log WHERE ts >= ? GROUP BY weeksAgo ORDER BY weeksAgo DESC
+      `).all(now, 7 * DAY, now - 28 * DAY).map((r) => ({
+        weeksAgo: r.weeksAgo,
+        queries: r.queries,
+        avgHits: Math.round((r.avgHits || 0) * 100) / 100,
+        emptyQueries: r.emptyQueries,
+      }));
+    } catch { /* 表未建/为空时留空 */ }
+
+    // ③ 分布：类型（有效记忆）+ 项目 Top 5
+    try {
+      out.byType = db.prepare("SELECT type, COUNT(*) AS c FROM mem WHERE (valid_to IS NULL OR valid_to > ?) GROUP BY type ORDER BY c DESC").all(now)
+        .map((r) => ({ type: r.type, count: r.c }));
+      out.byProject = db.prepare("SELECT project, COUNT(*) AS c FROM mem WHERE (valid_to IS NULL OR valid_to > ?) AND project IS NOT NULL GROUP BY project ORDER BY c DESC LIMIT 5").all(now)
+        .map((r) => ({ project: r.project, count: r.c }));
+    } catch { /* 段级防御 */ }
+
+    // ④ 演化链：所有被取代的记忆一次性读进内存走链（O(N) 两次查询，无逐条 SQL）。
+    //    链长 = 同一主题被推翻重写的次数，越长说明这块知识反复翻车。
+    try {
+      const all = db.prepare("SELECT id, title, superseded_by FROM mem").all();
+      const byId = new Map(all.map((r) => [r.id, r]));
+      const heads = new Map(); // superseded_by → 被它取代的前任（链首候选的反向边）
+      for (const r of all) if (r.superseded_by) heads.set(r.superseded_by, r);
+      const chains = [];
+      const seenHead = new Set();
+      for (const row of all) {
+        if (!row.superseded_by) continue;
+        // 回溯到链首：谁 superseded_by = 我，谁就在我前面
+        let head = row;
+        let guard = 0;
+        while (guard++ < 50) {
+          const prev = heads.get(head.id);
+          if (!prev) break;
+          head = prev;
+        }
+        if (seenHead.has(head.id)) continue;
+        seenHead.add(head.id);
+        // 沿链到尾统计长度
+        let len = 0, cur = head, guard2 = 0;
+        const titles = [];
+        while (cur && guard2++ < 50) { len++; titles.push(cur.title); cur = byId.get(cur.superseded_by); }
+        if (len >= 2) chains.push({ head: head.title, length: len, titles: titles.slice(0, 5) });
+      }
+      chains.sort((a, b) => b.length - a.length);
+      out.chains = chains.slice(0, 5);
+    } catch { /* 段级防御 */ }
+
+    // ⑤ 回收站堆积
+    try {
+      const trash = this.store.listTrash();
+      out.trash = { count: trash.length, bytes: trash.reduce((s, t) => s + (t.size || 0), 0) };
+    } catch { /* 段级防御 */ }
+
+    return out;
+  }
+
   stats() {
     const counts = this.index.counts();
     const devices = this.index.beats();
@@ -1883,6 +1981,18 @@ class MemoryService {
 
   statusForAgent() {
     const s = this.indexStatus();
+    // 体检摘要：完整报告走调度任务（memory_health_run / 每日 11:30），status 只给关键数字，
+    // 避免 agent 每次自检都拉全量报告。任一段失败只让该段为 null，不拖垮 status。
+    let health = null;
+    try {
+      const h = this.healthReport();
+      health = {
+        zombies: h.zombies.count,
+        trash: h.trash.count,
+        maxChain: h.chains.length ? h.chains[0].length : 0,
+        recentQueries: h.trend.reduce((sum, t) => sum + t.queries, 0),
+      };
+    } catch { /* 体检失败不拖垮 status */ }
     return {
       ok: true,
       root: s.rootDir,
@@ -1891,6 +2001,7 @@ class MemoryService {
       projects: s.projects,
       today: s.today,
       pendingReview: s.pending,
+      health,
     };
   }
 }

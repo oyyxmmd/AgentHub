@@ -78,13 +78,21 @@ async function refresh() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   })();
+  // 托盘只要「今日」口径：显式传今日 00:00 ~ 现在（上游统计已区间化，缺省跨度可能不是今天）
+  const dayStart = (() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  })();
   const [pool, log, stats] = await Promise.all([
     proxyPool().catch(() => null),
     proxyGrowthLog().catch(() => null),
-    proxyStatsOverview().catch(() => null),
+    proxyStatsOverview({ from: dayStart, to: Date.now() }).catch(() => null),
   ]);
   channels.value = pool || [];
-  usage.value = stats ? { req: Number(stats.today?.req) || 0, tokens: Number(stats.today?.tokens) || 0 } : null;
+  usage.value = stats
+    ? { req: Number(stats.summary?.req) || 0, tokens: Number(stats.summary?.totalTokens) || 0 }
+    : null;
   // 当日各任务最近一次执行（rows 新在前：当日首遇即最新）
   const latest: Record<string, { ok: number; total: number; at: string }> = {};
   for (const e of log?.rows || [] as ProxyGrowthLogEntry[]) {

@@ -111,7 +111,8 @@ class AgentAccess {
     if (adapter.format === "toml-mcp_servers") steps.push(inject.uninjectTomlConfig(adapter));
     else steps.push(inject.uninjectJsonConfig(adapter));
     if (adapter.instruction && adapter.instruction.path) steps.push(inject.removeBlock(adapter.instruction.path));
-    const failed = steps.find((s) => s.ok === false);
+    // 与 injectOne 同口径：!s.ok（s.ok === false 会漏掉 ok 为 undefined 的步骤）
+    const failed = steps.find((s) => !s.ok);
     if (failed) return { ok: false, message: failed.message || "卸载失败", steps };
     return { ok: true, steps };
   }
@@ -162,13 +163,13 @@ class AgentAccess {
     if (!entry || !entry.name || !entry.path) return { ok: false, message: "自定义 Agent 需要名称与配置文件路径" };
     if (!inHome(entry.path)) return { ok: false, message: "配置文件路径必须位于用户主目录内" };
     if (entry.instructionPath && !inHome(entry.instructionPath)) return { ok: false, message: "指令文件路径必须位于用户主目录内" };
-    const id = entry.id || `custom-${Date.now().toString(36)}`;
+    // 同毫秒连点保存会撞 id（第二个覆盖第一个）：加随机后缀保证唯一
+    const id = entry.id || `custom-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const next = (Array.isArray(list) ? list : []).filter((x) => x.id !== id).concat([{
       id, name: entry.name, path: entry.path,
       format: entry.format || "json-mcpServers",
       instructionPath: entry.instructionPath || "",
     }]);
-    void cfgAgents;
     return { ok: true, id, list: next };
   }
 

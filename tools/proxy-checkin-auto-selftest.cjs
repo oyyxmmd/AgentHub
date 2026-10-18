@@ -7,8 +7,18 @@ if (process.argv[2]) process.env.AGENTHUB_DATA_DIR = process.argv[2];
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
+// 未传沙箱目录时自建（此前不传就直接跑在真实 %APPDATA%\AgentHub 上：既会被真实账号数据
+// 顶掉「无记录账号 checkin 为 null」断言，又会在真实库里增删测试账号）
+if (!process.env.AGENTHUB_DATA_DIR) {
+  process.env.AGENTHUB_DATA_DIR = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "ah-checkin-auto-"));
+}
 const config = require("../electron/backend/config.cjs");
 const store = require("../electron/backend/proxy/store.cjs");
+
+// —— 安全闸门：数据目录必须落在沙箱内 ——
+const _dataDir = path.resolve(process.env.AGENTHUB_DATA_DIR).toLowerCase();
+const _inSandbox = path.resolve(store.proxyDir()).toLowerCase().startsWith(_dataDir);
+if (!_inSandbox) { console.error("拒绝运行：数据目录不在沙箱内（" + store.proxyDir() + "）"); process.exit(2); }
 
 let pass = 0;
 function ok(name, cond) {

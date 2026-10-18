@@ -155,6 +155,11 @@
   border-bottom: 1px solid var(--border-soft);
 }
 .sk-tool-row:last-child { border-bottom: none; }
+/* 当前正在看的那一条：左缘色条比背景微亮更容易看出选中（列表下方才是它的裁决面板） */
+.sk-tool-row.is-active {
+  background: var(--panel-2);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 .sk-tool-icon {
   width: 38px;
   height: 38px;

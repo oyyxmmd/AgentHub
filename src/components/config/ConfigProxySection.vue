@@ -9,12 +9,13 @@ import type { ProxyModel, ProxyRuleFile } from "../../types";
 import { useAppStore } from "../../stores/app";
 import { fmtAgo, fmtK } from "../../views/proxy/format";
 import ProxyUpstreamDialog from "../ProxyUpstreamDialog.vue";
+import ConfigRemoteTargets from "./ConfigRemoteTargets.vue";
 
 const app = useAppStore();
 // 上游启闭弹窗（渠道级开关：关闭的渠道在反代网关全部页面动态隐藏，重新打开立即恢复）
 const upOpen = ref(false);
-// 页面内的二级子板块：服务与路由 / 监控与安全 / 规则文件
-const tab = ref<"service" | "monitor" | "rules">("service");
+// 页面内的二级子板块：服务与路由 / 监控与安全 / 规则文件 / 远程实例
+const tab = ref<"service" | "monitor" | "rules" | "remote">("service");
 const rules = ref<ProxyRuleFile[]>([]);
 const vault = ref<{ encrypted: boolean; driver: string; dataDir: string } | null>(null);
 const saving = ref(false);
@@ -97,7 +98,16 @@ async function save() {
     app.config.proxy.port = port;
     app.config.proxy.rateLimitPerMin = Math.max(0, Math.round(Number(app.config.proxy.rateLimitPerMin) || 0));
     app.config.proxy.concurrency = Math.max(1, Math.round(Number(app.config.proxy.concurrency) || 1));
-    app.config.proxy.channelFailoverMax = Math.min(5, Math.max(1, Math.round(Number(app.config.proxy.channelFailoverMax) || 3)));
+    app.config.proxy.channelFailoverMax = Math.min(10, Math.max(1, Math.round(Number(app.config.proxy.channelFailoverMax) || 3)));
+    // 判数用 Number.isFinite 而不是 ||：合法的 0（= 关闭预警）会被 || 当 falsy 跳回默认值
+    const esd = Number(app.config.proxy.expiringSoonDays);
+    app.config.proxy.expiringSoonDays = Math.min(3650, Math.max(0, Math.round(Number.isFinite(esd) ? esd : 1)));
+    // 保留期只认 1~3650：非正值（0 / 负数 / 空串 / 垃圾）一律兜底默认 90，与后端两处同一口径
+    // （setUsageRetention 忽略非法值保留现值、cleanupUsage 兜底 90）。刻意不把 0 钳成 1——
+    // 那等于静默把保留期改成一天，下次启动 GC 会把一天前的流水整批删掉；真要清空走统计页
+    // 那个带确认的「清理」按钮。空串得先掐掉再 Number：Number("") === 0 会被当成合法输入。
+    const urd = Number(String(app.config.proxy.usageRetentionDays ?? "").trim() || NaN);
+    app.config.proxy.usageRetentionDays = Number.isFinite(urd) && Math.round(urd) >= 1 ? Math.min(3650, Math.round(urd)) : 90;
     app.config.proxy.channelCooldownMs = Math.max(10000, Math.round(Number(app.config.proxy.channelCooldownMs) || 120000));
     app.config.proxy.channelCooldownCapMs = Math.max(app.config.proxy.channelCooldownMs, Math.round(Number(app.config.proxy.channelCooldownCapMs) || 900000));
     const r = await app.save();
@@ -149,6 +159,7 @@ function openDataDir() {
       <button class="cfg-subtab" :class="{ active: tab === 'service' }" @click="tab = 'service'"><i class="ph ph-gear-six"></i>服务与路由</button>
       <button class="cfg-subtab" :class="{ active: tab === 'monitor' }" @click="tab = 'monitor'"><i class="ph ph-chart-bar"></i>监控与安全</button>
       <button class="cfg-subtab" :class="{ active: tab === 'rules' }" @click="tab = 'rules'"><i class="ph ph-file-code"></i>规则文件</button>
+      <button class="cfg-subtab" :class="{ active: tab === 'remote' }" @click="tab = 'remote'"><i class="ph ph-cloud-check"></i>远程实例</button>
     </div>
 
     <template v-if="tab === 'service'">
@@ -224,7 +235,10 @@ function openDataDir() {
           <span style="font-size: 11px; color: var(--text-3)">次 / 分钟</span>
         </div>
         <div class="set-row">
-          <div class="set-info"><div class="set-name">上游并发上限</div></div>
+          <div class="set-info">
+            <div class="set-name">单渠道并发上限</div>
+            <div class="set-desc">每个渠道同时打上游的请求数；打满只跳备选渠道，不拒绝请求（旧版按全渠道合计、会误伤空闲渠道）</div>
+          </div>
           <input v-model.number="app.config.proxy.concurrency" class="input mono" style="width: 90px" type="number" min="1" />
           <span style="font-size: 11px; color: var(--text-3)">并发</span>
         </div>
@@ -244,8 +258,11 @@ function openDataDir() {
         </div>
         <template v-if="app.config.proxy.channelFailover !== false">
           <div class="set-row">
-            <div class="set-info"><div class="set-name">单请求最多尝试渠道数</div></div>
-            <input v-model.number="app.config.proxy.channelFailoverMax" class="input mono" style="width: 90px" type="number" min="1" max="5" />
+            <div class="set-info">
+              <div class="set-name">单请求最多尝试渠道数</div>
+              <div class="set-desc">范围 1~10；超出上限按 10 保存（上游尝试预算随上限放大：每模型 上限+1 次、最低 6 次）</div>
+            </div>
+            <input v-model.number="app.config.proxy.channelFailoverMax" class="input mono" style="width: 90px" type="number" min="1" max="10" />
             <span style="font-size: 11px; color: var(--text-3)">个（含主渠道）</span>
           </div>
           <div class="set-row">
@@ -293,8 +310,20 @@ function openDataDir() {
           <button class="btn btn-ghost" @click="gotoTiming">去修改 →</button>
         </div>
         <div class="set-row">
-          <div class="set-info"><div class="set-name">余额历史 / 请求流水保留</div></div>
-          <span class="num">90 天（启动时自动清理）</span>
+          <div class="set-info">
+            <div class="set-name">「即将到期」预警阈值</div>
+            <div class="set-desc">号池到期徽标与逐包明细共用这一个值；填 0 关闭预警。范围 0~3650，超出按边界保存</div>
+          </div>
+          <input v-model.number="app.config.proxy.expiringSoonDays" class="input mono" style="width: 90px" type="number" min="0" max="3650" />
+          <span style="font-size: 11px; color: var(--text-3)">天</span>
+        </div>
+        <div class="set-row">
+          <div class="set-info">
+            <div class="set-name">余额历史 / 请求流水保留</div>
+            <div class="set-desc">启动时按它清理超期的请求流水与余额历史（1~3650 天，默认 90；填 0 或非法值按 90 保存）。改完不重启也不会一直按旧值跑：用量统计页的「清理」按钮按当前值立即删一轮</div>
+          </div>
+          <input v-model.number="app.config.proxy.usageRetentionDays" class="input mono" style="width: 90px" type="number" min="1" max="3650" />
+          <span style="font-size: 11px; color: var(--text-3)">天</span>
         </div>
       </div>
       <div class="card">
@@ -318,6 +347,8 @@ function openDataDir() {
       </div>
     </div>
     </template>
+
+    <ConfigRemoteTargets v-else-if="tab === 'remote'" />
 
     <div class="card" v-else>
       <div class="card-title">

@@ -4,12 +4,14 @@
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
-const { shell } = require("electron");
+const crypto = require("node:crypto"); // JSON 导入账号的 uid 派生用（Node 22 全局 crypto 是 WebCrypto，无 createHash）
 const config = require("../config.cjs");
+const platform = require("./platform/index.cjs");
 const store = require("./store.cjs");
 const rules = require("./rules.cjs");
 const pool = require("./pool.cjs");
 const adapters = require("./adapters.cjs");
+const provider = require("./provider.cjs");
 const discovery = require("./discovery.cjs");
 const credits = require("./credits.cjs");
 const server = require("./server.cjs");
@@ -17,11 +19,11 @@ const events = require("./events.cjs");
 const util = require("./util.cjs");
 const ideswitch = require("./ideswitch.cjs");
 const poolsync = require("./poolsync.cjs");
+const poolsched = require("./poolsched.cjs");
 const ccswitch = require("./ccswitch.cjs");
 const oplog = require("./oplog.cjs");
 const xlsx = require("./xlsx.cjs"); // xlsx 写入器在本目录（v1.57.0 误写 ../xlsx.cjs，顶层 require 抛错 → 启动即崩）
 const zcodeLocal = require("./zcodeLocal.cjs");
-const zcodeCapture = require("./zcodeCapture.cjs");
 const zip = require("../zip.cjs");
 // 休眠唤醒守卫：避免唤醒瞬间逾期定时任务集中爆发（见 backend/wakeGuard.cjs 的实测说明）
 const wakeGuard = require("../wakeGuard.cjs");
@@ -214,7 +216,7 @@ async function checkinBatch({ channel, accountId, action, interactive, trigger }
           // 不弹窗，该行如实标「需人工过码」，UI 提示用户手动领取
           if (r && r.needCaptcha && r.captcha && r.captcha.sceneId && typeof ad.checkin === "function") {
             if (interactive) {
-              const cap = await zcodeCapture.solveCaptcha(r.captcha);
+              const cap = await platform.solveCaptcha(r.captcha);
               if (cap.ok) {
                 r = await ad.checkin(acc, secrets, { captcha: { verifyParam: cap.verifyParam, region: cap.region || r.captcha.region, sceneId: r.captcha.sceneId }, planId: r.planId });
               } else {
@@ -595,6 +597,7 @@ async function boot() {
   startCheckinAuto();
   growthLogLoad();
   startGrowthAuto();
+  poolsched.start(); // 号池定时同步（issue #89/#92）：hourly/daily 周期触发，全关时空转
   // 远程锚定指纹（remoteMid）的云端兜底：本机 anchor 缺锚（重装/换机）先从 WebDAV 拉回；
   // 有锚则顺手上传一份（内容 hash 记账，未变不重传）。fire-and-forget，WebDAV 未配置/网络
   // 失败一律静默——锚定的主事实在本机 anchor 文件里，云端只是防丢副本
@@ -612,11 +615,47 @@ async function boot() {
   }
 }
 
-function shutdown() {
+/** 停掉本模块持有的全部定时设施与在途流程（额度刷新 / 自动签到 / 号池同步 / 在途 OAuth）。
+ *  shutdown 与容器停机序列共用——网关监听停不停由调用方决定（桌面 shutdown 停 server；
+ *  容器先 drain 在途请求再关） */
+function stopTimers() {
   credits.stopScheduler();
   stopCheckinAuto();
+  poolsched.stop();
+  discovery.cancelOAuth();
+}
+
+function shutdown() {
+  stopTimers();
+  server.stop();
+}
+
+/**
+ * 模块开关（issue #91）运行时启停。
+ * 开：从未装配过（启动时模块被关）→ 完整 boot；装配过 → 只重启各定时设施，
+ *     网关是否自启仍由「记住网关开关」决定——启用模块不等于打开网关。
+ * 关：停定时器/网关并关库（各 store 函数入口都惰性 open，随时可重开）。
+ * 不动 booted 装配闸与 rules 监听：重启应用后由启动短路决定是否装配，
+ * 会话内反复开关不做全量拆卸/重建，避免 chokidar 重复挂监听。
+ */
+function setRuntime(on) {
+  if (on) {
+    if (!booted) return boot();
+    credits.startScheduler(() => settings().creditsRefreshMin);
+    startCheckinAuto();
+    poolsched.start();
+    events.emit({ type: "status" });
+    return Promise.resolve();
+  }
+  credits.stopScheduler();
+  stopCheckinAuto();
+  poolsched.stop();
   discovery.cancelOAuth();
   server.stop();
+  try { poolsync.cancel(); } catch { /* 在途号池同步一并收尾，符合「停用后不运行」承诺 */ }
+  try { store.close(); } catch { /* 关闭失败无碍，句柄随进程退出 */ }
+  events.emit({ type: "status" }); // 侧栏网关卡片立即回到已停止态，不等下一次轮询
+  return Promise.resolve();
 }
 
 // ===== IPC =====
@@ -697,7 +736,7 @@ function openAuthWindow(opts) {
   // 新开窗（含 target=_blank / window.open）：深链接管捕获，其余一律交系统浏览器打开
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^office-raccoon:\/\//i.test(url)) capture(url);
-    else if (isAuthPage(url)) shell.openExternal(url).catch(() => {});
+    else if (isAuthPage(url)) platform.openExternal(url);
     return { action: "deny" };
   });
   win.webContents.on("will-navigate", (ev, url) => {
@@ -762,12 +801,21 @@ function poolView(opts) {
   const channelEnabled = settings().channelEnabled || {};
   const checkinRules = settings().checkinAutoRules || {};
   const pinnedAccount = settings().pinnedAccount || {};
+  const now = Date.now();
+  // 阈值随设置热生效（无需重启网关）：每次出号池视图前对齐一次（廉价的模块级 setter）。
+  // poolSummary 的账号级 expiringSoon 与逐包用的是同一个值，改设置两处一起变。
+  pool.setExpiringSoonDays(settings().expiringSoonDays);
+  // 逐包一次全量读出再分桶：每账号一次查是 N+1（200 账号实测 15ms 上下，方差大）。
+  // store.cjs 的 listKeys() 统计每把 Key 的今日用量走的也是「一次全量 + Map join」同一形态
+  const packagesByAccount = store.listAllCreditPackages();
   return store.CHANNELS.filter((c) => all || channelOn(c.id)).map((c) => {
     const summary = pool.poolSummary(c.id);
     const localUid = String((localLogins[c.id] && localLogins[c.id].uid) || "");
     const accounts = pool.poolAccounts(c.id).map((a) => ({
       ...a,
       modelCool: pool.accountModelCool(a.id),
+      // 逐包明细：时间态（expired/expiringSoon）每次出视图重算，不落库
+      packages: pool.decoratePackageStates(packagesByAccount.get(a.id) || [], now),
       // 当前电脑上的 agent 客户端登录的就是这个账号（按本机登录态 uid 比对）
       liveHere: !!(localUid && a.uid && String(a.uid) === localUid),
     }));
@@ -831,6 +879,10 @@ function rememberRunning(running) {
 }
 
 function register(ipcMain) {
+  // 请求流水保留期从设置灌入号池存储模块：gc() 只在 open()（首次摸库）时跑，register 先行不踩空。
+  // 改完设置后启动 GC 要等下次开库才按新值清；想立刻按新值删一轮，用用量统计页的「清理」按钮
+  // ——那条走的是实时 settings() 里的值，不依赖这里的模块变量。
+  store.setUsageRetention(settings().usageRetentionDays);
   // ===== 服务启停 / 状态 =====
   ipcMain.handle("proxy_status", handle(() => gatewayStatus()));
   ipcMain.handle("proxy_start", handle(async () => {
@@ -874,8 +926,23 @@ function register(ipcMain) {
   }));
   ipcMain.handle("proxy_key_delete", handle(({ id }) => {
     if (!store.deleteKey(id)) return fail("Key 不存在");
+    try { poolsync.noteKeyRemoved(id); } catch { /* 墓碑记失败只是其他设备暂时删不掉，下轮可重 */ }
     oplog.log("info", "API Key", `删除 Key ${id}`, { target: id });
     return ok({});
+  }));
+  // 批量删除（Key 列表多选）：逐个走与单删相同的链路（墓碑先行 + WebDAV 传播），oplog 只记汇总一条
+  ipcMain.handle("proxy_keys_delete", handle(({ ids }) => {
+    const list = Array.isArray(ids) ? ids.map(String).filter(Boolean) : [];
+    if (!list.length) return fail("未选择 Key");
+    let removed = 0;
+    let missing = 0;
+    for (const id of list) {
+      if (!store.deleteKey(id)) { missing++; continue; }
+      try { poolsync.noteKeyRemoved(id); } catch { /* 同上：墓碑记失败不阻塞本地删除 */ }
+      removed++;
+    }
+    if (removed) oplog.log("info", "API Key", `批量删除 ${removed} 个 Key（选择 ${list.length} 个${missing ? `，${missing} 个已不存在` : ""}）`, {});
+    return ok({ removed, missing });
   }));
 
   // ===== 号池 =====
@@ -954,8 +1021,27 @@ function register(ipcMain) {
       cfg.proxy.pinnedAccount = pinned;
       config.saveConfig(cfg);
     }
+    // CatPaw 会话注册表挂点（对齐参照实现 W5 接线要求）：账号删除后其会话记录残留
+    // （2h TTL），工具续接窗口内其他账号的请求可把 tool 结果提交到已消失账号的 conversation
+    try { require("./catpaw/registry.cjs").registry.clearAccount(id); } catch { /* 无会话不影响删除 */ }
     oplog.log("info", "号池账号", `移除 ${store.channelDisplay(acc.channel)} 账号「${acc.name}」`, { channel: acc.channel, target: acc.name });
     return ok({});
+  }));
+  // 批量删除（号池列表多选）：逐个走与单删相同的链路（墓碑先行 + CatPaw 会话清理），oplog 只记汇总一条
+  ipcMain.handle("proxy_account_remove_batch", handle(({ ids }) => {
+    const list = Array.isArray(ids) ? ids.map(String).filter(Boolean) : [];
+    if (!list.length) return fail("未选择账号");
+    let removed = 0;
+    let missing = 0;
+    for (const id of list) {
+      const acc = store.getAccount(id);
+      if (!acc) { missing++; continue; }
+      poolsync.noteRemoved(poolsync.accountKeyOf(acc));
+      if (store.removeAccount(id)) removed++;
+      try { require("./catpaw/registry.cjs").registry.clearAccount(id); } catch { /* 无会话不影响删除 */ }
+    }
+    if (removed) oplog.log("info", "号池账号", `批量删除 ${removed} 个账号（选择 ${list.length} 个${missing ? `，${missing} 个已不存在` : ""}）`, {});
+    return ok({ removed, missing });
   }));
   ipcMain.handle("proxy_account_toggle", handle(({ id, enabled }) => {
     const acc = store.getAccount(id);
@@ -963,6 +1049,10 @@ function register(ipcMain) {
     store.updateAccount(id, enabled
       ? { status: "online", coolUntil: 0, coolReason: "" }
       : { status: "disabled" });
+    // 停用同样作废该账号名下的 CatPaw 会话（不再参与调度但记录残留，同上）
+    if (!enabled) {
+      try { require("./catpaw/registry.cjs").registry.clearAccount(id); } catch { /* 无会话不影响停用 */ }
+    }
     oplog.log("info", "号池账号", `${enabled ? "启用" : "停用"} ${store.channelDisplay(acc.channel)} 账号「${acc.name}」`, { channel: acc.channel, target: acc.name });
     return ok({});
   }));
@@ -972,6 +1062,15 @@ function register(ipcMain) {
     if (!acc) return fail("账号不存在");
     store.updateAccount(id, { name: String(name || "").trim() });
     oplog.log("info", "号池账号", `重命名「${acc.name}」为「${String(name || "").trim()}」`, { channel: acc.channel, target: acc.name });
+    return ok({});
+  }));
+  // 账号备注（号池列表「备注」弹窗）：落 meta.note，随 exportPool 快照导出 + 备注新者胜传播
+  ipcMain.handle("proxy_account_note", handle(({ id, note }) => {
+    const acc = store.getAccount(id);
+    if (!acc) return fail("账号不存在");
+    if (!store.noteAccount(id, note)) return fail("账号不存在");
+    const text = String(note || "").trim();
+    oplog.log("info", "号池账号", `${text ? "设置备注" : "清除备注"}「${acc.name}」${text ? `：${text.slice(0, 50)}${text.length > 50 ? "…" : ""}` : ""}`, { channel: acc.channel, target: acc.name });
     return ok({});
   }));
   // 手动解除冷却：cooling 账号立即回 online，同时豁免该账号的模型级负缓存
@@ -1062,7 +1161,7 @@ function register(ipcMain) {
     credits.refreshAccount(r.id).catch(() => {});
     return ok({ id: r.id, updated: r.updated });
   }));
-  ipcMain.handle("proxy_oauth_begin", handle(async ({ channel }) => {
+  ipcMain.handle("proxy_oauth_begin", handle(async ({ channel, captchaVerifyParam, vendor }) => {
     const ch = adapters.get(channel) ? String(channel) : store.CHANNELS[0].id;
     const r = await discovery.beginOAuth(ch, (result) => {
       if (result.ok) {
@@ -1072,13 +1171,49 @@ function register(ipcMain) {
       }
       oplog.log(result.ok ? "info" : "error", "OAuth 登录", result.ok ? `${store.channelDisplay(ch)} 授权登录成功` : result.message || `${store.channelDisplay(ch)} 授权登录失败`, { channel: ch });
       events.emit({ type: "oauth-done", channel: ch, ...result });
-    }, { openAuthWindow });
+    }, { openAuthWindow }, { captchaVerifyParam, vendor });
     // 带授权地址的渠道在系统浏览器打开（小浣熊走内嵌授权窗，不回 url——深链回调绝不能进浏览器
     // 再被系统交给官方客户端：授权码是一次性的，官方客户端消费掉 AgentHub 就永远收不到回调）
-    if (r.ok && r.url) await shell.openExternal(r.url);
-    return r.ok ? ok({ url: r.url, mode: r.mode }) : fail(r.message);
+    if (r.ok && r.url) await platform.openExternal(r.url);
+    // port 一并回传：AutoClaw 国际版回环登录会占用 z.ai 登记的白名单端口，前端展示/排障需要它；
+    // userCode 一并回传：Cline 设备授权要显示「用户码」供手动输码（verification_uri_complete
+    // 已带码，但用户改用普通授权页时仍需要这串码）
+    return r.ok ? ok({ url: r.url, mode: r.mode, port: r.port, userCode: r.userCode }) : fail(r.message);
   }));
   ipcMain.handle("proxy_oauth_cancel", handle(() => ok({ cancelled: discovery.cancelOAuth() })));
+  // ===== AutoClaw 登录辅助：国内版手机验证码两跳 + 国际版风控配置（验证码由前端跑 SDK）=====
+  ipcMain.handle("proxy_autoclaw_sms_send", handle(async ({ channel, phone }) => {
+    const ch = String(channel || "autoclaw");
+    if (!adapters.get(ch)) return fail(`未知渠道 ${ch}`);
+    const login = require("./autoclaw/login.cjs");
+    const r = await login.sendSmsCode({ cfg: (rules.get("headers.json") || {})[ch] || {}, httpJson: adapters.httpJson, phone });
+    if (r.ok) oplog.log("info", "AutoClaw 发码", `${store.channelDisplay(ch)} 验证码已发送（${r.phoneTail || r.phone}）`, { channel: ch });
+    return r.ok ? ok(r) : fail(r.message);
+  }));
+  ipcMain.handle("proxy_autoclaw_sms_login", handle(async ({ channel, phone, code, deviceId }) => {
+    const ch = String(channel || "autoclaw");
+    if (!adapters.get(ch)) return fail(`未知渠道 ${ch}`);
+    const login = require("./autoclaw/login.cjs");
+    const r = await login.smsLogin({ cfg: (rules.get("headers.json") || {})[ch] || {}, httpJson: adapters.httpJson, phone, code, deviceId });
+    if (!r.ok) return fail(r.message);
+    try {
+      const saved = await discovery.saveAutoclawAccount(ch, r, r.deviceId);
+      credits.refreshAccount(saved.id).catch(() => {});
+      checkinBatch({ accountId: saved.id, action: "checkin" }).catch(() => {});
+      oplog.log("info", "AutoClaw 登录", `${store.channelDisplay(ch)} 短信登录成功`, { channel: ch });
+      events.emit({ type: "oauth-done", channel: ch, ok: true, id: saved.id, uid: saved.uid });
+      return ok({ id: saved.id, uid: saved.uid, updated: saved.updated });
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+  }));
+  ipcMain.handle("proxy_autoclaw_captcha_config", handle(async ({ channel }) => {
+    const ch = String(channel || "autoclaw_intl");
+    if (!adapters.get(ch)) return fail(`未知渠道 ${ch}`);
+    const login = require("./autoclaw/login.cjs");
+    const r = await login.oauthCaptchaConfig({ cfg: (rules.get("headers.json") || {})[ch] || {}, httpJson: adapters.httpJson });
+    return r.ok ? ok(r) : fail(r.message);
+  }));
   // 浏览器没跳回回环地址时的兜底：把地址栏内容整段粘回来完成登录
   ipcMain.handle("proxy_oauth_submit_callback", handle(async ({ channel, url }) => {
     const r = await discovery.submitCallbackUrl(url, channel);
@@ -1158,13 +1293,25 @@ function register(ipcMain) {
   // 合并视图 + 管理态（启停/渠道覆盖/回退模型/自定义参数）；管理态由渲染层写回整体配置（app.save），服务端每请求读盘热生效
   ipcMain.handle("proxy_models", handle(() => {
     const cfg = settings();
-    return adapters.mergedModels(cfg).map((m) => ({
-      ...m,
-      enabled: !(cfg.disabledModels || []).includes(m.id),
-      override: (cfg.modelOverrides || {})[m.id] || "",
-      fallback: (cfg.modelFallback || {})[m.id] || "",
-      custom: (cfg.modelCustom || {})[m.id] || undefined,
-    }));
+    const channelModelIds = Object.fromEntries(
+      Object.keys(adapters.ADAPTERS).map((channel) => [channel, adapters.channelModelIds(channel)])
+    );
+    return adapters.mergedModels(cfg).map((m, index) => {
+      const item = {
+        ...m,
+        enabled: !(cfg.disabledModels || []).includes(m.id),
+        override: (cfg.modelOverrides || {})[m.id] || "",
+        fallback: (cfg.modelFallback || {})[m.id] || "",
+        custom: (cfg.modelCustom || {})[m.id] || undefined,
+      };
+      // 原始渠道目录只需随响应返回一次：渲染层从首条读取（ProxyModelsView 的
+      // `models[0]?.channelModelIds || {}`），避免新增 IPC 与重复传输。
+      // 该隐式契约是安全的——空列表时不挂载也不会丢有效数据：mergedModels 为空 ⟺ 所有渠道
+      // ad.models() 均为空（见 adapters.mergedModels：逐渠道并集、无过滤），此时
+      // channelModelIds 各值本就为空数组。切勿把本字段挪到别处或改成逐条挂载（会重复传输）。
+      if (index === 0) item.channelModelIds = channelModelIds;
+      return item;
+    });
   }));
   // 官方模型目录拉取（三渠道通用）：取号池里第一个 online 有 token 的账号，adapter.fetchModels 走云端接口
   // （Trae get_detail_param / WB v3/config + console models），结果写回 rules/catalog.json 热生效。
@@ -1173,9 +1320,12 @@ function register(ipcMain) {
     const ch = String(channel || "");
     const adapter = adapters.get(ch);
     if (!adapter || typeof adapter.fetchModels !== "function") return fail(`未知渠道 "${ch}"`);
-    const acc = pool.poolAccounts(ch).find((a) => a.status === "online" && a.hasToken);
-    if (!acc) return fail(`${store.channelDisplay(ch)}号池无可用账号，无法拉取模型目录`);
-    const secrets = store.accountSecrets(store.getAccount(acc.id));
+    // 目录接口是否需要登录态：未显式声明 modelsNeedAuth 的渠道一律按「需要」处理（行为与既有一致）；
+    // Cline 的 recommended-models 实测无需鉴权（modelsNeedAuth:false），可在无账号时先同步目录
+    const needAuth = adapter.modelsNeedAuth !== false;
+    const acc = needAuth ? pool.poolAccounts(ch).find((a) => a.status === "online" && a.hasToken) : null;
+    if (needAuth && !acc) return fail(`${store.channelDisplay(ch)}号池无可用账号，无法拉取模型目录`);
+    const secrets = acc ? store.accountSecrets(store.getAccount(acc.id)) : null;
     const r = await adapter.fetchModels(acc, secrets);
     if (!r || !r.ok || !Array.isArray(r.models) || !r.models.length) {
       oplog.log("error", "模型目录", `${store.channelDisplay(ch)} 模型目录拉取失败：${(r && r.message) || "返回为空"}`, { channel: ch });
@@ -1190,6 +1340,31 @@ function register(ipcMain) {
     oplog.log("info", "模型目录", `${store.channelDisplay(ch)} 模型目录已同步（${r.models.length} 个模型）`, { channel: ch });
     return ok({ channel: ch, count: r.models.length, withRate });
   }));
+
+  // ===== 自定义提供商（中转站 / 自建 OpenAI 兼容端点） =====
+  // 校验与规矩都在 provider.cjs；这里只做参数搬运与 ok/fail 形状包装，出错一律 {ok:false,message}
+  // 由前端直接展示（validate 的 message 已带用户可行动的说明，不再另造错误码）。
+  ipcMain.handle("proxy_provider_list", handle(() => ok({ providers: provider.list() })));
+  ipcMain.handle("proxy_provider_create", handle(({ keys, ...input }) => {
+    const r = provider.create(input);
+    if (!r.ok) return r;
+    // 建提供商时顺带把手里几把 Key 一起存：表单一次填完比"先建再逐个加"少三 step。
+    // 逐个走 addKey 是为了让去重与校验规则只有一份。
+    const added = [];
+    for (const k of Array.isArray(keys) ? keys : []) {
+      const a = provider.addKey(r.provider.id, typeof k === "string" ? { key: k } : k);
+      if (a.ok) added.push(a.id);
+    }
+    return ok({ provider: r.provider, keyIds: added });
+  }));
+  ipcMain.handle("proxy_provider_update", handle((input) => provider.update(input.id, input)));
+  ipcMain.handle("proxy_provider_delete", handle(({ id }) => provider.remove(id)));
+  ipcMain.handle("proxy_provider_add_key", handle(({ id, name, key }) => provider.addKey(id, { name, key })));
+  ipcMain.handle("proxy_provider_remove_key", handle(({ accountId }) => provider.removeKey(accountId)));
+  // 探测用「表单里当场填的 Key + 地址」，未保存的配置也能试；编辑态不重填时改传 accountId，
+  // 由主进程解密——两条都不动号池（不 pickAccount、不写流水、不进冷却），探完好 Key 还是好的
+  ipcMain.handle("proxy_provider_test", handle((input) => provider.probe(input)));
+  ipcMain.handle("proxy_provider_fetch_models", handle(({ id }) => provider.fetchModels(id)));
 
   // ===== 生态接入：CC Switch =====
   ipcMain.handle("proxy_ccswitch_status", handle(() => ccswitch.status()));
@@ -1274,29 +1449,29 @@ function register(ipcMain) {
   }));
 
   // ===== 统计 =====
-  ipcMain.handle("proxy_stats_overview", handle(({ days }) => ({
-    today: store.statsToday(),
-    trend: store.statsTrend(days || 7),
-    tops: {
-      channel: store.statsTop("channel", days || 7),
-      model: store.statsTop("model", days || 7),
-      key: store.statsTop("key", days || 7),
-      account: store.statsTop("account", days || 7),
-    },
-  })));
+  // 区间化总览：一次回 KPI / 序列 / 四维排行 / 各 Key / 状态分布 / Token 构成（方案 §4.2）
+  ipcMain.handle("proxy_stats_overview", handle(({ from, to, granularity }) =>
+    store.statsOverview({ from, to, granularity })));
   ipcMain.handle("proxy_stats_top", handle(({ dim, days }) => store.statsTop(dim, days)));
-  ipcMain.handle("proxy_stats_detail", handle(({ page, pageSize, channel, keyId, model }) =>
-    store.statsDetail({ page, pageSize, channel, keyId, model })));
+  ipcMain.handle("proxy_stats_detail", handle(({ from, to, page, pageSize, channel, keyId, key, model, status }) =>
+    store.statsDetail({ from, to, page, pageSize, channel, keyId, key, model, status })));
+  // 手动清理流水：days 缺省取设置里的保留期（实时读，改完设置不必重启），all=true 清空整表。
+  // 删的是不可恢复的用户数据，所以落一条操作日志——统计页的提示只活几秒，日志才是事后能查的凭据。
+  ipcMain.handle("proxy_stats_cleanup", handle(({ days, all }) => {
+    const r = store.cleanupUsage(Math.round(Number(days)) || Number(settings().usageRetentionDays) || 90, !!all);
+    oplog.log("info", "用量统计", all ? `手动清空全部请求流水（${r.deleted} 条）` : `按保留期手动清理请求流水（${r.deleted} 条）`, { target: "usage_requests" });
+    return r;
+  }));
   ipcMain.handle("proxy_recent", handle(({ limit }) => store.recentRequests(limit)));
 
   // ===== 规则文件 / 目录 / 安全 =====
   ipcMain.handle("proxy_rules_list", handle(() => rules.list()));
   ipcMain.handle("proxy_open_rules_dir", handle(async () => {
-    await shell.openPath(rules.rulesDir());
+    await platform.openPath(rules.rulesDir());
     return ok({});
   }));
   ipcMain.handle("proxy_open_data_dir", handle(async () => {
-    await shell.openPath(store.proxyDir());
+    await platform.openPath(store.proxyDir());
     return ok({});
   }));
   ipcMain.handle("proxy_vault_status", handle(() => ({
@@ -1325,4 +1500,4 @@ function register(ipcMain) {
 }
 
 // 计划判定与抖动的纯函数一并导出：供自测直接验证跨午夜 / 不补欠账 / 已完成等分支
-module.exports = { boot, shutdown, register, settings, checkinJitterOffset, checkinPlannedAt, checkinDueKey };
+module.exports = { boot, shutdown, stopTimers, setRuntime, register, settings, checkinJitterOffset, checkinPlannedAt, checkinDueKey };

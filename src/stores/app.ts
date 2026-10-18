@@ -1,8 +1,24 @@
 // 应用级状态：配置（主题 / 模块顺序 + 技能仓库配置）、当前模块与子页面、技能仓库全局数据
 import { defineStore } from "pinia";
 import { MODULES } from "../types";
+import { moduleEnabled } from "../api/caps";
 import type { AppConfig, SettingsTab, ModuleDef, ModuleKey, PageDef, Overview, ToolRow } from "../types";
 import * as api from "../api/ipc";
+
+/** 递归合并：以 base 为基线补全 patch 缺失的嵌套字段；数组与原始值一律整体取 patch（有则覆盖）。
+ *  用途：后端返回的配置一旦缺某个嵌套字段（旧版后端 / 字段重命名 / mock 未同步），浅合并会让
+ *  模板访问形如 proxy.poolsyncSchedule 时直接抛错白屏——这里保证任何层级都有 defaultConfig 兜底。 */
+function mergeConfigDeep<T>(base: T, patch: unknown): T {
+  if (Array.isArray(base) || Array.isArray(patch)) return (patch === undefined ? base : (patch as T));
+  if (base && typeof base === "object" && patch && typeof patch === "object") {
+    const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+    for (const key of Object.keys(patch as Record<string, unknown>)) {
+      out[key] = mergeConfigDeep((base as Record<string, unknown>)[key], (patch as Record<string, unknown>)[key]);
+    }
+    return out as T;
+  }
+  return patch === undefined ? base : (patch as T);
+}
 
 // 浏览器 mock / 后端加载失败时的兜底默认值；后端权威默认值见 electron/backend/config.cjs
 const defaultConfig: AppConfig = {
@@ -14,6 +30,7 @@ const defaultConfig: AppConfig = {
   fxPools: false,
   fxCursor: true,
   moduleOrder: MODULES.map((m) => m.key),
+  modules: { skills: { enabled: true }, sync: { enabled: true }, proxy: { enabled: true }, memory: { enabled: true } },
   tools: {},
   customDirs: [],
   mountMode: "junction",
@@ -21,7 +38,7 @@ const defaultConfig: AppConfig = {
   trashDays: 7,
   update: { channel: "stable", autoCheck: true, notifiedVersion: "" },
   webdav: { endpoint: "", username: "", password: "", root: "/agent-skills", deviceId: "", deviceName: "" },
-  schedule: { minimizeToTray: true, autoStart: false, hourly: false, daily: false, dailyTime: "09:00", notifyOnSuccess: false },
+  schedule: { minimizeToTray: true, shortcutToggle: "Alt+`", lightweightMode: false, autoStart: false, hourly: false, daily: false, dailyTime: "09:00", notifyOnSuccess: false },
   watch: { enabled: true, intervalSeconds: 15 },
   // 反代网关设置兜底（权威默认值见 electron/backend/config.cjs）
   proxy: {
@@ -34,6 +51,9 @@ const defaultConfig: AppConfig = {
     rateLimitPerMin: 120,
     concurrency: 8,
     creditsRefreshMin: 30,
+    usageRetentionDays: 90,
+    expiringSoonDays: 1,
+    poolsyncSchedule: { hourly: false, hourlyInterval: 6, daily: false, dailyTime: "04:00" },
     debugStatus: false,
     modelOverrides: {},
     humanizeJitter: true,
@@ -77,6 +97,35 @@ function mirrorFx(key: string, on: boolean) {
   }
 }
 
+// ===== 界面位置镜像（轻量模式必需）=====
+// 轻量模式关窗时会销毁整个渲染进程，Pinia 里的 activeModule/activePage 随之丢失。
+// 若不落盘，用户每次唤回界面都会回到默认页 —— 等于轻量化把"我刚才在看哪"清一次。
+// 用 localStorage 而非新增 IPC：与动效镜像同款做法，渲染层自己记住即可，
+// 不必让主进程参与，Web/容器端（NAS）也不受影响。
+const PAGE_MIRROR_KEY = "agenthub.lastPage";
+
+function mirrorPage(moduleKey: string, pageId: string) {
+  try {
+    localStorage.setItem(PAGE_MIRROR_KEY, JSON.stringify({ module: moduleKey, id: pageId }));
+  } catch {
+    /* 写不进只影响下次恢复位置：忽略 */
+  }
+}
+
+function readMirroredPage(): { module: string; id: string } | null {
+  try {
+    const raw = localStorage.getItem(PAGE_MIRROR_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    if (v && typeof v === "object" && typeof v.module === "string" && typeof v.id === "string") {
+      return { module: v.module, id: v.id };
+    }
+  } catch {
+    /* 解析失败按没有处理 */
+  }
+  return null;
+}
+
 export const useAppStore = defineStore("app", {
   state: () => ({
     config: { ...defaultConfig } as AppConfig,
@@ -106,10 +155,14 @@ export const useAppStore = defineStore("app", {
   getters: {
     isDark: (s) => s.config.theme === "dark",
     moduleOf: () => (key: ModuleKey): ModuleDef => MODULES.find((m) => m.key === key) || MODULES[0],
-    /** 左栏模块列表：用户自定义顺序优先，缺失模块按内置默认补尾 */
-    orderedModules(s): ModuleDef[] {
+    /** 左栏模块列表：用户自定义顺序优先，缺失模块按内置默认补尾；
+     *  附 enabled 标志（issue #91）：关闭的板块左上角置灰不可点；
+     *  Web 托管形态按服务端能力清单裁剪（容器版只有 proxy），桌面全量 */
+    orderedModules(s): (ModuleDef & { enabled: boolean })[] {
       const byKey = new Map(MODULES.map((m) => [m.key, m]));
-      return s.config.moduleOrder.map((k) => byKey.get(k)).filter((m): m is ModuleDef => !!m);
+      return s.config.moduleOrder.map((k) => byKey.get(k)).filter((m): m is ModuleDef => !!m)
+        .filter((m) => moduleEnabled(m.key))
+        .map((m) => ({ ...m, enabled: !s.config.modules?.[m.key] || s.config.modules[m.key].enabled !== false }));
     },
     /** 当前模块的子页面：memory 模块按 ui.tabs 白名单过滤（空=默认 5 个核心页；dashboard/browse 保底），其余模块全量返回 */
     pagesOf(s): PageDef[] {
@@ -132,17 +185,41 @@ export const useAppStore = defineStore("app", {
     },
   },
   actions: {
+    /** 板块开关切换（issue #91）：走主进程唯一写入口，成功后同步内存态供 UI 即时置灰。
+     *  必须是 action 不能是 getter——Pinia getter 会被立即求值，函数值会被提前调用炸掉 */
+    async toggleModule(key: string, enabled: boolean) {
+      const r = await api.moduleToggle(key, enabled);
+      if (r && r.ok) {
+        const mods = this.config.modules as Record<string, { enabled: boolean }> | undefined;
+        if (mods && mods[key]) mods[key].enabled = enabled;
+      }
+      return r;
+    },
     async load() {
       try {
-        Object.assign(this.config, await api.loadConfig());
+        // 深合并而非 Object.assign（浅合并会把 proxy 等嵌套对象整体替换，后端一旦缺字段即白屏）
+        const remote = await api.loadConfig();
+        Object.assign(this.config, mergeConfigDeep(structuredClone(defaultConfig), remote));
       } catch {
         this.config = JSON.parse(JSON.stringify(defaultConfig));
       }
-      // 启动默认板块：左栏模块自定义排序的第一个（而非固定技能仓库），页面取其第一个子页
-      const first = this.orderedModules[0];
+      // 启动默认板块：左栏模块自定义排序的第一个【已启用】板块（关闭的板块置灰不可选），
+      // 页面取其第一个子页；全部未启用时回落第一个（后端 module_toggle 有「至少留一个」守卫）
+      const first = this.orderedModules.find((m) => m.enabled) || this.orderedModules[0];
       if (first) {
         this.activeModule = first.key;
         this.activePage = first.pages[0].id;
+      }
+      // 恢复上次停留的页面（轻量模式销毁界面后唤回时，用户应回到原处而不是默认页）。
+      // 只在模块与页面都仍然合法时恢复 —— 记忆页签白名单会变、模块顺序也可能被改过，
+      // 失效就静默回落到上面的默认位置。
+      const mirrored = readMirroredPage();
+      if (mirrored) {
+        const mod = this.orderedModules.find((m) => m.key === mirrored.module);
+        if (mod && this.moduleOf(mod.key).pages.some((p) => p.id === mirrored.id)) {
+          this.activeModule = mod.key;
+          this.activePage = mirrored.id;
+        }
       }
       this.applyTheme(this.config.theme);
       // 界面动效默认开启：只有显式存的 false 才关（旧配置无此字段时跟随新默认）；
@@ -230,6 +307,22 @@ export const useAppStore = defineStore("app", {
       this.applyFxCursor(on);
       this.save();
     },
+    /** 把当前停留位置写进 localStorage 镜像（轻量模式销毁界面后唤回时据此恢复）。
+     *  由 App.vue 的「loaded + 当前位置」watcher 调用，故只在配置加载完成、位置已定后记录。 */
+    mirrorActivePage() {
+      mirrorPage(this.activeModule, this.activePage);
+    },
+    /** 重拉配置到内存快照：main 侧托盘等直写配置后经 app:event 广播，渲染层据此刷新。
+     *  与 load() 的区别：不动 activeModule/activePage（重拉不能把用户从当前页拽走）。 */
+    async refreshConfig() {
+      try {
+        const remote = await api.loadConfig();
+        Object.assign(this.config, mergeConfigDeep(structuredClone(defaultConfig), remote));
+      } catch {
+        /* 拉取失败保留当前快照 */
+      }
+      this.applyTheme(this.config.theme);
+    },
     /** 打开全局设置弹窗：tab 缺省保持当前模块；左下角齿轮给 general，跨模块入口给 webdav 等 */
     openSettings(tab?: SettingsTab) {
       if (tab) this.settingsTab = tab;
@@ -256,6 +349,8 @@ export const useAppStore = defineStore("app", {
     selectModule(key: ModuleKey) {
       this.settingsOpen = false;
       this.pageBeforeConfig = "";
+      // 已停用的板块置灰不可点（issue #91）：入口拦在切换处，避免渲染层绕过
+      if (this.config.modules?.[key] && this.config.modules[key].enabled === false) return;
       if (this.activeModule === key) return;
       this.activeModule = key;
       this.activePage = this.moduleOf(key).pages[0].id;

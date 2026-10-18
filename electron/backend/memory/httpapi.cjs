@@ -28,6 +28,9 @@ class MemoryHttpApi {
   }
 
   start() {
+    // 防重入：已启动直接返回现成端口。曾无此保护，重复 start 会创建第二个 server
+    // 并覆盖 runtime.json（token 同时变两份），旧 server 句柄丢失永不关闭 = 泄漏
+    if (this.server) return Promise.resolve({ port: this.port });
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => this._handle(req, res));
       server.on("error", reject);
@@ -44,7 +47,7 @@ class MemoryHttpApi {
     const payload = { port: this.port, token: this.token, pid: process.pid, startedAt: Date.now() };
     try {
       fs.mkdirSync(path.dirname(this.runtimeFile), { recursive: true });
-      const tmp = `${this.runtimeFile}.tmp`;
+      const tmp = `${this.runtimeFile}.tmp.${process.pid}`;
       fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf8");
       if (fs.existsSync(this.runtimeFile)) fs.rmSync(this.runtimeFile, { force: true });
       fs.renameSync(tmp, this.runtimeFile);

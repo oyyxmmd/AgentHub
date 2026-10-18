@@ -3,35 +3,99 @@
 "use strict";
 const store = require("./store.cjs");
 
-/** 派生有效状态：cooling 到期自动回 online；exhausted 到次日 04:00 后给复活机会 */
+/** 「即将到期」窗口（天）：设置页可调，index.cjs 出号池视图前按 settings().expiringSoonDays 灌入。
+ *  放本模块的模块级变量（仿 store.usageRetentionDays），避免让热路由模块依赖 config。
+ *  默认 1 = 与本改动前 poolSummary 里那个硬编码 86400000 完全等价，不改变任何人的现有观感。
+ *  账号级聚合（poolSummary.expiringSoon）与逐包（decoratePackageStates）共用这一个值。 */
+let expiringSoonDays = 1;
+function setExpiringSoonDays(n) {
+  // 只认「数字」和「非空数字串」。不能写成 Number(n) 一把梭：Number(null) 和 Number("")
+  // 都是合法的 0，会被下面这段当成「用户主动把预警调到 0=关闭」，于是缺字段 / 清空输入框
+  // 会静默关掉预警，而且界面上一点痕迹都没有。
+  const v = typeof n === "number" ? n
+    : (typeof n === "string" && n.trim() !== "" ? Number(n) : NaN);
+  if (Number.isFinite(v) && v >= 0 && v <= 3650) expiringSoonDays = v;
+}
+function expiringSoonMs() { return expiringSoonDays * 86400000; }
+
+/**
+ * 由积分包集派生账号级额度（包集是单一事实源时调用；无包则返回 null，调用方保留既有聚合值）。
+ *  - 任一包 remaining = -1（上游「不限」哨兵）→ credits = -1（无限额度）
+ *    ⚠ total = -1 **不**算不限——它表示「上游不给这一包的总额」，与「额度无限」是两回事。
+ *    两者混为一谈时，producer 只要按「不知道总额」的口径写 total:-1，该号余额就会被
+ *    派生成无限并绕开 cost-first 路由，所以这里只认 remaining。
+ *  - 剩余 = Σ未过期包剩余；最近到期 = min(剩余>0 且未过期 的包到期)
+ */
+function deriveAccountCredits(packages, now) {
+  if (!Array.isArray(packages) || !packages.length) return null;
+  now = now || Date.now();
+  const unlimited = packages.some((p) => Number(p.remaining) === -1);
+  const valid = packages.filter((p) => !(Number(p.expiresAt) > 0 && Number(p.expiresAt) <= now));
+  const credits = unlimited ? -1 : valid.reduce((s, p) => s + Math.max(0, Number(p.remaining) || 0), 0);
+  const withRemain = valid.filter((p) => (Number(p.remaining) || 0) > 0 && Number(p.expiresAt) > 0);
+  const expiresAt = withRemain.length ? Math.min(...withRemain.map((p) => Number(p.expiresAt))) : 0;
+  return { credits, expiresAt };
+}
+
+/**
+ * 逐包时间态：给包集附 expired/expiringSoon。
+ * 两个量故意不落库——把"今天"写进库就被刷新时刻冻结了，隔天再看全是旧的；每次出视图重算。
+ * expiresAt = 0 是「长期有效」（normalizeExpiryMs 把远未来脏值归 0），既不算已过期也不算即将到期。
+ */
+function decoratePackageStates(packages, now) {
+  const t = now || Date.now();
+  const soonMs = expiringSoonMs();
+  return (packages || []).map((p) => ({
+    ...p,
+    expired: p.expiresAt > 0 && p.expiresAt <= t,
+    expiringSoon: p.expiresAt > t && p.expiresAt - t < soonMs,
+  }));
+}
+
+/** 派生有效状态：cooling 到期自动回 online；exhausted 到次日 04:00 后给复活机会。
+ *  只返回派生状态，不落库——落库时机由调用方 poolAccounts 统一收，避免双写 */
 function effectiveStatus(acc, now) {
   now = now || Date.now();
-  if (acc.status === "cooling" && acc.cool_until && acc.cool_until <= now) {
-    store.updateAccount(acc.id, { status: "online", coolUntil: 0, coolReason: "" });
-    return "online";
-  }
+  if (acc.status === "cooling" && acc.cool_until && acc.cool_until <= now) return "online";
   if (acc.status === "exhausted" && acc.cool_until && acc.cool_until <= now) return "online";
   return acc.status;
 }
 
 const memLastUsed = new Map(); // accId → 内存最近选号时间戳，消除选号高频同步写放大
 
-/** 渠道号池视图（账号明细 + 派生状态 + 内存最新 lastUsed） */
+/** 渠道号池视图（账号明细 + 派生状态 + 内存最新 lastUsed）。
+ *  派生复活（cooling/exhausted 到期回 online）统一在这里落库，调度与视图读同一口径；
+ *  必须保持「状态确实变化才写」，否则每轮 pickAccount 都对全池写一遍，SQLite 锁竞争放大 */
 function poolAccounts(channel) {
   return store.listAccounts(channel).map((a) => {
-    const before = a.status;
     const eff = effectiveStatus(a);
-    // 派生复活（cooling/exhausted 到期）必须落库，否则调度/健康检查读原始行永不复活
-    if (before !== eff) store.updateAccount(a.id, { status: eff, coolUntil: 0, coolReason: "" });
+    const before = a.status;
+    if (before !== eff) {
+      // cooling 到期的复活清冷却字段；exhausted 到期只回 online，保留 coolUntil（次日 04:00 锚点）
+      store.updateAccount(a.id, before === "cooling" ? { status: "online", coolUntil: 0, coolReason: "" } : { status: "online" });
+    }
     const latestUsed = Math.max(a.lastUsed || 0, memLastUsed.get(a.id) || 0);
     return { ...a, status: eff, lastUsed: latestUsed };
   });
 }
 
+/** 渠道是否声明「余额 0 不是硬门禁」（Cline：上游允许余额记负——实测欠费 -0.02 仍可用，
+ *  真实门禁是每日额度的 429（带重置时间）与订阅 403，都已由错误分类按账号处置）。
+ *  对这类渠道，「余额 0 → exhausted」会把免费池账号锁死：store 入库层把两位小数舍入后的
+ *  0 与 < -1 的负值都归 0，复活条件 credits > 0 在余额恒 0 时永不满足。
+ *  惰性 require：adapters.cjs 装配重，避免顶层 require 改变加载顺序（本仓反代依赖惯例） */
+function zeroBalanceUsable(channel) {
+  try {
+    const ad = require("./adapters.cjs").get(channel);
+    return !!(ad && ad.zeroBalanceUsable);
+  } catch { return false; }
+}
+
 /**
  * 池内选号：expire_first（默认，积分先到期先用）/ credit_first / round_robin
  * 两种自动切换（不发请求、调度期前置生效）：
- *  ① 余额不足自动切换——已查到余额为 0 的账号直接标记耗尽并跳过，不再浪费一次上游 402；
+ *  ① 余额不足自动切换——已查到余额为 0 的账号直接标记耗尽并跳过，不再浪费一次上游 402
+ *     （声明 zeroBalanceUsable 的渠道豁免——余额 0 不是它的硬门禁，判定见上）；
  *  ② 余额到期自动切换——到期时间已过的账号余额视为失效，标记并跳过；
  *     搭配默认 expire_first 策略：快到期账号永远排在最前优先消耗（到期前榨干），过期即自动切走。
  * 被跳过的账号等下次额度刷新拿到新余额/新到期时间后自动复活（credits.cjs）。
@@ -44,8 +108,10 @@ function pickAccount(channel, strategy, excludeIds, maxInFlight, pinnedId) {
   const candidates = [];
   for (const a of poolAccounts(channel)) {
     if (a.status !== "online" || !a.hasToken || exclude.has(a.id)) continue;
-    // credits === -1 = 企业版无限额度哨兵，不参与耗尽判定
-    if (a.creditsAt > 0 && a.credits === 0) {
+    // credits === -1 = 企业版无限额度哨兵，不参与耗尽判定；
+    // 声明 zeroBalanceUsable 的渠道（Cline）同样豁免——余额 0 不是它的硬门禁，
+    // 真实门禁（每日额度 429）由错误分类落冷却处置，这里误标只会把账号锁死在调度外
+    if (a.creditsAt > 0 && a.credits === 0 && !zeroBalanceUsable(channel)) {
       // ① 已知余额不足：标记耗尽（次日 04:00 给复活机会），自动切换下一账号
       store.updateAccount(a.id, { status: "exhausted", coolUntil: nextDay4AM(), coolReason: "余额不足，已自动切换" });
       continue;
@@ -190,6 +256,12 @@ function coolAccount(id, kind, detail) {
     case "relogin": // 401 刷新失败
       store.updateAccount(id, { status: "relogin", coolUntil: 0, coolReason: detail || "凭证失效，需重新登录" });
       break;
+    case "account_blocked": // 11140 账号级风控拦截（WB）：拦截时长上游不给，按小时级冷却
+      // 档位不能取默认的 60s——风控状态不会自己好，1 分钟后被重新选中又是一次白撞；
+      // 也不能学 relogin 直接判死：实测该状态与账号本身无关（目录/计费端点照常 200），
+      // 换会话后可能就恢复了。2h 是「别把整池拖下水」与「别误判成永久失效」的折中
+      store.updateAccount(id, { status: "cooling", coolUntil: now + 2 * 3600000, coolReason: detail || "账号被上游风控拦截" });
+      break;
     default:
       store.updateAccount(id, { status: "cooling", coolUntil: now + 60000, coolReason: detail || "" });
   }
@@ -310,7 +382,7 @@ function poolSummary(channel) {
     accountCount: accs.length,
     onlineCount: online.length,
     earliestExpire: expires.length ? Math.min(...expires) : 0,
-    expiringSoon: accs.some((a) => a.expiresAt > 0 && a.expiresAt - now < 86400000),
+    expiringSoon: accs.some((a) => a.expiresAt > 0 && a.expiresAt - now < expiringSoonMs()),
     todayReq: accs.reduce((s, a) => s + a.todayReq, 0),
     todayTokens: accs.reduce((s, a) => s + a.todayTokens, 0),
     lastCreditsAt: accs.reduce((m, a) => Math.max(m, a.creditsAt || 0), 0),
@@ -318,8 +390,8 @@ function poolSummary(channel) {
 }
 
 module.exports = {
-  effectiveStatus, poolAccounts, pickAccount, coolAccount, coolAccountMs,
+  effectiveStatus, deriveAccountCredits, decoratePackageStates, setExpiringSoonDays, expiringSoonMs, poolAccounts, pickAccount, coolAccount, coolAccountMs,
   coolAccountModel, isModelCooled, accountModelCool, poolSummary, nextDay4AM,
   acquireAccount, releaseAccount, inFlightCount, softBackoffMs, noteSessionDead, noteServerError, noteSuccess,
-  releaseCool,
+  releaseCool, zeroBalanceUsable,
 };

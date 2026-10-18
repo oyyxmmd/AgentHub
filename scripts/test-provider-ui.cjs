@@ -1,0 +1,122 @@
+// 自定义提供商 · 渲染层接线闸
+//
+// 为什么单独一条闸：这一段的产物主要是「接线」——一条 IPC 命令、一张词表、一个页签。
+// 三处漂移的共同表现都不是报错而是静默：白名单漏登记 → 界面卡在加载态；档位词表漂了 →
+// 思考档位下拉与实际降级不一致；页签没进 MODULES → 页面永远进不去。类型检查抓不到任何一条。
+"use strict";
+const fs = require("fs");
+const path = require("path");
+
+const ROOT = path.join(__dirname, "..");
+const read = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
+
+let pass = 0;
+let failed = 0;
+function ok(cond, name, got) {
+  if (cond) {
+    pass++;
+    console.log(`  ✓ ${name}`);
+  } else {
+    failed++;
+    console.log(`  ✗ ${name}` + (got === undefined ? "" : ` → got ${JSON.stringify(got).slice(0, 260)}`));
+  }
+}
+
+const PROVIDER_CMDS = [
+  "proxy_provider_list",
+  "proxy_provider_create",
+  "proxy_provider_update",
+  "proxy_provider_delete",
+  "proxy_provider_add_key",
+  "proxy_provider_remove_key",
+  "proxy_provider_test",
+  "proxy_provider_fetch_models",
+];
+
+// ===== ① IPC 三面一致：渲染层调用名 ⊆ preload 白名单，且每条都有主进程注册 =====
+console.log("① IPC 三面一致（漏一处表现为界面假死，不是报错）");
+{
+  const preload = read("electron/preload.cjs");
+  const allow = new Set([...preload.matchAll(/^\s+"([a-z0-9_]+)",/gm)].map((m) => m[1]));
+  const ipc = read("src/api/ipc.ts");
+  const index = read("electron/backend/proxy/index.cjs");
+  const registered = new Set([...index.matchAll(/ipcMain\.handle\(\s*"([a-z0-9_]+)"/g)].map((m) => m[1]));
+  const called = new Set([...ipc.matchAll(/"(proxy_provider_[a-z_]+)"/g)].map((m) => m[1]));
+
+  ok([...PROVIDER_CMDS].every((c) => called.has(c)), "渲染层把八条命令都封了函数", PROVIDER_CMDS.filter((c) => !called.has(c)));
+  const missAllow = PROVIDER_CMDS.filter((c) => !allow.has(c));
+  ok(missAllow.length === 0, "八条命令都在 preload 白名单里（漏登记＝「未授权的 IPC 命令」）", missAllow);
+  const missReg = PROVIDER_CMDS.filter((c) => !registered.has(c));
+  ok(missReg.length === 0, "八条命令都在主进程注册了", missReg);
+  ok(called.size === PROVIDER_CMDS.length, "渲染层没有第九条 provider 命令（新增必须同步登记两处）", [...called]);
+
+  // 装置自证：把一条不存在的命令塞进判据，必须被抓出来——否则上面几条绿得没有意义
+  const fakeCheck = ["proxy_provider_list", "proxy_provider_zzz"].filter((c) => !allow.has(c));
+  ok(fakeCheck.length === 1 && fakeCheck[0] === "proxy_provider_zzz", "漏登记的探测本身是有效的（能认出编造的命令）", fakeCheck);
+}
+
+// ===== ② 思考档位词表与后端同源（顺序也要一致：下拉按序展示） =====
+console.log("\n② 档位词表同源（前端写死的那张表 vs util.EFFORT_RANK）");
+{
+  const view = read("src/views/proxy/ProxyProvidersView.vue");
+  const m = view.match(/const EFFORT_LEVELS = \[([^\]]*)\]/);
+  const ui = m ? m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean) : null;
+  const back = require(path.join(ROOT, "electron/backend/proxy/util.cjs")).EFFORT_LEVELS;
+  ok(!!ui, "视图里能找到 EFFORT_LEVELS 常量（改名了就要同步改这条闸）", ui);
+  ok(JSON.stringify(ui) === JSON.stringify(back), "前端档位表与后端逐字同序（漂移的表现是选了某档却被静默降级）", [ui, back]);
+  ok(JSON.stringify(ui) !== JSON.stringify(back.slice(0, 5)), "同序判据不是恒真（截短一档必须不等）");
+}
+
+// ===== ③ 协议形态值集合与后端 KINDS 同源 =====
+console.log("\n③ 上游协议形态值集合（types 与 provider.cjs 必须同一份）");
+{
+  const types = read("src/types/index.ts");
+  const tm = types.match(/^export type ProxyProviderKind = ([^;]+);/m);
+  const uiKinds = tm ? [...tm[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1]) : null;
+  const src = read("electron/backend/proxy/provider.cjs");
+  const km = src.match(/^const KINDS = new Set\[?\(?\[(.*?)\]\)?;?$/m);
+  const backKinds = km ? [...km[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1]) : null;
+  ok(!!uiKinds, "types 里能解析出 ProxyProviderKind", uiKinds);
+  ok(!!backKinds, "provider.cjs 里能解析出 KINDS", backKinds);
+  ok(
+    !!uiKinds && !!backKinds && uiKinds.slice().sort().join() === backKinds.slice().sort().join(),
+    "两侧值集合完全相同（前端多一档会存下后端拒收的 kind，后端多一档前端选不到）",
+    [uiKinds, backKinds],
+  );
+}
+
+// ===== ④ 页面可达：MODULES 页签 + App.vue 挂载三处都对得上 =====
+console.log("\n④ 页面可达（页签注册 + 挂载，缺一处就是进不去或白屏）");
+{
+  const types = read("src/types/index.ts");
+  // 作用域切到 proxy 模块那段 pages 数组：全文正则会撞上别的模块的同名 id，切不到即判红
+  const pm = types.match(/key:\s*"proxy",[\s\S]*?pages:\s*\[([\s\S]*?)\]/);
+  ok(!!pm, "能在 MODULES 里定位到反代网关模块的 pages 数组", pm && pm[1].slice(0, 60));
+  const ids = pm ? [...pm[1].matchAll(/\{\s*id:\s*"([a-z]+)"/g)].map((x) => x[1]) : [];
+  ok(ids.includes("providers"), "proxy 页签里含 providers", ids);
+  ok(pm[1].includes('id: "providers", name: "自定义提供商"'), "页签有中文名（没 name 会渲染成空按钮）", pm && pm[1]);
+
+  const app = read("src/App.vue");
+  ok(/import\s+ProxyProvidersView\s+from\s+"\.\/views\/proxy\/ProxyProvidersView\.vue"/.test(app), "App.vue 引了该视图");
+  const block = app.match(/<ProxyProvidersView[^>]*\/>/);
+  ok(!!block, "App.vue 里有该视图的挂载块", block && block[0]);
+  const b = block ? block[0] : "";
+  ok(
+    /v-if="seen\('proxy', 'providers'\)"/.test(b) && /v-show="on\('proxy', 'providers'\)"/.test(b) && /'page-anim': on\('proxy', 'providers'\)/.test(b),
+    "挂载块三处页签名一致（v-if 拼错＝永不挂载，v-show 拼错＝永远不显示）",
+    b,
+  );
+}
+
+// ===== ⑤ Key 列表的数据源：号池视图不含提供商，照 fork 写法会拿到空表 =====
+console.log("\n⑤ 「Key 管理」的取数路径");
+{
+  const view = read("src/views/proxy/ProxyProvidersView.vue");
+  ok(!/api\.proxyPool\(\)/.test(view), "视图不调 proxyPool（那条视图按内置 CHANNELS 迭代，提供商恒不在其中）", view.match(/api\.proxyPool\(\)/g));
+  ok(/\.keys\b/.test(view), "视图从 proxy_provider_list 的 keys 字段取 Key 列表");
+  const provider = read("electron/backend/proxy/provider.cjs");
+  ok(/keys,/.test(provider) && /pool\.poolAccounts\(p\.id\)/.test(provider), "后端 list() 确实带上了 keys（与号池同一个脱敏视图）");
+}
+
+console.log(`\n${pass} passed, ${failed} failed`);
+process.exit(failed ? 1 : 0);

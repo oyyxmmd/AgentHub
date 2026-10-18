@@ -24,24 +24,39 @@ function log(...args) {
   try { process.stderr.write(`[agenthub-memory] ${args.join(" ")}\n`); } catch { /* stderr 不可用时静默 */ }
 }
 
+// 桌面端的 userData 目录名有两种大小写，桥都得找：源码运行（npm run dev）时 Electron 取
+// package.json 的 name（小写 agenthub）——main.cjs 的 app.setName("AgentHub") 晚于同文件靠前的
+// crashReporter.start()，userData 已按小写定死；安装版取 productName（大写 AgentHub）。
+// Linux 的 config 根目录还可能被 XDG_CONFIG_HOME 改掉，故两种根目录都列
+const CONFIG_DIR_NAMES = ["agenthub", "AgentHub"];
+
 function runtimeFileCandidates() {
   const out = [];
-  if (process.env.AGENTHUB_MEMORY_RUNTIME) out.push(process.env.AGENTHUB_MEMORY_RUNTIME);
-  if (process.env.APPDATA) {
-    out.push(path.join(process.env.APPDATA, "AgentHub", "memory-runtime.json"));
+  const push = (file) => { if (file && !out.includes(file)) out.push(file); };
+  if (process.env.AGENTHUB_MEMORY_RUNTIME) push(process.env.AGENTHUB_MEMORY_RUNTIME);
+  // 与 electron/backend/config.cjs 的 dataDir() 同源：显式指定时它就是桌面端的落盘目录
+  if (process.env.AGENTHUB_DATA_DIR) push(path.join(process.env.AGENTHUB_DATA_DIR, "memory-runtime.json"));
+  const appDataDirs = [
+    process.env.APPDATA, // Windows
+    path.join(os.homedir(), "AppData", "Roaming"), // Windows（APPDATA 缺失时的兜底）
+    path.join(os.homedir(), "Library", "Application Support"), // macOS
+    process.env.XDG_CONFIG_HOME, // Linux（Electron 的 appData 取这个）
+    path.join(os.homedir(), ".config"), // Linux
+  ];
+  for (const dir of appDataDirs) {
+    if (!dir) continue;
+    for (const name of CONFIG_DIR_NAMES) push(path.join(dir, name, "memory-runtime.json"));
   }
-  // macOS 跨电脑标准路径
-  out.push(path.join(os.homedir(), "Library", "Application Support", "AgentHub", "memory-runtime.json"));
-  // Linux 跨电脑标准路径
-  out.push(path.join(os.homedir(), ".config", "AgentHub", "memory-runtime.json"));
-  // 通用备用路径
-  out.push(path.join(os.homedir(), "AppData", "Roaming", "AgentHub", "memory-runtime.json"));
-  out.push(path.join(os.homedir(), ".agenthub", "memory-runtime.json"));
+  push(path.join(os.homedir(), ".agenthub", "memory-runtime.json")); // 通用备用路径
   return out;
 }
 
+let loggedMiss = false;
+let lastLoggedFile = "";
+
 function readRuntime() {
-  for (const file of runtimeFileCandidates()) {
+  const files = runtimeFileCandidates();
+  for (const file of files) {
     try {
       const data = JSON.parse(fs.readFileSync(file, "utf8"));
       if (!data || !data.port || !data.token) continue;
@@ -49,8 +64,19 @@ function readRuntime() {
       if (data.pid) {
         try { process.kill(data.pid, 0); } catch { continue; }
       }
+      // 采用的是哪个候选文件只留痕一次（换了文件再留一次）：多台电脑/多个 userData 并存时
+      // 桥连到哪一份是排查这类问题的第一现场
+      if (lastLoggedFile !== file) {
+        lastLoggedFile = file;
+        log(`已采用 runtime：${file}（port ${data.port}）`);
+      }
       return { ...data, file };
     } catch { /* 换下一个候选 */ }
+  }
+  // 一个都没命中时把查过的路径点名一次：否则「桌面端明明在跑却报未运行」只能靠猜
+  if (!loggedMiss) {
+    loggedMiss = true;
+    log(`未找到可用的 memory-runtime.json，已查找：${files.join(" | ")}`);
   }
   return null;
 }
@@ -150,9 +176,13 @@ const INSTRUCTIONS = [
 async function handleMessage(msg) {
   const { id, method, params } = msg || {};
   if (method === "initialize") {
+    // 协议版本只回自己支持的：无条件回显客户端任意版本会让对端以为服务端
+    // 支持未来版本的新特性（实际并不支持），调用时行为错位
+    const SUPPORTED = ["2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
     const want = params && params.protocolVersion;
+    const protocolVersion = SUPPORTED.includes(want) ? want : PROTOCOL_FALLBACK;
     return reply(id, {
-      protocolVersion: want || PROTOCOL_FALLBACK,
+      protocolVersion,
       capabilities: { tools: { listChanged: false } },
       serverInfo: SERVER_INFO,
       instructions: INSTRUCTIONS,

@@ -19,12 +19,15 @@
 //    Claude 角色别名映射回真实模型），*_MODEL_NAME 只作展示名，不得写入别名。
 //    非接管路径（如 CC Switch 的「打开终端」）不经过转换，直连网关必然 404，
 //    因此 UI 必须引导用户开启代理接管后正常启动 claude，而不是用「打开终端」。
-// 测试可用 CCSWITCH_DB_PATH 环境变量把库位置指到临时目录（备份目录跟随其父目录）
+// 测试可用 CCSWITCH_DB_PATH 环境变量把库位置指到临时目录（备份目录跟随其父目录）；
+// live 探测读的是 os.homedir()（Windows 取 USERPROFILE、类 Unix 取 HOME），自测里两个都指到 fixture 家目录，
+// 否则会用真机的 ~/.claude 与 ~/.codex 喂断言——那既不确定，也是在读用户私有配置
 "use strict";
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const config = require("../config.cjs");
+const server = require("./server.cjs");
 
 // 驱动与 store.cjs 一致：Node 22 内置 node:sqlite 优先，better-sqlite3 回退
 let Database = null;
@@ -60,6 +63,64 @@ const ICONS = {
 
 /** 只保留最近 N 份本应用生成的写前备份：备份含明文密钥，无限累积是一种安全负担 */
 const BACKUP_KEEP = 10;
+
+/** CC Switch 本地代理的监听端口（本机 CC Switch 日志 24 次启动均为 127.0.0.1:15721，
+ *  cc-switch 未把该端口暴露成配置项，故按观测值写死）。
+ *  live 配置指向它 = 客户端正被 CC Switch 接管转换；指向网关端口 = 直连。 */
+const CCS_PROXY_PORT = 15721;
+
+/** live 配置指向分类：gateway=直连 AgentHub 网关；ccswitch=经 CC Switch 本地代理；
+ *  other=指向其它地址；unset=未配置服务地址。 */
+function classifyLiveTarget(rawUrl, gatewayPort) {
+  const url = String(rawUrl || "").trim().replace(/\/+$/, "");
+  if (!url) return { url: "", target: "unset" };
+  let host = "";
+  let port = 0;
+  try {
+    const u = new URL(url);
+    host = u.hostname;
+    port = Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+  } catch {
+    return { url, target: "other" };
+  }
+  // URL.hostname 对 IPv6 回的是带方括号的形态（new URL("http://[::1]:9527").hostname === "[::1]"），
+  // 所以两种写法都要认——只写 "::1" 会让 http://[::1]:9527 这种本地地址落进 other
+  const local = host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+  if (local && port === gatewayPort) return { url, target: "gateway" };
+  if (local && port === CCS_PROXY_PORT) return { url, target: "ccswitch" };
+  return { url, target: "other" };
+}
+
+/** 读各应用 live 配置的实际指向——真实流量路径的地面真相，库里的接管开关只是意图。
+ *  Claude Code：~/.claude/settings.json 的 env.ANTHROPIC_BASE_URL；
+ *  Codex：~/.codex/config.toml 的 model_provider → [model_providers.X] base_url。
+ *  任何读取失败都按未配置处理，不影响状态卡其余部分。 */
+function readLiveRouting(gatewayPort) {
+  const read = (fn) => {
+    try {
+      return fn();
+    } catch {
+      return { url: "", target: "unset" };
+    }
+  };
+  const claude = read(() => {
+    const j = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude", "settings.json"), "utf8"));
+    return classifyLiveTarget(j && j.env && j.env.ANTHROPIC_BASE_URL, gatewayPort);
+  });
+  const codex = read(() => {
+    const toml = fs.readFileSync(path.join(os.homedir(), ".codex", "config.toml"), "utf8");
+    const cur = /^\s*model_provider\s*=\s*"([^"]+)"/m.exec(toml);
+    let url = "";
+    if (cur) {
+      // provider 名要当字面量拼进正则：名字里带 . * [ 等元字符时不能让它匹配到别的段
+      const esc = cur[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const sec = new RegExp(`\\[\\s*model_providers\\.${esc}\\s*\\]([\\s\\S]*?)(?:\\n\\[|$)`).exec(toml);
+      if (sec) url = (/^\s*base_url\s*=\s*"([^"]+)"/m.exec(sec[1]) || [])[1] || "";
+    }
+    return classifyLiveTarget(url, gatewayPort);
+  });
+  return { claude, codex };
+}
 
 /** INSERT 用到的全部列（自检与写入共用，单一事实源）：
  *  schema 漂移时按这份清单把写入错误归类为「CC Switch 版本不兼容」 */
@@ -284,14 +345,31 @@ function buildEntry(appType, { base, apiKey, model }, tiers) {
   };
 }
 
-/** 只读视图：CC Switch 是否已安装 + 三个固定条目是否已注册 + 各应用代理接管是否已开启 */
-function status() {
+/** 只读视图：CC Switch 是否已安装 + 三个固定条目是否已注册 + 各应用代理接管状态 + live 配置实际指向。
+ *  可传 { port } 显式指定网关端口（测试用）；缺省依次取实际监听端口 → 配置端口 → 9527 */
+function status({ port } = {}) {
+  // 网关端口判定：显式入参 → 实际监听端口（改过配置没重启时以监听为准）→ 配置端口 → 9527
+  let gwPort = 0;
+  if (Number.isFinite(port) && port > 0) gwPort = port;
+  if (!gwPort) {
+    try {
+      if (server.status().port) gwPort = server.status().port;
+    } catch { /* 网关未初始化时忽略 */ }
+  }
+  if (!gwPort) {
+    try {
+      const cfgProxy = (config.loadConfig() || {}).proxy || {};
+      if (Number.isFinite(cfgProxy.port) && cfgProxy.port > 0) gwPort = cfgProxy.port;
+    } catch { /* 配置读不到时用缺省 */ }
+  }
+  if (!gwPort) gwPort = 9527;
   const p = dbPath();
   if (!fs.existsSync(p)) {
     return {
       installed: false,
       dbPath: p,
       takeover: { claude: false, codex: false, claudeDesktop: false },
+      live: readLiveRouting(gwPort),
       entries: [
         { appType: "claude", registered: false },
         { appType: "codex", registered: false },
@@ -303,8 +381,11 @@ function status() {
   try {
     let rows = [];
     let incompatible = false;
-    // 代理接管状态：proxy_config.enabled 为该应用是否已接管（等价于 require routing）。
-    // 读取失败按未接管处理，只在 UI 上提示，不影响注册本身。
+    // 代理接管状态（proxy_config 两列的实测语义）：
+    //   enabled = 接管开关的持久化意图——CC Switch 退出后仍为 1，下次启动自动恢复接管；
+    //   proxy_enabled = 当前是否接管中——退出时随「Live 配置已恢复」归零，运行且接管中为 1。
+    // 即：enabled=1 而 CC Switch 未运行时，live 配置其实已被恢复为直连网关，「路由已开启」
+    // 不代表流量正经过它。读取失败按未接管处理，只在 UI 上提示，不影响注册本身。
     let takeover = { claude: false, codex: false, claudeDesktop: false };
     try {
       // 与 register 同源校验：providers 表存在且具备 INSERT 所需的全部列
@@ -316,7 +397,7 @@ function status() {
         .all(FIXED.claude, FIXED.codex, FIXED["claude-desktop"]);
       try {
         // Claude Desktop 的映射模式依赖 CC Switch 本地网关常驻：本机 proxy_config 无
-        // claude-desktop 行，借 claude 行的 proxy_enabled 判断全局代理网关是否在线。
+        // claude-desktop 行，借 claude 行的 proxy_enabled 判断当前是否接管中。
         const ps = db.prepare(`SELECT app_type, proxy_enabled, enabled FROM proxy_config WHERE app_type IN ('claude','codex')`).all();
         takeover = {
           claude: !!ps.find((r) => r.app_type === "claude")?.enabled,
@@ -334,6 +415,7 @@ function status() {
       incompatible,
       dbPath: p,
       takeover,
+      live: readLiveRouting(gwPort),
       entries: ["claude", "codex", "claude-desktop"].map((t) => {
         const row = rows.find((r) => r.id === FIXED[t]);
         return { appType: t, registered: !!row, name: row ? row.name : undefined };
@@ -415,4 +497,4 @@ function register({ appType, apiKey, model, tiers, port } = {}) {
   }
 }
 
-module.exports = { status, register };
+module.exports = { status, register, classifyLiveTarget };

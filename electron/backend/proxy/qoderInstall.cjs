@@ -138,8 +138,8 @@ function registryResources(exeLabel) {
   return out;
 }
 
-/** resources 目录候选（按命中概率排序；返回第一个存在 app.asar.unpacked 的候选） */
-function candidates(product) {
+/** 常规候选（文件系统直查，零外部进程）：环境变量覆盖 → 默认安装 → 解包直装 → launcher */
+function fastCandidates(product) {
   const exeLabel = EXE_LABELS[product];
   if (!exeLabel) return [];
   const local = localAppData();
@@ -149,18 +149,24 @@ function candidates(product) {
   out.push(path.join(local, "Programs", exeLabel, "resources"));
   out.push(path.join(local, exeLabel, "resources"));
   out.push(...launcherResources(exeLabel));
-  out.push(...registryResources(exeLabel));
   return [...new Set(out.filter(Boolean))];
 }
 
 /**
- * 定位某产品的 resources 目录（含 app.asar.unpacked 才算命中）。
- * 成功缓存；失败返回 null 且不缓存（装完客户端无需重启）。
+ * 注册表兜底候选。**惰性**：只在常规候选全部未命中时才调用——
+ * 每次定位都跑 reg.exe（3 个根，~100ms/次）纯属浪费，且在被沙箱/安全软件禁 reg 的
+ * 环境下会让整个定位链路失败（本函数注释原本就写着「仅在前述候选全失败时调用」，
+ * 但调用方此前无条件执行，实现与注释不符）。
  */
-function findResources(product) {
-  const hit = cache.get(product);
-  if (hit && fs.existsSync(hit)) return hit;
-  for (const c of candidates(product)) {
+function registryCandidates(product) {
+  const exeLabel = EXE_LABELS[product];
+  if (!exeLabel) return [];
+  return [...new Set(registryResources(exeLabel).filter(Boolean))];
+}
+
+/** 在候选列表里找第一个含 app.asar.unpacked 的目录；命中即写缓存 */
+function firstHit(product, list) {
+  for (const c of list) {
     try {
       if (fs.existsSync(c) && fs.existsSync(path.join(c, "app.asar.unpacked"))) {
         cache.set(product, c);
@@ -171,6 +177,16 @@ function findResources(product) {
     }
   }
   return null;
+}
+
+/**
+ * 定位某产品的 resources 目录（含 app.asar.unpacked 才算命中）。
+ * 成功缓存；失败返回 null 且不缓存（装完客户端无需重启）。
+ */
+function findResources(product) {
+  const hit = cache.get(product);
+  if (hit && fs.existsSync(hit)) return hit;
+  return firstHit(product, fastCandidates(product)) || firstHit(product, registryCandidates(product));
 }
 
 /** 风控身份生成器（领取接口必需，见 qoderAuth.readRiskIdentity） */

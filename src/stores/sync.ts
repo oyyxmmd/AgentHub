@@ -353,7 +353,16 @@ export const useSyncStore = defineStore("sync", {
       }
       // start_sync 后台运行、立即返回，进度通过轮询 get_sync_progress 更新
       try {
-        await api.startSync(mode === "backup" ? { mode: "backup" } : undefined);
+        const r = await api.startSync(mode === "backup" ? { mode: "backup" } : undefined);
+        // 主进程拒绝（同步中 / 恢复中 / 本地统计进行中）时，理由要落到弹窗正在读的那两处：
+        // SyncDialog 显示 app.sync.stageLabel + message，而顶栏那句只在 sync.running 时出现，
+        // 被拒绝时 running=false —— 不写进 sync.message 就等于点了没反应。
+        if (r && r.ok === false) {
+          this.syncing = false;
+          this.syncStartError = r.message;
+          this.sync = { ...this.sync, running: false, stage: "error", stageLabel: "失败", message: r.message };
+          return;
+        }
         this.refreshProgress();
       } catch (e) {
         const message = e instanceof Error ? e.message : "同步启动失败";
@@ -362,7 +371,11 @@ export const useSyncStore = defineStore("sync", {
       }
     },
     closeSyncDialog() {
-      if (!this.sync.running && !this.syncing) this.syncDialogOpen = false;
+      if (!this.sync.running && !this.syncing) {
+        this.syncDialogOpen = false;
+        // 启动失败是「这一次点击」的结论：不跟着关闭清掉，下次打开弹窗会顶着一句旧失败
+        this.syncStartError = "";
+      }
     },
     async cancelSync() {
       await api.cancelSync();

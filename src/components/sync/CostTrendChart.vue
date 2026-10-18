@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, ref, watch, nextTick, computed } from "vue";
-import * as echarts from "echarts";
+import { graphic, init, type ECharts } from "../../utils/echarts";
 import { useSyncStore } from "../../stores/sync";
 import { useAppStore } from "../../stores/app";
 import { glassTooltip, tooltipCard, markerColor, type TooltipParam } from "../../utils/chart-tooltip";
@@ -11,7 +11,7 @@ const emit = defineEmits<{ (e: "change-range", days: number): void }>();
 const app = useSyncStore();
 const ui = useAppStore();
 const el = ref<HTMLDivElement | null>(null);
-let chart: echarts.ECharts | null = null;
+let chart: ECharts | null = null;
 
 const ranges = [
   { key: 7, label: "最近7天" },
@@ -106,7 +106,7 @@ function render() {
         symbol: "none",
         lineStyle: { width: 2.2, color: accent, shadowColor: accent, shadowBlur: 8, shadowOffsetY: 3 },
         areaStyle: {
-          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          color: new graphic.LinearGradient(0, 0, 0, 1, [
             { offset: 0, color: accent + "4d" },
             { offset: 1, color: accent + "00" },
           ]),
@@ -126,7 +126,7 @@ onMounted(() => {
   if (!el.value) return;
   nextTick(() => {
     if (!el.value) return;
-    chart = echarts.init(el.value);
+    chart = init(el.value);
     render();
 
     resizeObserver = new ResizeObserver(() => {

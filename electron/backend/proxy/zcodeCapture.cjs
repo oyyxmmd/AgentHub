@@ -12,7 +12,7 @@
 //   ② 主进程 120s 总体看门狗 —— 用户放着窗口不管 / SDK 回调全丢时强制失败关窗；
 //   ③ render-process-gone / unresponsive —— 沙箱页崩溃或死循环时立刻失败。
 "use strict";
-const { BrowserWindow, ipcMain } = require("electron");
+const platform = require("./platform/index.cjs");
 
 // 同一时刻只允许一个验证窗（多账号连跑领取时排队，互不取消）
 let pending = null;
@@ -21,6 +21,12 @@ let pending = null;
 const SDK_LOAD_TIMEOUT_MS = 15000;
 /** 总体看门狗（主进程）：从开窗到收参的最大时长，覆盖用户手动过码的操作时间 */
 const SOLVE_WATCHDOG_MS = 120000;
+
+/** 内联 <script> 插值用：JSON.stringify 不转义 /，上游 captcha 配置若含 </script>
+ *  会终止脚本元素在页内执行任意 JS——`<` 统一转 \u003c（值语义不变） */
+function jsStr(v) {
+  return JSON.stringify(v == null ? "" : v).replace(/</g, "\\u003c");
+}
 
 /** 验证窗页面（内联 HTML：加载阿里云官方 SDK，无感优先、超时或失败转交互式） */
 function captchaHtml(sceneId, region, prefix) {
@@ -91,10 +97,10 @@ function captchaHtml(sceneId, region, prefix) {
     });
   }
   loadSdk().then(function(){
-    window.AliyunCaptchaConfig = { region: ${JSON.stringify(region || "")}, prefix: ${JSON.stringify(prefix || "")} };
+    window.AliyunCaptchaConfig = { region: ${jsStr(region || "")}, prefix: ${jsStr(prefix || "")} };
     status("正在进行人机校验…");
     window.initAliyunCaptcha({
-      SceneId: ${JSON.stringify(sceneId || "")},
+      SceneId: ${jsStr(sceneId || "")},
       mode: "popup",
       language: "zh-CN",
       showErrorTip: false,
@@ -123,6 +129,12 @@ function captchaHtml(sceneId, region, prefix) {
  */
 function solveCaptcha(cfg, opts) {
   if (!cfg || !cfg.sceneId) return Promise.resolve({ ok: false, message: "验证码配置缺失（sceneId 为空）" });
+  // 无图形环境不假装能过人机校验：交回 needCaptcha，由调用方如实标记人工
+  if (!platform.isElectron) {
+    return Promise.resolve({ ok: false, needCaptcha: true, message: "无图形环境无法过人机校验；请在桌面版号池页手动领取（账号经号池同步过来）" });
+  }
+  // electron API 只在桌面路径可达（上方守卫已拦截 headless），惰性 require 让本文件在容器内可安全加载
+  const { BrowserWindow, ipcMain } = require("electron");
   if (pending) {
     return pending.then(() => solveCaptcha(cfg, opts), () => solveCaptcha(cfg, opts)); // 排队：前一个结束后接着跑
   }

@@ -38,13 +38,19 @@ function readTokens() {
   };
 }
 
-/** 从 JWT payload 解账户 ID（小浣熊顶层 iss；sid 是登录会话 ID 兜底，与 discovery.scanRaccoon 同口径） */
+/** 从 JWT payload 解账号 ID。
+ *  ⚠️ claim 语义（真实 token 实测）：
+ *    iss = "xiaohuanxiong.com/iam"   ← **签发方**，所有账号都相同，**不是**账号 ID
+ *    sub = "pu-00000000-…"           ← 账号 ID（每账号稳定唯一）—— 要的是它
+ *    sid = "ses-00000000-…"          ← 登录**会话** ID，每次登录都变
+ *  旧实现取 `iss || sid` 两个都错：取 iss 会让所有账号 uid 相同（号池里加不进第二个号），
+ *  取 sid 则每次登录都新增一个；跨机时 uid 相同还会让号池把不同账号当成同一个互相覆盖凭据。 */
 function tokenUid(token) {
   try {
     const p = String(token || "").trim().split(".");
     if (p.length < 2) return "";
     const payload = JSON.parse(Buffer.from(p[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
-    return String((payload && (payload.iss || payload.sid)) || "");
+    return String((payload && (payload.sub || payload.uid || payload.id || payload.iss)) || "");
   } catch {
     return "";
   }
@@ -52,14 +58,15 @@ function tokenUid(token) {
 
 /**
  * 本地文件是否确属该账号。号池可多号而 auth.json 只有一份，回写串号会把桌面端别的号顶掉，
- * 必须先验明正身：access 的 iss 与账号 uid 一致，或 refresh_token 与传入快照同值（同号铁证）。
+ * 必须先验明正身：access 的 uid（tokenUid 解 JWT 的 sub）与账号 uid 一致，
+ * 或 refresh_token 与传入快照同值（同号铁证）。
  * 命中返回文件凭据（可安全采用/回写），否则返回 null（绝不碰该文件）。
  */
 function ownedTokens(accountUid, secretsRefresh) {
   const t = readTokens();
   if (!t) return null;
-  const iss = tokenUid(t.accessToken);
-  if (iss && accountUid && String(iss) === String(accountUid)) return t;
+  const fileUid = tokenUid(t.accessToken);
+  if (fileUid && accountUid && String(fileUid) === String(accountUid)) return t;
   if (t.refreshToken && secretsRefresh && t.refreshToken === secretsRefresh) return t;
   return null;
 }
@@ -76,7 +83,9 @@ function writeTokens({ accessToken, refreshToken, officeIdentity } = {}) {
   if (accessToken) next.access_token = String(accessToken);
   if (refreshToken) next.refresh_token = String(refreshToken);
   if (officeIdentity) next.office_identity = String(officeIdentity);
-  const tmp = `${file}.agenthub-tmp`;
+  // 临时文件带进程号（对齐参考 credentials.rs）：双方同时刷新不互踩
+  // （固定名会让并发写一方把另一方的半成品 rename 走）
+  const tmp = `${file}.agenthub-${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tmp, file);

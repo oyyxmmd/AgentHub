@@ -371,6 +371,134 @@ function resolveContentConflict(item, choice, cfg) {
   return { ok: false, message: "未知裁决选项：" + choice };
 }
 
+// diff-link 冲突：工具目录里那个位置有链接，但它不指向中央真身。
+// 和内容冲突的区别：链接背后那份内容未必是本工具的"版本"（可能是别处未纳管的目录、
+// 也可能是指向中央但写法不规范的路径），所以动词分开：
+// relink 只重建链接、不碰任何内容；adopt 把链接指向的那份收进中央，再重链。
+
+function hubRootReal() {
+  const root = path.resolve(config.hubDir());
+  try {
+    return fs.realpathSync(root);
+  } catch {
+    return root; // 中央目录不存在（如未初始化）时按字面路径判
+  }
+}
+
+/** 链接现状：指向哪里、还在不在、中央有没有对应真身。渲染层的面板与裁决器共用同一份判定 */
+function linkConflictState(item) {
+  const linkPath = path.join(item.dir, item.skill);
+  const centralPath = path.join(hub.skillsDir(), item.skill);
+  const isLink = mounter.isLink(linkPath);
+  let target = "";
+  try {
+    target = fs.readlinkSync(linkPath);
+  } catch {
+    /* 不是链接或已消失：isLink 已经表达 */
+  }
+  let resolved = null;
+  if (isLink) {
+    try {
+      resolved = fs.realpathSync(linkPath);
+    } catch {
+      resolved = null; // 悬空链接：链接在，目标没了
+    }
+  }
+  let centralReal = null;
+  try {
+    centralReal = fs.realpathSync(centralPath);
+  } catch {
+    /* 中央还没有这份真身 */
+  }
+  const root = hubRootReal();
+  const insideHub = resolved !== null && (resolved === root || resolved.startsWith(root + path.sep));
+  return {
+    linkPath,
+    target,
+    resolved,
+    isLink,
+    resolves: resolved !== null,
+    hasSkillMd: resolved !== null && fs.existsSync(path.join(resolved, "SKILL.md")),
+    centralPath,
+    centralExists: fs.existsSync(centralPath),
+    sameAsCentral: resolved !== null && centralReal !== null && resolved === centralReal,
+    targetInsideHub: insideHub,
+  };
+}
+
+/** 裁决 diff-link：relink（重建链接指向中央）/ adopt（把链接指向的那份收进中央后重链）。
+ *  落选链接进回收站；adopt 只复制内容，链接指向的那份原地保留 */
+function resolveDiffLinkConflict(item, choice, cfg) {
+  const { skill, dir, toolId } = item;
+  const st = linkConflictState(item);
+  // 只有链接才适用这两个动词：位置上是真实目录时属于内容冲突的语义，宁可如实报错也不猜
+  if (!st.isLink) return { ok: false, message: "该位置已不是链接（可能被手动改过），重新扫描后再处理" };
+  if (remoteBusy()) return { ok: false, message: "WebDAV 同步进行中，稍后重试" };
+
+  /** 摘掉现有链接再按中央真身重挂；链接本身进回收站，它指向的内容一个字都不动 */
+  const relink = () => {
+    const backed = hub.toTrash(st.linkPath, skill);
+    const r = mounter.mount(skill, dir, cfg.mountMode, skill);
+    if (r.action !== "mounted" && r.action !== "already" && r.action !== "copied") {
+      return { ok: false, message: `原链接已移入回收站（${path.basename(backed)}），但重挂失败：${r.message || r.action}` };
+    }
+    hub.setMount(skill, toolId, path.join(dir, skill), cfg.mountMode === "copy" ? "copy" : mounter.linkType(), true);
+    noteHistory(skill, `冲突裁决：重建链接指向中央，${toolId} 版原链接进回收站（${path.basename(backed)}）`);
+    return { ok: true, message: `已重建为指向中央的链接（原链接在 ${path.basename(backed)}，可还原）` };
+  };
+
+  if (choice === "relink") {
+    if (!st.centralExists) return { ok: false, message: `中央还没有 ${skill}，先选「把链接那份收进中央」` };
+    return relink();
+  }
+
+  if (choice === "adopt") {
+    if (!st.resolves) return { ok: false, message: "链接已悬空（指向的目标不存在），没有内容可收纳" };
+    if (st.targetInsideHub) return { ok: false, message: "链接指向中央仓库内部，不能拿它覆盖另一份真身；请选「重建链接指向中央」" };
+    if (!st.hasSkillMd) return { ok: false, message: `链接指向的位置没有 SKILL.md（${st.resolved}），不是技能目录，已拒绝收纳` };
+    const central = st.centralPath;
+    const oldBacked = fs.existsSync(central) ? hub.toTrash(central, skill) : "";
+    // 复制失败（权限 / 磁盘满 / 路径过长）必须自己接住：此时旧中央版已经进了回收站，
+    // 让异常裸奔上去的话用户只会看到一条未捕获的错误，不知道内容还能从回收站还原
+    try {
+      fs.cpSync(st.resolved, central, { recursive: true });
+    } catch (e) {
+      return {
+        ok: false,
+        message: `收纳失败：${String((e && e.message) || e)}${oldBacked ? `；原中央版已移入回收站（${path.basename(oldBacked)}），可还原` : "；中央此前没有这份内容，未受影响"}`,
+      };
+    }
+    const treeHash = scanner.treeHash(central);
+    const m = hub.loadManifest();
+    const detail = `冲突裁决：收下链接指向的那份（${st.resolved}）覆盖中央${oldBacked ? `，旧中央版进回收站（${path.basename(oldBacked)}）` : ""}`;
+    if (m.skills[skill]) {
+      m.skills[skill].treeHash = treeHash;
+      m.skills[skill].mergeHistory.push({ at: new Date().toISOString(), action: "conflict-diff-link-adopt", detail });
+    } else {
+      // 中央此前没有这份技能（也没有台账条目）：补一条，否则后面 setMount 无处记账，
+      // 下一轮扫描又会把同一个链接判成 diff-link
+      m.skills[skill] = {
+        name: skill,
+        version: "",
+        description: "",
+        skillName: skill,
+        treeHash,
+        sources: [{ tool: toolId, originalName: skill, firstSeen: new Date().toISOString() }],
+        mounts: [],
+        mergeHistory: [{ at: new Date().toISOString(), action: "conflict-diff-link-adopt", detail }],
+        health: [],
+      };
+    }
+    hub.saveManifest(m);
+    const r = relink();
+    return r.ok
+      ? { ok: true, message: `已把链接指向的那份收进中央并重挂${oldBacked ? "（旧中央版可还原）" : ""}` }
+      : { ok: false, message: `中央已收下这份内容，但${r.message}` };
+  }
+
+  return { ok: false, message: "未知裁决选项：" + choice };
+}
+
 // L2 疑似冲突：确认同一就把 b 摘掉（含全部已登记挂载与全部来源目录）、原目录改挂到 a；判为不同就只撤销提示
 function resolveNormConflict(item, choice, cfg) {
   const aName = item.a, bName = item.b;
@@ -556,4 +684,4 @@ function adoptHubSkill(raw, cfg) {
   return { ok: true, name, mounts: mounts.length };
 }
 
-module.exports = { survey, librarySkills, planSync, executeSync, loadConflicts, saveConflicts, upsertConflict, resolveContentConflict, resolveNormConflict, toggleMount, removeCustomTool, repairMounts, adoptHubSkill };
+module.exports = { survey, librarySkills, planSync, executeSync, loadConflicts, saveConflicts, upsertConflict, linkConflictState, resolveContentConflict, resolveDiffLinkConflict, resolveNormConflict, toggleMount, removeCustomTool, repairMounts, adoptHubSkill };

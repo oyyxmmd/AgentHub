@@ -181,6 +181,28 @@ onMounted(async () => {
     <template v-else>
       <div class="switch-row">
         <div class="s-left">
+          <div class="s-title">号池定时同步（WebDAV）</div>
+          <div class="s-desc">API Keys、模型映射与账号随号池同步；开启后按周期自动跑，换设备不用手动点</div>
+        </div>
+        <div class="tg-ctl">
+          <el-select v-if="app.config.proxy.poolsyncSchedule.hourly" v-model="app.config.proxy.poolsyncSchedule.hourlyInterval" class="f-el-select" popper-class="glass-popper" style="width: 110px" @change="saveFramework">
+            <el-option v-for="n in [1, 2, 3, 6, 12]" :key="n" :value="n" :label="`${n} 小时`" />
+          </el-select>
+          <div class="switch" :class="{ on: app.config.proxy.poolsyncSchedule.hourly }" role="switch" :aria-checked="app.config.proxy.poolsyncSchedule.hourly" @click="app.config.proxy.poolsyncSchedule.hourly = !app.config.proxy.poolsyncSchedule.hourly; saveFramework()"></div>
+        </div>
+      </div>
+      <div class="switch-row">
+        <div class="s-left">
+          <div class="s-title">号池每天固定时间</div>
+          <div class="s-desc">每天到点同步一次（错过自动补跑）；与每小时档可同时开</div>
+        </div>
+        <div class="tg-ctl">
+          <input v-if="app.config.proxy.poolsyncSchedule.daily" type="time" class="f-input" style="width: 110px" v-model="app.config.proxy.poolsyncSchedule.dailyTime" @change="saveFramework" />
+          <div class="switch" :class="{ on: app.config.proxy.poolsyncSchedule.daily }" role="switch" :aria-checked="app.config.proxy.poolsyncSchedule.daily" @click="app.config.proxy.poolsyncSchedule.daily = !app.config.proxy.poolsyncSchedule.daily; saveFramework()"></div>
+        </div>
+      </div>
+      <div class="switch-row">
+        <div class="s-left">
           <div class="s-title">额度自动刷新周期</div>
           <div class="s-desc">逐账号批量查询各渠道额度（每渠道并发 ≤2）</div>
         </div>

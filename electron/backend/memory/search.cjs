@@ -80,7 +80,7 @@ class MemorySearch {
     const sql = `
       SELECT m.id, m.path, m.anchor, m.project, m.agent, m.layer, m.type,
              m.title, m.summary, m.tags, m.created, m.updated, m.importance,
-             m.pinned, m.starred, m.valid_to, m.superseded_by, rank
+             m.pinned, m.starred, m.valid_to, m.superseded_by, m.access_count, rank
       FROM ${ftsTable}
       JOIN mem m ON m.rowid = ${ftsTable}.rowid
       WHERE ${matchWhere.join(" AND ")}
@@ -118,6 +118,20 @@ class MemorySearch {
     const graphBoosted = this._graphExpand(scored, cfg, opts).sort((a, b) => b.score - a.score);
     const finalRows = graphBoosted.slice(offset, offset + limit);
 
+    // 热度记账（best-effort）：命中的记忆 +1。失败绝不能影响检索结果。
+    try {
+      this.index.recordHits(finalRows.map((r) => r.id));
+      // 检索审计（best-effort）：一行一次检索，供体检报告与「搜了什么没搜到」分析
+      this.index.logRecall({
+        query,
+        agent: opts.agent,
+        hits: finalRows.length,
+        total: hitTotal || rows.length,
+        hitIds: finalRows.map((r) => r.id),
+        latencyMs: Date.now() - t0,
+      });
+    } catch { /* 热度/审计失败不影响检索 */ }
+
     return {
       fallback: lastFallbackReason || undefined,
       results: finalRows.map((r) => ({
@@ -125,6 +139,7 @@ class MemorySearch {
         layer: r.layer, type: r.type, title: r.title, summary: r.summary,
         tags: splitTags(r.tags),
         created: r.created, updated: r.updated, importance: r.importance,
+        accessCount: r.access_count || 0,
         pinned: !!r.pinned, starred: !!r.starred,
         superseded: !!r.superseded_by || (r.valid_to != null && r.valid_to <= Date.now()),
         score: Math.round(r.score * 1000) / 1000,
@@ -157,6 +172,7 @@ class MemorySearch {
       importance: num(cfg["search.weightImportance"], 0.1),
       affinity: num(cfg["search.weightAffinity"], 0.15),
       layer: num(cfg["search.weightLayer"], 0.05),
+      heat: num(cfg["search.weightHeat"], 0.1),
     };
     const halfLifeMs = num(cfg["search.timeDecayHalfLife"], 30) * 86400000;
     const ranks = rows.map((r) => -r.rank);
@@ -177,10 +193,11 @@ class MemorySearch {
         importance: w.importance * importance,
         affinity: w.affinity * affinity,
         layer: w.layer * layer,
+        heat: w.heat * Math.log1p(r.access_count || 0),
         graph: 0,
         pinned: pinBoost,
       };
-      const score = parts.bm25 + parts.recency + parts.importance + parts.affinity + parts.layer + parts.pinned;
+      const score = parts.bm25 + parts.recency + parts.importance + parts.affinity + parts.layer + parts.heat + parts.pinned;
       return { ...r, score, scoreParts: parts };
     }).sort((a, b) => b.score - a.score);
   }
@@ -215,7 +232,7 @@ class MemorySearch {
           if (opts && opts.pinned && !row.pinned) continue;
           const w = weight / hop;
           row.score = w;
-          row.scoreParts = { bm25: 0, recency: 0, importance: 0, affinity: 0, layer: 0, graph: w, pinned: 0 };
+          row.scoreParts = { bm25: 0, recency: 0, importance: 0, affinity: 0, layer: 0, heat: 0, graph: w, pinned: 0 };
           extra.push(row);
           next.push(n.id);
           if (extra.length >= max) break;

@@ -53,7 +53,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onEsc));
           </section>
 
           <section :id="'help-why'">
-            <h3><i class="ph ph-packages"></i>为什么扫出来的比装过的多</h3>
+            <h3><i class="ph ph-package"></i>为什么扫出来的比装过的多</h3>
             <ul>
               <li><b>每个工具各算一份</b>：同一个技能装在 ZCode 和 Codex 里，就是两份独立副本，会被分别扫到。</li>
               <li><b>一个技能包往往含多个技能</b>：比如设计类技能包一次会带进十几个目录，看起来就「一大堆」。</li>

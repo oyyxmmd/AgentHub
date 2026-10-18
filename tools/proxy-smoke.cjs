@@ -223,6 +223,11 @@ async function main() {
   console.log("role layer ok（developer→system / function→tool|user / 幂等 / 非法输入不抛 / qoder+zcode 静默丢弃已堵）");
 
   assert(adapters.mergedModels().length > 5, "合并模型目录");
+  const rawCatPawModels = adapters.channelModelIds("catpaw");
+  assert(rawCatPawModels.includes("kimi-k3") && !rawCatPawModels.includes("AgentHub-1.0"), "反向映射候选只含 CatPaw 原始模型，不含统一请求名");
+  const selfMapCfg = { modelReverseAliases: { "AgentHub-1.0": { catpaw: "AgentHub-1.0", lobster: "glm-5.3" } } };
+  assert(adapters.resolveModelTarget("AgentHub-1.0", "catpaw", selfMapCfg) === null, "历史自映射不得被当成 CatPaw 可转发目标");
+  assert(!adapters.modelOwners("AgentHub-1.0", selfMapCfg).includes("catpaw"), "自映射渠道不得进入反向映射归属");
   assert(adapters.modelOwners("gpt-5").length === 1 && adapters.modelOwners("gpt-5")[0] === "workbuddy", "gpt-5 归属 CN workbuddy（AI 区目录已无此型号）");
   assert(adapters.modelOwners("deepseek-v4.1-flash").length === 1 && adapters.modelOwners("deepseek-v4.1-flash")[0] === "workbuddy_ai", "deepseek-v4.1-flash 归属国际版 workbuddy_ai");
   assert(adapters.modelOwners("deepseek-v4-flash")[0] === "trae", "单源模型归属");
@@ -280,6 +285,32 @@ async function main() {
     const om = adapters.get(other).models();
     const clash = qModels.filter((m) => om.includes(m));
     assert(clash.length === 0, `qoder 模型与 ${other} 零重名（无路由歧义）`);
+  }
+
+  // ===== AutoClaw 双区注册 =====
+  // glm-5.3 / glm-5.3-flash 与 workbuddy_ai、catpaw 等渠道同名是既有语义（modelOwners 多归属 =
+  // failover 候选），故本渠道不做「零重名」断言，只断言归属包含自身。
+  const acOn = !!store.AUTOCLAW_INTL_ENABLED;
+  for (const id of ["autoclaw"]) {
+    const ad = adapters.get(id);
+    assert(ad && ad.id === id, `${id} 适配器注册`);
+    assert(store.CHANNELS.some((c) => c.id === id), `store.CHANNELS 含 ${id}`);
+    assert(!!adapters.get("autoclaw_intl") === acOn && store.CHANNELS.some((c) => c.id === "autoclaw_intl") === acOn,
+      `autoclaw_intl 注册状态与开关(${acOn}) 一致（ADAPTERS 与 CHANNELS 双侧）`);
+    const need = ["cfg", "models", "fetchModels", "headers", "rewriteBody", "chat", "queryCredits", "refreshToken", "checkin", "checkinStatus"];
+    assert(need.every((k) => typeof ad[k] === "function"), `${id} 适配器十件套齐备`);
+    assert(ad.models().includes("glm-5.3") && ad.models().includes("glm-5.3-flash"), `${id} 静态兜底模型表`);
+    assert(adapters.modelOwners("glm-5.3").includes(id), `glm-5.3 归属含 ${id}`);
+    const acH = ad.headers();
+    assert(!("authorization" in acH) && !("x-authorization" in acH), `${id} headers() 不含认证头（X-Authorization 由 chat 按账号现场出）`);
+    const acR = ad.rewriteBody("glm-5.3", { messages: [{ role: "user", content: "hi" }], max_tokens: 1024 }, { id: "a1", uid: "u" }, {});
+    assert(acR.routeModelId === "zaicoding_glm-5.3" && acR.body.model === "glm-5.3", `${id} rewriteBody 解析路由 ID + 剥前缀 model`);
+    assert(acR.body.max_tokens === 10000, `${id} rewriteBody 归一小 max_tokens`);
+    assert(acR.body.messages[0].role === "system" && /OpenClaw/.test(acR.body.messages[0].content), `${id} rewriteBody 前置 OpenClaw 身份前缀`);
+    // 深拷贝纪律：改写绝不污染入参 body（渠道回退链多渠道复用同一 body 对象）
+    const sharedBody = { messages: [{ role: "user", content: "hi" }], max_tokens: 512 };
+    ad.rewriteBody("glm-5.3", sharedBody, { id: "a1" }, {});
+    assert(sharedBody.messages.length === 1 && !("model" in sharedBody) && sharedBody.max_tokens === 512, `${id} rewriteBody 不污染入参 body`);
   }
   const qBody = qd.rewriteBody("dfmodel", { messages: [{ role: "user", content: "hi" }], temperature: 0.2 }, { uid: "u" }, {});
   assert(qBody.model_config && qBody.model_config.key === "dfmodel" && qBody.model_config.format === "openai", "qoder rewriteBody 产出 QoderInferRequest");

@@ -134,16 +134,23 @@ function toAnthropic(model, body, opts) {
         budget_tokens: Number(b.thinking.budget_tokens || b.thinking.budgetTokens) || 2048,
       };
     } else if (b.thinking.type === "disabled") {
-      out.thinking = { type: "disabled" };
+      // disabled 折叠成最低档（参考 agent2api reasoning.rs 实测：GLM-5.3 对
+      // {type:"disabled"}/none/minimal 必 400 code 1210；与 raccoon 渠道 off→low 归一同款先例）
+      out.thinking = { type: "enabled", budget_tokens: 2048 };
     }
   } else if (b.reasoning_effort === "off") {
-    out.thinking = { type: "disabled" };
+    out.thinking = { type: "enabled", budget_tokens: 2048 };
   } else if (typeof b.reasoning_effort === "string" && b.reasoning_effort) {
     const budgetMap = { minimal: 1024, low: 2048, medium: 4096, high: 8192, xhigh: 16384, max: 24576 };
     out.thinking = {
       type: "enabled",
       budget_tokens: budgetMap[b.reasoning_effort] || 4096,
     };
+  }
+  // 扩展思考与采样参数并存会被上游拒绝（参考 reasoning.rs 实测）：开思考时显式删
+  if (out.thinking && out.thinking.type === "enabled") {
+    delete out.temperature;
+    delete out.top_p;
   }
   return out;
 }

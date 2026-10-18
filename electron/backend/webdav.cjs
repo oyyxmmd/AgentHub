@@ -65,6 +65,39 @@ function setActiveSignal(signal) {
   activeSignal = signal || null;
 }
 
+/** s3.cjs 共用同一取消信号（call 时懒加载，避免循环 require） */
+function syncActiveSignal() {
+  return activeSignal;
+}
+
+// ===== S3 兼容存储分派（issue #89）：cfg.__s3 为真走 S3 传输（AK/SK 复用 username/password 字段），
+// 七个原语语义与 WebDAV 一一对齐，四个同步引擎零改动
+const s3 = require("./s3.cjs");
+const isS3 = (cfg) => !!(cfg && cfg.__s3);
+
+// ===== 跨模块同步互斥（issue #92 前置） =====
+// activeSignal 只表达「取消当前在途请求」，不表达「有同步在跑」。技能/用量/号池/记忆
+// 四个模块各有手动与定时入口，号池定时上线后两模块并发会互相抢取消信号、重复上传。
+// 全应用同一时刻只放行一个远端同步任务：抢不到的入口直接跳过（定时任务下轮补跑，
+// 手动入口把原因提示给用户）。模块自身的防重入（isRunning / state.running）仍各自保留。
+let syncRunTag = null;
+
+/** 尝试占住全应用唯一的远端同步槽位；被占用返回 false（调用方跳过本轮） */
+function tryBeginSync(tag) {
+  if (syncRunTag) return false;
+  syncRunTag = String(tag || "sync");
+  return true;
+}
+
+function endSync() {
+  syncRunTag = null;
+}
+
+/** 当前占用者标签（null = 空闲），供入口提示与自测 */
+function syncBusyTag() {
+  return syncRunTag;
+}
+
 /** 网络层异常分类：超时 / 无法连接 / 取消 / 其他，供上层给出明确提示 */
 function networkKind(e) {
   if (!e) return "网络错误";
@@ -159,7 +192,7 @@ function parseEntries(xml) {
  * 列出目录下所有条目。
  * 返回 [{ href, name, isDir, size, modified }]
  */
-async function list(url, cfg) {
+async function listDav(url, cfg) {
   const res = await request("PROPFIND", url, cfg, PROPFIND_BODY, { "Content-Type": "application/xml; charset=utf-8" });
   if (res.status === 404) return [];
   if (res.status === 207 || res.status === 200) {
@@ -187,7 +220,12 @@ async function list(url, cfg) {
   throw new Error(`PROPFIND 失败：HTTP ${res.status}`);
 }
 
-async function get(url, cfg) {
+/** 分派入口：S3 兼容存储走 s3.cjs，其余走 WebDAV（issue #89） */
+async function list(url, cfg) {
+  return isS3(cfg) ? s3.list(url, cfg) : listDav(url, cfg);
+}
+
+async function getDav(url, cfg) {
   const res = await request("GET", url, cfg);
   if (res.status === 404) return null;
   if (!res.ok) {
@@ -201,13 +239,17 @@ async function get(url, cfg) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+async function get(url, cfg) {
+  return isS3(cfg) ? s3.get(url, cfg) : getDav(url, cfg);
+}
+
 /** 读取远端文件并解码为 UTF-8 文本 */
 async function getText(url, cfg) {
   const buf = await get(url, cfg);
   return buf == null ? null : buf.toString("utf8");
 }
 
-async function put(url, cfg, text) {
+async function putDav(url, cfg, text) {
   const res = await request("PUT", url, cfg, text);
   if (!res.ok && res.status !== 201 && res.status !== 204) {
     if (res.status === 401 || res.status === 403) {
@@ -221,8 +263,12 @@ async function put(url, cfg, text) {
   }
 }
 
+async function put(url, cfg, text) {
+  return isS3(cfg) ? s3.put(url, cfg, text) : putDav(url, cfg, text);
+}
+
 /** 删除远端文件/目录（WebDAV DELETE 对集合为递归删除）；404 视为已删除（幂等） */
-async function remove(url, cfg) {
+async function removeDav(url, cfg) {
   const res = await request("DELETE", url, cfg);
   if (res.ok || res.status === 404) return;
   if (res.status === 401 || res.status === 403) {
@@ -231,8 +277,12 @@ async function remove(url, cfg) {
   throw new Error(`DELETE 失败：HTTP ${res.status}（${url}）`);
 }
 
-/** 确保业务目录存在：从 endpoint 已存在路径之后开始逐级 MKCOL。 */
-async function ensureDir(url, cfg) {
+async function remove(url, cfg) {
+  return isS3(cfg) ? s3.remove(url, cfg) : removeDav(url, cfg);
+}
+
+/** 确保业务目录存在：从 endpoint 已存在路径之后开始逐级 MKCOL。S3 无目录概念，直接放行 */
+async function ensureDirDav(url, cfg) {
   const u = new URL(url);
   const endpoint = new URL(normalizeEndpoint(cfg.endpoint));
   if (u.origin !== endpoint.origin) throw new Error(`WebDAV 地址不一致：${url}`);
@@ -252,6 +302,10 @@ async function ensureDir(url, cfg) {
   }
 }
 
+async function ensureDir(url, cfg) {
+  return isS3(cfg) ? s3.ensureDir(url, cfg) : ensureDirDav(url, cfg);
+}
+
 /** http 明文传输提醒（账号密码经 Basic 认证发送，https 之外一律明文） */
 function insecureHint(cfg) {
   return normalizeEndpoint(cfg.endpoint).toLowerCase().startsWith("http://")
@@ -260,7 +314,7 @@ function insecureHint(cfg) {
 }
 
 /** 测试连接：对根目录 PROPFIND（Depth 0），逐类错误码给出可读提示 */
-async function test(cfg) {
+async function testDav(cfg) {
   const started = Date.now();
   let url;
   try {
@@ -290,4 +344,8 @@ async function test(cfg) {
   return { ok: false, message: `连接失败：HTTP ${res.status}（${Date.now() - started}ms）`, latencyMs: Date.now() - started };
 }
 
-module.exports = { joinUrl, normalizeEndpoint, list, get, getText, put, remove, ensureDir, test, setActiveSignal, networkKind, describeFailure, isNetworkError };
+async function test(cfg) {
+  return isS3(cfg) ? s3.test(cfg) : testDav(cfg);
+}
+
+module.exports = { joinUrl, normalizeEndpoint, list, get, getText, put, remove, ensureDir, test, setActiveSignal, syncActiveSignal, networkKind, describeFailure, isNetworkError, tryBeginSync, endSync, syncBusyTag };

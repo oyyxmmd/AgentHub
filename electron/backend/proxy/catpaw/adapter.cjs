@@ -26,6 +26,23 @@ const { runConversation } = require("./conversation.cjs");
 /** 静态兜底模型清单（远程目录不可用时的 id 集） */
 const STATIC_MODEL_IDS = MODELS.map((model) => model.id);
 
+/**
+ * 把编排层解析出的**上游真实模型名**写回请求体。
+ *
+ * 与其它渠道的 rewriteBody 对齐：adapters.cjs 的 chat 契约里 ctx.model 才是要转发给上游的
+ * 模型（别名 / 反向映射 / 跨渠道回退之后的真值），ctx.body.model 仍是客户端的原始请求名
+ * （响应 model 字段按原值回给客户端）。其它渠道都通过 rewriteBody 把 ctx.model 写进
+ * out.model，而 CatPaw 的协议层（prepare.cjs）直接读 body.model——不对齐就会把反向映射的
+ * 统一虚拟名（如 AgentHub-1.0）原样发给上游并报 400。
+ */
+function withUpstreamModel(ctx) {
+  const source = ctx || {};
+  const body = source.body || {};
+  const model = String(source.model || body.model || "").trim();
+  if (!model) return source;
+  return { ...source, body: { ...body, model } };
+}
+
 function makeCatPaw() {
   return {
     id: "catpaw",
@@ -61,7 +78,7 @@ function makeCatPaw() {
 
     /** 会话式转发入口（契约：ctx 同 chat，出参同形 {status, planLimit}） */
     chatSession(ctx) {
-      return runConversation(ctx);
+      return runConversation(withUpstreamModel(ctx));
     },
 
     /** 余额 / 积分：GET catx.nocode.cn/api/gateway/credit/balance（凭证复用转发那条链） */
@@ -111,4 +128,4 @@ function makeCatPaw() {
   };
 }
 
-module.exports = { makeCatPaw };
+module.exports = { makeCatPaw, withUpstreamModel };

@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS mem (
   t_body        TEXT,
   t_tags        TEXT,
   w_title       TEXT,
+  -- 检索热度（2026-10-16 借鉴 causal-memory 的 Q 值机制）：被检索命中的次数与最近命中时间。
+  -- 只升不降（永不自动衰减），importance 是写入时的静态重要度，热度是「被用得越多越靠前」的动态补充。
+  access_count   INTEGER DEFAULT 0,
+  last_hit_at    INTEGER,
   PRIMARY KEY (id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_mem_project ON mem(project);
@@ -151,6 +155,21 @@ CREATE TABLE IF NOT EXISTS review_queue (
   resolution TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, kind);
+
+-- 检索审计（2026-10-16 借鉴 causal-memory 的 recall_audit）：每次检索一行，
+-- 用于回答「搜了什么没搜到」「哪些记忆从未被命中」。写入 best-effort：
+-- 失败绝不影响检索。保留 90 天，写入时顺手清理。
+CREATE TABLE IF NOT EXISTS recall_log (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts         INTEGER NOT NULL,
+  query      TEXT NOT NULL,
+  agent      TEXT,
+  hits       INTEGER NOT NULL DEFAULT 0,
+  total      INTEGER NOT NULL DEFAULT 0,
+  hit_ids    TEXT,
+  latency_ms INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_recall_log_ts ON recall_log(ts);
 `;
 
 const MEM_COLS = [
@@ -159,7 +178,26 @@ const MEM_COLS = [
   "hash", "size", "mtime", "valid_from", "valid_to", "superseded_by", "refs_text",
   "dup_index", "dedup_status", "ai_processed", "pinned", "starred",
   "t_title", "t_summary", "t_body", "t_tags", "w_title",
+  "access_count", "last_hit_at",
 ];
+
+// mem 表各列类型（存量库列自愈用）。
+// 为什么需要：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列——历史上每次加列
+// （project / valid_to / access_count…）都没有迁移步骤，老库 open 后 upsert 直接抛
+// "no such column"，整个记忆读写崩、前端显示「记忆中枢未启用」（1.73.0 教训：
+// access_count/last_hit_at 两列无迁移，升级用户索引全挂、记忆全部读不出来）。
+// 对 MEM_COLS 全集比对 table_info，缺什么补什么；幂等（已存在的列跳过）。
+const MEM_COL_TYPES = {
+  id: "TEXT", path: "TEXT", anchor: "TEXT", type: "TEXT", layer: "TEXT",
+  title: "TEXT", summary: "TEXT", tags: "TEXT", project: "TEXT", agent: "TEXT",
+  device: "TEXT", session: "TEXT", created: "INTEGER", updated: "INTEGER",
+  importance: "INTEGER", hash: "TEXT", size: "INTEGER", mtime: "INTEGER",
+  valid_from: "INTEGER", valid_to: "INTEGER", superseded_by: "TEXT",
+  refs_text: "TEXT", dup_index: "INTEGER", dedup_status: "TEXT",
+  ai_processed: "INTEGER", pinned: "INTEGER", starred: "INTEGER",
+  t_title: "TEXT", t_summary: "TEXT", t_body: "TEXT", t_tags: "TEXT",
+  w_title: "TEXT", access_count: "INTEGER", last_hit_at: "INTEGER",
+};
 
 class MemoryIndex {
   constructor(dbFile) {
@@ -182,6 +220,16 @@ class MemoryIndex {
     // FTS 重建（一键修复「卡死」的根源）。开 ON 让 REPLACE 正确走触发器，FTS 保持一致。
     db.exec("PRAGMA recursive_triggers = ON");
     db.exec(DDL);
+    // 存量库列自愈：DDL 的 CREATE TABLE IF NOT EXISTS 对已存在的表不会加列，
+    // 老库（跨任意历史版本）upsert 会抛 no such column，整个记忆读写崩。
+    // 对 MEM_COLS 全集比对 table_info，缺什么补什么。SQLite ALTER 每语句一列，
+    // 逐列 try：重复列名/极端库损坏都不阻断启动（下轮 open 继续自愈）。
+    try {
+      const existing = new Set(db.prepare("PRAGMA table_info(mem)").all().map((c) => c.name));
+      for (const [col, type] of Object.entries(MEM_COL_TYPES)) {
+        if (!existing.has(col)) db.exec(`ALTER TABLE mem ADD COLUMN ${col} ${type}`);
+      }
+    } catch { /* 极端损坏留给 selfCheck/重建路径处理 */ }
     const v = db.prepare("PRAGMA user_version").get().user_version;
     if (v > SCHEMA_VERSION) {
       // 更新版应用写的库：只读保护，不降级写
@@ -217,6 +265,12 @@ class MemoryIndex {
     );
     this._findBySessionTitle = this.db.prepare("SELECT id FROM mem WHERE session = ? AND title = ? LIMIT 1");
     this._getIdsByPath = this.db.prepare("SELECT id FROM mem WHERE path = ?");
+    // upsert 是 INSERT OR REPLACE：新列不写就会在重写时被重置，先取旧热度再带上
+    this._getHeat = this.db.prepare("SELECT access_count, last_hit_at FROM mem WHERE id = ? AND path = ?");
+    // 命中计数：access_count/last_hit_at 不在 mem_au 触发器的 OF 列表里，不触发 FTS 重建。
+    // COALESCE 兜 NULL：ALTER TABLE ADD COLUMN DEFAULT 0 后存量行读出来仍是 NULL
+    // （SQLite 不物化默认值），裸 +1 会让存量记忆的热度永远不涨
+    this._hitStmt = this.db.prepare("UPDATE mem SET access_count = COALESCE(access_count, 0) + 1, last_hit_at = ? WHERE id = ?");
     this._clearLinks = this.db.prepare("DELETE FROM mem_link WHERE src = ?");
     this._deleteLinksByNode = this.db.prepare("DELETE FROM mem_link WHERE src = ? OR dst = ?");
     this._insertLink = this.db.prepare("INSERT OR IGNORE INTO mem_link (src, dst, kind) VALUES (?, ?, ?)");
@@ -317,6 +371,11 @@ class MemoryIndex {
   upsertOne(entry, cfg) {
     if (this.readOnly) return false;
     const boost = cfg && cfg.titleBoost ? cfg.titleBoost : 3;
+    // INSERT OR REPLACE 会整行重建，热度两列必须显式带旧值，否则每次重写都清零。
+    // entry 显式传值优先（导入/测试可覆盖），否则沿用旧行。
+    const prev = this._getHeat.get(entry.id, entry.path);
+    const accessCount = entry.accessCount != null ? entry.accessCount : (prev ? prev.access_count || 0 : 0);
+    const lastHitAt = entry.lastHitAt != null ? entry.lastHitAt : (prev ? prev.last_hit_at : null);
     const row = {
       id: entry.id,
       path: entry.path,
@@ -350,6 +409,8 @@ class MemoryIndex {
       t_body: tokenize(entry.body),
       t_tags: tokenize(Array.isArray(entry.tags) ? entry.tags.join(" ") : entry.tags),
       w_title: weightedTitle(entry.title, boost),
+      access_count: accessCount,
+      last_hit_at: lastHitAt,
     };
     this._upsert.run(...MEM_COLS.map((c) => row[c]));
     this._replaceLinks(entry.id, entry.refs);
@@ -361,7 +422,9 @@ class MemoryIndex {
     if (!Array.isArray(refs)) return;
     for (const r of refs) {
       const s = String(r);
-      const kind = s.startsWith("project:") ? "project" : s.startsWith("topic:") ? "topic" : "mem";
+      // file: 前缀是文件锚定引用（不是记忆间链接）：若误归为 'mem'，
+      // graphStats 的断链查询会把 dst 不在 mem 表的每条文件链接都数成断链
+      const kind = s.startsWith("project:") ? "project" : s.startsWith("topic:") ? "topic" : s.startsWith("file:") ? "file" : "mem";
       this._insertLink.run(id, s.replace(/^project:/, "").replace(/^topic:/, ""), kind);
     }
   }
@@ -397,6 +460,52 @@ class MemoryIndex {
 
   getById(id) {
     return this._getById.get(id) || null;
+  }
+
+  /**
+   * 检索命中计数（best-effort）：一次检索命中的记忆 id 各 +1，刷新 last_hit_at。
+   * 调用方必须自己 try/catch —— 热度记账失败绝不能影响检索结果。
+   * 返回实际更新的行数；只读模式或异常一律返回 0。
+   */
+  recordHits(ids) {
+    if (this.readOnly || !Array.isArray(ids) || !ids.length) return 0;
+    const now = Date.now();
+    this.db.exec("BEGIN");
+    try {
+      for (const id of ids) this._hitStmt.run(now, id);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch { /* 连接已坏，交给上层 */ }
+      return 0;
+    }
+    return ids.length;
+  }
+
+  /**
+   * 检索审计（best-effort）：一行一次检索。纪律与 recordHits 相同——失败不影响检索。
+   * 顺手清理 90 天前的旧日志（命中 ts 索引，代价可忽略），防止表无限增长。
+   */
+  logRecall(entry) {
+    if (this.readOnly) return false;
+    try {
+      const hitIds = Array.isArray(entry.hitIds) ? entry.hitIds : [];
+      this.db.prepare(
+        "INSERT INTO recall_log (ts, query, agent, hits, total, hit_ids, latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        entry.ts || Date.now(),
+        String(entry.query || "").slice(0, 500),
+        entry.agent ? String(entry.agent).slice(0, 64) : null,
+        Number(entry.hits) || 0,
+        Number(entry.total) || 0,
+        hitIds.length ? JSON.stringify(hitIds.slice(0, 100)) : null,
+        Number(entry.latencyMs) || 0,
+      );
+      // 90 天留存：DELETE 走 idx_recall_log_ts，单次检索路径上多这一次也远不到 1ms
+      this.db.prepare("DELETE FROM recall_log WHERE ts < ?").run(Date.now() - 90 * 86400000);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   counts() {
@@ -478,6 +587,28 @@ class MemoryIndex {
     this.db.prepare("UPDATE review_queue SET status = 'resolved', resolved = ?, resolution = ? WHERE id = ?")
       .run(Date.now(), resolution, id);
     return true;
+  }
+
+  /** 惰性作废：引用记忆已不存在的 pending 建议（模型输出 id 漂移、记忆被删除后残留的孤儿）。
+      待确认列表每次拉取时顺带清扫，死项不再留在收件箱里让用户"点了必失败"。
+      payload 损坏的同样作废（用户对它也无从裁决）。返回清理条数。 */
+  sweepStaleReview() {
+    if (this.readOnly) return 0;
+    const rows = this.db.prepare(
+      "SELECT id, kind, payload FROM review_queue WHERE status = 'pending' AND kind IN ('supersede', 'classify', 'dedup')",
+    ).all();
+    let cleaned = 0;
+    for (const r of rows) {
+      let p = null;
+      try { p = JSON.parse(r.payload || "{}"); } catch { p = null; }
+      let alive;
+      if (!p || typeof p !== "object") alive = false;
+      else if (r.kind === "supersede") alive = !!(p.oldId && this.getById(p.oldId));
+      else if (r.kind === "classify") alive = !!(p.memoryId && this.getById(p.memoryId));
+      else alive = !!(p.targetId && p.newId && this.getById(p.targetId) && this.getById(p.newId));
+      if (!alive) { this.reviewResolve(r.id, "stale"); cleaned++; }
+    }
+    return cleaned;
   }
 }
 

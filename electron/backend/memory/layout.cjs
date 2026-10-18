@@ -87,23 +87,26 @@ function detectGitRemotes(cwd) {
   if (cached !== undefined) return cached;
   let list = [];
   try {
-    const namesOut = execFileSync("git", ["-C", cwd, "remote"], {
+    // 单次 git remote -v 拿全部（行格式: name<TAB>url<TAB>(fetch|push)）：
+    // 曾经的写法每个 remote 再起一个 git 子进程，N 个 remote = N×4s 最坏耗时
+    const out = execFileSync("git", ["-C", cwd, "remote", "-v"], {
       encoding: "utf8", timeout: 4000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
     });
-    const names = namesOut.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-    // origin 优先，其余保持 git 的字母序（git remote 本身按名称排序，稳定可预期）
-    names.sort((a, b) => (a === "origin" ? -1 : b === "origin" ? 1 : 0));
+    const byName = new Map();
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.match(/^(\S+)\t(\S+)\t\((fetch|push)\)$/);
+      if (!m) continue;
+      const [, name, url, kind] = m;
+      if (kind !== "fetch") continue; // fetch 与 push 的 URL 通常相同，只取 fetch
+      if (!byName.has(name)) byName.set(name, []);
+      const urls = byName.get(name);
+      if (!urls.includes(url)) urls.push(url);
+    }
+    // origin 优先，其余保持 git 的字母序（git remote -v 按名称排序，稳定可预期）
+    const names = [...byName.keys()].sort((a, b) => (a === "origin" ? -1 : b === "origin" ? 1 : 0));
     const seen = new Set();
     for (const name of names) {
-      let urls = [];
-      try {
-        const out = execFileSync("git", ["-C", cwd, "remote", "get-url", "--all", name], {
-          encoding: "utf8", timeout: 4000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
-        });
-        urls = out.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-      } catch {
-        continue;
-      }
+      const urls = byName.get(name) || [];
       for (const raw of urls) {
         const parsed = normalizeGitRemote(raw);
         if (!parsed) continue;
@@ -515,7 +518,7 @@ class ProjectRegistry {
       const cur = data.projects[idx];
       // 命中旧的大写条目时把 slug 归一到小写：否则本次写入会带着小写 slug 落到索引，
       // 而卡片还叫大写，projects() 的 slug 精确关联随即对不上（卡片条数显示 0）
-      const merged = { ...cur, ...entry, slug: sanitizeSlug(entry.slug || cur.slug), updated: now };
+      const merged = { ...cur, ...entry, slug: sanitizeSlug(entry.slug || cur.slug) || cur.slug || "unknown", updated: now };
       // 空值不覆盖已有名：写入方不带 name 时（如 projectAttachPath 传 name: undefined）
       // 之前会把台账里的真名抹成 undefined，卡片随即显示空白
       if (!merged.name && cur.name) merged.name = cur.name;
@@ -555,7 +558,10 @@ class ProjectRegistry {
 
   remove(slug) {
     const data = this._load();
-    data.projects = data.projects.filter((p) => p.slug !== slug);
+    // 大小写归一比较：slug 生成已折小写，但历史脏数据/手工台账可能残留大写，
+    // 严格相等会让「删不掉」——前端点删除静默无效果
+    const target = String(slug || "").toLowerCase();
+    data.projects = data.projects.filter((p) => String(p.slug || "").toLowerCase() !== target);
     this._save();
   }
 

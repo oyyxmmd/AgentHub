@@ -4,7 +4,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, onUnmounted } from "vue";
 import * as api from "../../api/ipc";
-import { webdavStatus, onUpdateEvent, type WebDavStatus } from "../../api/ipc";
+import { webdavStatus, webdavSync, onUpdateEvent, type WebDavStatus } from "../../api/ipc";
 import { useAppStore } from "../../stores/app";
 import { useSyncStore } from "../../stores/sync";
 
@@ -25,19 +25,24 @@ async function refreshStatus() {
   } catch { /* 保留旧值 */ }
 }
 
-// 激活即加载：状态 / 共享配置 / 号池状态
+// 激活即加载：状态 / 共享配置 / 四个板块各自的同步状态
 async function loadPage() {
   await refreshStatus();
   loadShared();
   refreshPoolsync();
+  refreshMemSync();
+  syncApp.refreshProgress().catch(() => {});
 }
 
 // ===== 统一 WebDAV 服务器（webdavShared）：技能仓库 / 用量统计 / 反代网关 / 记忆中枢共用 =====
 const SYNC_PASSWORD_MASK = "••••••••"; // 与后端掩码约定一致：精确掩码视为「未修改密码」
 const shared = ref<api.SharedWebdavConfig>({
+  type: "webdav",
   endpoint: "",
   username: "",
   password: "",
+  encryptionPassphrase: "",
+  s3: { bucket: "", region: "", pathStyle: false },
   roots: { skills: "/agent-skills", usage: "/dosage-sync", proxy: "/agenthub-proxy", memory: "/agenthub-memory" },
 });
 const sharedTestResult = ref<{ ok: boolean; message: string } | null>(null);
@@ -49,6 +54,10 @@ const sharedSaving = ref(false);
 function onSharedPasswordInput() {
   const v = shared.value.password;
   if (v !== SYNC_PASSWORD_MASK && v.includes("•")) shared.value.password = "";
+}
+function onSharedPassphraseInput() {
+  const v = shared.value.encryptionPassphrase;
+  if (v !== SYNC_PASSWORD_MASK && v.includes("•")) shared.value.encryptionPassphrase = "";
 }
 async function testShared() {
   sharedTestResult.value = null;
@@ -80,6 +89,23 @@ async function saveShared() {
     sharedSaving.value = false;
   }
 }
+// 显式清除（后端唯一允许清掉已存密码的入口；后台保存遇空密码会保留密文，防解密失败被覆盖）
+async function clearShared() {
+  if (!window.confirm("确定清除统一 WebDAV 服务器配置吗？\n\n地址、账号、密码与四个模块根目录将全部清空，四个模块的跨设备同步会立即停用（本机数据不受影响）。")) return;
+  sharedSaveMsg.value = "";
+  try {
+    const r = await api.webdavSharedClear();
+    sharedSaveMsg.value = r?.ok ? "已清除" : r?.message || "清除失败";
+    if (r?.ok) {
+      await loadShared();
+      await syncApp.reloadConfig().catch(() => {});
+      refreshPoolsync();
+      await refreshStatus();
+    }
+  } catch (e) {
+    sharedSaveMsg.value = String((e as Error).message || e);
+  }
+}
 async function loadShared() {
   try {
     shared.value = await api.webdavSharedGet();
@@ -108,11 +134,32 @@ async function saveUsageExtra() {
   window.setTimeout(() => (usageExtraMsg.value = ""), 3200);
 }
 
+// ---- 用量统计同步（跟随统一服务器；startSync 先落盘配置再后台跑，进度走标准「同步中」弹窗） ----
+const usageRunning = computed(() => syncApp.syncing || !!syncApp.sync?.running);
+const usageLastSyncAt = computed(() => syncApp.sync?.lastSyncAt ?? 0);
+function runUsageSync() {
+  void syncApp.startSync();
+}
+
+// ---- 技能仓库同步（中央库跨设备同步；进度事件 event:"webdav"） ----
+const skillsRunning = computed(() => !!status.value?.running);
+const skillsMsg = ref("");
+async function runSkillsSync() {
+  skillsMsg.value = "";
+  try {
+    const r = await webdavSync();
+    if (r && !r.ok) skillsMsg.value = r.message || "启动失败";
+    else await refreshStatus();
+  } catch (e) {
+    skillsMsg.value = String((e as Error).message || e);
+  }
+}
+
 // ---- 反代网关号池同步（压缩包用 WebDAV 密码加密；进度走 app:event 推送） ----
 const poolsync = ref<api.ProxyPoolSyncStatus | null>(null);
 const poolsyncMsg = ref("");
 const poolsyncRunning = computed(() => !!poolsync.value?.running);
-let offPoolsync: (() => void) | undefined;
+let offEvents: (() => void) | undefined;
 
 async function refreshPoolsync() {
   try {
@@ -138,23 +185,65 @@ function fmtAgoMs(ms: number) {
   return new Date(ms).toLocaleString("zh-CN", { hour12: false });
 }
 
+/** 技能仓库的 lastSyncAt 是 ISO 字符串（WebDavStatus），与毫秒值统一走相对时间格式化 */
+function fmtAgoVal(v: number | string | null | undefined) {
+  if (!v) return "从未同步";
+  const ms = typeof v === "string" ? new Date(v).getTime() : v;
+  return ms ? fmtAgoMs(ms) : "从未同步";
+}
+
+// ---- 记忆中枢同步（整体打包上传/下载；进度事件 event:"memory" type:"sync"） ----
+const memSync = ref<{ running: boolean; lastSyncAt: number; configured: boolean } | null>(null);
+const memSyncMsg = ref("");
+const memSyncRunning = computed(() => !!memSync.value?.running);
+async function refreshMemSync() {
+  try {
+    const s = await api.memorySyncStatus();
+    memSync.value = { running: s.running, lastSyncAt: s.lastSyncAt, configured: s.configured };
+  } catch { /* 浏览器预览走 mock */ }
+}
+async function runMemSync() {
+  memSyncMsg.value = "";
+  try {
+    const r = await api.memorySyncRun();
+    memSyncMsg.value = r.ok
+      ? `同步完成：下载 ${r.downloaded ?? 0} · 冲突 ${r.conflicts ?? 0}`
+      : r.cancelled ? "已取消" : r.message || "同步失败";
+  } catch (e) {
+    memSyncMsg.value = String((e as Error).message || e);
+  }
+  await refreshMemSync();
+}
+
 /** 未配置时引导到上方「统一 WebDAV 服务器」表单（与号池同步页的门控行为对齐） */
 function gotoSharedForm() {
   document.getElementById("shared-webdav-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-// 号池同步进度（proxy 事件流里的 poolsync 子事件）
+// 四个板块的同步进度事件合流：号池（proxy/poolsync）、技能（webdav）、记忆（memory/sync）；
+// 运行中就地更新运行态，结束时回读完整状态（拿 lastSyncAt / lastError / 摘要）
 onMounted(() => {
-  offPoolsync = onUpdateEvent((e) => {
+  offEvents = onUpdateEvent((e) => {
     const p = e as { event?: string; type?: string; stage?: string; detail?: string; running?: boolean };
-    if (p?.event !== "proxy" || p?.type !== "poolsync" || !poolsync.value) return;
-    poolsync.value.running = !!p.running;
-    if (p.stage) poolsync.value.stage = p.stage;
-    poolsync.value.detail = p.detail || "";
+    if (p?.event === "proxy" && p?.type === "poolsync" && poolsync.value) {
+      poolsync.value.running = !!p.running;
+      if (p.stage) poolsync.value.stage = p.stage;
+      poolsync.value.detail = p.detail || "";
+    }
+    if (p?.event === "webdav" && status.value) {
+      status.value.running = !!p.running;
+      if (p.stage) status.value.stage = p.stage as WebDavStatus["stage"];
+      status.value.detail = p.detail || "";
+      if (!p.running) refreshStatus();
+    }
+    if (p?.event === "memory" && p?.type === "sync" && memSync.value) {
+      memSync.value.running = !!p.running;
+      if (!p.running) refreshMemSync();
+    }
   });
 });
 onUnmounted(() => {
-  if (offPoolsync) offPoolsync();
+  if (offEvents) offEvents();
 });
 </script>
 
@@ -163,7 +252,7 @@ onUnmounted(() => {
     <div class="cfg-sec-head">
       <div>
         <div class="cfg-sec-title">WebDAV 同步</div>
-        <div class="cfg-sec-sub">统一服务器 · 模块根目录 · 号池同步（四个模块共用这一台服务器）。技能仓库的「中央仓库同步」运行器在「技能仓库 · WebDAV 同步」页。</div>
+        <div class="cfg-sec-sub">统一服务器 · 模块根目录 · 快捷同步（四个模块共用这一台服务器）。技能仓库的「中央仓库同步」运行器在「技能仓库 · WebDAV 同步」页。</div>
       </div>
       <div class="cfg-sec-actions">
         <el-tag :type="configured ? 'success' : 'info'" effect="plain" round>
@@ -187,14 +276,43 @@ onUnmounted(() => {
             <span class="sg-hint">技能仓库 / 用量统计 / 反代网关三套同步共用 · 密码经系统密钥加密保存，界面只显示掩码</span>
           </div>
           <div class="form-grid">
-            <div class="form-field"><label>服务器地址（WebDAV）</label><input class="f-input" v-model="shared.endpoint" placeholder="https://dav.jianguoyun.com/dav" /></div>
-            <div class="form-field"><label>账号</label><input class="f-input" v-model="shared.username" autocomplete="off" /></div>
-            <div class="form-field full"><label>密码（同时作为反代号池压缩包的加密口令，多设备必须一致）</label><input class="f-input" type="password" v-model="shared.password" autocomplete="new-password" placeholder="已保存密码显示为掩码；输入任意字符即进入修改，请填写完整新密码" @input="onSharedPasswordInput" /></div>
             <div class="form-field full">
-              <button class="btn-outline" :disabled="sharedTesting" @click="testShared">{{ sharedTesting ? "测试中…" : "测试连接" }}</button>
-              <button class="btn btn-cta" :disabled="sharedSaving" @click="saveShared">{{ sharedSaving ? "保存中" : "保存设置" }}</button>
-              <span v-if="sharedTestResult" class="hint" :style="{ marginLeft: '10px', color: sharedTestResult.ok ? 'var(--ok)' : 'var(--err)' }">{{ sharedTestResult.message }}</span>
-              <span v-else-if="sharedSaveMsg" class="hint" style="margin-left: 10px">{{ sharedSaveMsg }}</span>
+              <label>存储类型</label>
+              <div class="tabs">
+                <button class="tab" :class="{ active: shared.type !== 's3' }" @click="shared.type = 'webdav'">WebDAV 网盘</button>
+                <button class="tab" :class="{ active: shared.type === 's3' }" @click="shared.type = 's3'">S3 兼容对象存储</button>
+              </div>
+            </div>
+            <template v-if="shared.type !== 's3'">
+              <div class="form-field"><label>服务器地址（WebDAV）</label><input class="f-input" v-model="shared.endpoint" placeholder="https://dav.jianguoyun.com/dav" /></div>
+              <div class="form-field"><label>账号</label><input class="f-input" v-model="shared.username" autocomplete="off" /></div>
+              <div class="form-field full"><label>密码（同时作为反代号池压缩包的默认加密口令，多设备必须一致）</label><input class="f-input" type="password" v-model="shared.password" autocomplete="new-password" placeholder="已保存密码显示为掩码；输入任意字符即进入修改，请填写完整新密码" @input="onSharedPasswordInput" /></div>
+            </template>
+            <template v-else>
+              <div class="form-field"><label>服务器地址（S3 兼容 API，如 OSS/COS/R2/MinIO 的端点）</label><input class="f-input" v-model="shared.endpoint" placeholder="https://s3.us-east-1.amazonaws.com" /></div>
+              <div class="form-field"><label>AccessKeyId</label><input class="f-input" v-model="shared.username" autocomplete="off" /></div>
+              <div class="form-field full"><label>SecretKey（同时作为反代号池压缩包的默认加密口令，多设备必须一致）</label><input class="f-input" type="password" v-model="shared.password" autocomplete="new-password" placeholder="已保存密钥显示为掩码；输入任意字符即进入修改" @input="onSharedPasswordInput" /></div>
+              <div class="form-field"><label>桶名（Bucket）</label><input class="f-input mono" v-model="shared.s3.bucket" placeholder="my-bucket" /></div>
+              <div class="form-field"><label>区域（AWS 填区域码；R2/MinIO 填 auto）</label><input class="f-input mono" v-model="shared.s3.region" placeholder="us-east-1 或 auto" /></div>
+              <div class="form-field full">
+                <div class="switch-row" style="padding: 0">
+                  <div class="s-left">
+                    <div class="s-title" style="font-size: 12.5px">Path-Style 寻址</div>
+                    <div class="s-desc">MinIO / R2 / OSS 等勾选；AWS 官方 S3 留空（虚拟主机式）</div>
+                  </div>
+                  <div class="switch" :class="{ on: shared.s3.pathStyle }" role="switch" :aria-checked="shared.s3.pathStyle" @click="shared.s3.pathStyle = !shared.s3.pathStyle"></div>
+                </div>
+              </div>
+            </template>
+            <div class="form-field full"><label>号池加密口令（可选，留空沿用密码 / SecretKey；多设备必须一致）</label><input class="f-input" type="password" v-model="shared.encryptionPassphrase" autocomplete="new-password" placeholder="已保存口令显示为掩码；输入任意字符即进入修改" @input="onSharedPassphraseInput" /></div>
+            <div class="form-field full">
+              <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+                <button class="btn-outline" :disabled="sharedTesting" @click="testShared">{{ sharedTesting ? "测试中…" : "测试连接" }}</button>
+                <button class="btn btn-cta" :disabled="sharedSaving" @click="saveShared">{{ sharedSaving ? "保存中" : "保存设置" }}</button>
+                <button v-if="shared.endpoint || shared.username" class="btn-outline danger" @click="clearShared">清除配置</button>
+                <span v-if="sharedTestResult" class="hint" :style="{ color: sharedTestResult.ok ? 'var(--ok)' : 'var(--err)' }">{{ sharedTestResult.message }}</span>
+                <span v-else-if="sharedSaveMsg" class="hint">{{ sharedSaveMsg }}</span>
+              </div>
             </div>
           </div>
         </div>
@@ -227,15 +345,58 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 反代网关号池同步：压缩包 + 加密 + 自动去重合并 -->
+    <!-- 快捷同步：四大板块逐一手动触发（共用上方统一服务器与各自根目录；详细进度/报告在各模块同步页） -->
     <div class="sync-scope">
-      <div class="card" style="padding: 6px 18px">
+      <div class="card" style="padding: 4px 18px 10px">
+        <div style="display:flex; align-items:baseline; padding: 12px 0 2px">
+          <span style="font-size:13px; font-weight:600; color: var(--text)">快捷同步</span>
+          <span style="font-size:11px; color: var(--text-3); margin-left:8px">四大板块共用上方统一服务器 · 可逐个手动触发，详细进度与报告见各模块的「同步」页</span>
+        </div>
+
+        <!-- 用量统计 -->
+        <div class="switch-row" style="align-items: flex-start">
+          <div class="s-left">
+            <div class="s-title">用量同步</div>
+            <div class="s-desc">把本机各工具的用量记录同步到网盘，多设备合并出完整用量统计 · 根目录 {{ shared.roots.usage || "/dosage-sync" }}</div>
+            <div class="s-desc" style="margin-top: 2px">
+              <span :style="{ color: configured ? 'var(--ok)' : 'var(--warn)' }">{{ configured ? "已就绪" : "未配置" }}</span>
+              <template v-if="configured && usageLastSyncAt"> · 上次同步 {{ fmtAgoVal(usageLastSyncAt) }}</template>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px; flex-shrink: 0">
+            <button v-if="!configured" class="btn-outline" @click="gotoSharedForm">去配置</button>
+            <button v-else class="btn-outline" :disabled="usageRunning" @click="runUsageSync">{{ usageRunning ? "同步中…" : "立即同步" }}</button>
+          </div>
+        </div>
+
+        <!-- 技能仓库 -->
+        <div class="switch-row" style="align-items: flex-start">
+          <div class="s-left">
+            <div class="s-title">技能同步</div>
+            <div class="s-desc">中央技能库跨设备同步：下载别人的更新、推送本机变更并合并台账 · 根目录 {{ shared.roots.skills || "/agent-skills" }}</div>
+            <div class="s-desc" style="margin-top: 2px">
+              <span :style="{ color: configured ? 'var(--ok)' : 'var(--warn)' }">{{ configured ? "已就绪" : "未配置" }}</span>
+              <template v-if="configured && status?.lastSyncAt"> · 上次同步 {{ fmtAgoVal(status.lastSyncAt) }}</template>
+            </div>
+            <div class="s-desc" v-if="status?.lastError" :style="{ color: 'var(--err)' }">上次失败：{{ status.lastError }}</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px; flex-shrink: 0">
+            <span v-if="skillsMsg" class="hint">{{ skillsMsg }}</span>
+            <button v-if="!configured" class="btn-outline" @click="gotoSharedForm">去配置</button>
+            <button v-else class="btn-outline" :disabled="skillsRunning" @click="runSkillsSync">{{ skillsRunning ? "同步中…" : "立即同步" }}</button>
+          </div>
+        </div>
+
+        <!-- 反代网关号池 -->
         <div class="switch-row" style="align-items: flex-start">
           <div class="s-left">
             <div class="s-title">反代网关 · 号池同步</div>
-            <div class="s-desc">把号池账号（含登录凭据）打成加密压缩包上传到 WebDAV，其他电脑拉取后按账号自动去重合并；本机移除账号会同步移除他机</div>
+            <div class="s-desc">把号池账号（含登录凭据）打成加密压缩包上传到网盘，其他电脑拉取后按账号自动去重合并；本机移除账号会同步移除他机 · 根目录 {{ shared.roots.proxy || "/agenthub-proxy" }}</div>
             <div class="s-desc" style="color: var(--text-3); margin-top: 2px">
-              压缩包用上面的 WebDAV 密码加密（AES-256-GCM），各设备密码须一致 · 根目录 {{ shared.roots.proxy || "/agenthub-proxy" }}
+              API Keys 与模型映射（含反向映射）随号池同步，改名/改配额/删除也会传播；上游启闭与签到规则按设备各自独立
+            </div>
+            <div class="s-desc" style="color: var(--text-3); margin-top: 2px">
+              压缩包用上面的 WebDAV 密码加密（AES-256-GCM），各设备密码须一致
             </div>
             <div class="s-desc" style="margin-top: 2px" v-if="poolsync">
               <span :style="{ color: poolsync.configured ? 'var(--ok)' : 'var(--warn)' }">{{ poolsync.configured ? "已就绪" : "未配置" }}</span>
@@ -247,7 +408,24 @@ onUnmounted(() => {
           <div style="display:flex;align-items:center;gap:10px; flex-shrink: 0">
             <span v-if="poolsyncMsg" class="hint">{{ poolsyncMsg }}</span>
             <button v-if="poolsync && !poolsync.configured" class="btn-outline" @click="gotoSharedForm">去配置</button>
-            <button v-else class="btn-outline" :disabled="poolsyncRunning || !poolsync" @click="runPoolsync">{{ poolsyncRunning ? "同步中…" : "立即同步号池" }}</button>
+            <button v-else class="btn-outline" :disabled="poolsyncRunning || !poolsync" @click="runPoolsync">{{ poolsyncRunning ? "同步中…" : "立即同步" }}</button>
+          </div>
+        </div>
+
+        <!-- 记忆中枢 -->
+        <div class="switch-row" style="align-items: flex-start">
+          <div class="s-left">
+            <div class="s-title">记忆中枢同步</div>
+            <div class="s-desc">把记忆文件夹整体打包上传/下载，按三方比对只搬变化的部分，冲突进队列等裁决 · 根目录 {{ shared.roots.memory || "/agenthub-memory" }}</div>
+            <div class="s-desc" style="margin-top: 2px" v-if="memSync">
+              <span :style="{ color: memSync.configured ? 'var(--ok)' : 'var(--warn)' }">{{ memSync.configured ? "已就绪" : "未配置" }}</span>
+              <template v-if="memSync.configured && memSync.lastSyncAt"> · 上次同步 {{ fmtAgoMs(memSync.lastSyncAt) }}</template>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px; flex-shrink: 0">
+            <span v-if="memSyncMsg" class="hint">{{ memSyncMsg }}</span>
+            <button v-if="memSync && !memSync.configured" class="btn-outline" @click="gotoSharedForm">去配置</button>
+            <button v-else class="btn-outline" :disabled="memSyncRunning || !memSync" @click="runMemSync">{{ memSyncRunning ? "同步中…" : "立即同步" }}</button>
           </div>
         </div>
       </div>

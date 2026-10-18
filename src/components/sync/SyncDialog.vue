@@ -59,10 +59,14 @@ onBeforeUnmount(stopPolling);
           <span><button class="icon-btn" :disabled="!canClose" @click="app.closeSyncDialog()">×</button></span>
         </el-tooltip>
       </div>
-      <div class="sync-dialog-status" :class="{ error: app.sync.stage === 'error', done: app.sync.stage === 'done' }">
-        <div class="status-line"><strong>{{ app.sync.stageLabel || "准备同步" }}</strong><span>{{ Math.round(app.sync.percent) }}%</span></div>
+      <div class="sync-dialog-status" :class="{ error: !!app.syncStartError || app.sync.stage === 'error', done: app.sync.stage === 'done' }">
+        <div class="status-line"><strong>{{ app.syncStartError ? "失败" : (app.sync.stageLabel || "准备同步") }}</strong><span>{{ Math.round(app.sync.percent) }}%</span></div>
         <div class="track"><div class="fill" :style="{ width: `${app.sync.percent}%` }"></div></div>
-        <p>{{ app.sync.message || "正在准备同步任务" }}</p>
+        <!-- syncStartError 排在前头是必需的，不是样式偏好：进度轮询每 600~1500ms 就把 app.sync
+             整份换成后端 progress（refreshProgress 里 this.sync = { ...progress }），而「启动被拒」
+             在后端 progress 里根本没有对应字段。只写 sync.message 的话理由最多亮一个轮询周期就被
+             冲掉，弹窗随即显示「正在准备同步任务」——被拒绝恰恰是最不该假装还在准备的时候。 -->
+        <p>{{ app.syncStartError || app.sync.message || "正在准备同步任务" }}</p>
       </div>
       <div class="sync-stages">
         <div v-for="(stage, index) in visibleStages" :key="stage.key" class="sync-stage" :class="{ active: index === currentIndex, done: index < currentIndex }">

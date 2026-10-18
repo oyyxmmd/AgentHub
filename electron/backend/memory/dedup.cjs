@@ -78,10 +78,11 @@ class DedupEngine {
 
   learnedList() {
     const list = this._learnedPairs();
+    // hash→标题 查一次备好：map 内闭包每次 find 都 prepare（≤500 对 × 2 次重新编译）
+    const find = this.service.index.db.prepare("SELECT id, title FROM mem WHERE hash = ? LIMIT 1");
     return list.map((key) => {
       const [a, b] = key.split("|");
-      const find = (hash) => this.service.index.db.prepare("SELECT id, title FROM mem WHERE hash = ? LIMIT 1").get(hash);
-      return { a, b, aTitle: find(a)?.title || "", bTitle: find(b)?.title || "" };
+      return { a, b, aTitle: find.get(a)?.title || "", bTitle: find.get(b)?.title || "" };
     });
   }
 
@@ -186,7 +187,9 @@ class DedupEngine {
       "【新记忆】",
       `标题：${newItem.title}`,
       `内容：${String(newItem.body || "").slice(0, 800)}`,
-      `项目：${newItem.project || "-"}  标签：${(newItem.tags || []).join(",")}`,
+      // tags 列在 mem 表里是逗号分隔字符串（不是数组）：直接 .join 会抛 TypeError，
+      // 被 scanAll 的 catch 吞掉后 continue 不标 done，该行永远卡在 pending 无限重试
+      `项目：${newItem.project || "-"}  标签：${Array.isArray(newItem.tags) ? newItem.tags.join(",") : String(newItem.tags || "")}`,
       "",
       "【已有记忆】",
       ...candidates.map((c) => `[${c.id}] 标题：${c.title}\n内容：${String(c.summary || "").slice(0, 300)}`),
@@ -238,8 +241,13 @@ class DedupEngine {
     // 学习表本轮不会变化（scanAll 内不调用 _learn），在循环外读一次即可：
     // 放进循环会让每行都 JSON.parse 一次最长 500 条的数组，几万条巡检退化成 O(N×M)
     const learned = this._learnedPairs();
-    // 每行至少执行一次的标记语句：巡检热路径上原地 prepare 等于每行重新编译 SQL，循环外备好
+    // 每行至少执行一次的标记语句 + 同对判重语句：巡检热路径上原地 prepare 等于每行重新编译 SQL，循环外备好
     const markDone = db.prepare("UPDATE mem SET dedup_status = 'done' WHERE id = ?");
+    const dupPendingStmt = db.prepare(
+      "SELECT id FROM review_queue WHERE kind = 'dedup' AND status = 'pending' AND json_extract(payload, '$.kind') = ? AND json_extract(payload, '$.newId') = ? AND json_extract(payload, '$.targetId') = ?",
+    );
+    // token 记账口径：emit/返回的是本轮增量，历史累计值会让调度器的「每轮 token」统计虚高
+    const tokensBefore = this.tokensUsed;
     for (const row of pending) {
       scanned++;
       if (onProgress && (scanned % 5 === 0 || scanned === pending.length)) onProgress(scanned, pending.length);
@@ -277,15 +285,13 @@ class DedupEngine {
         const conf = Number(j.confidence) || 0.5;
         if (j.event === "ADD" || j.event === "NONE") continue;
         if (j.event === "UPDATE" && conf >= autoUpdate && cfg["timeline.requireConfirm"] === false) {
-          await this.service.markSuperseded(target.id, row.id, j.reason || "去重自动合并（高置信）");
-          merged++;
+          const r = await this.service.markSuperseded(target.id, row.id, j.reason || "去重自动合并（高置信）");
+          if (r.ok) merged++;
+          else this.emit({ type: "dedup", detail: `自动合并失败（保留原状）：${String(r.message || "").slice(0, 80)}` });
         } else {
           // 同一对 (kind,newId,targetId) 已在待确认队列就不再重复进队：
           // 巡检每轮都会重扫 pending 条目，不判重会把队列刷出 N 份相同的确认项
-          const dupPending = db.prepare(
-            "SELECT id FROM review_queue WHERE kind = 'dedup' AND status = 'pending' AND json_extract(payload, '$.kind') = ? AND json_extract(payload, '$.newId') = ? AND json_extract(payload, '$.targetId') = ?",
-          ).get(j.event, row.id, target.id);
-          if (dupPending) continue;
+          if (dupPendingStmt.get(j.event, row.id, target.id)) continue;
           const dedupPayload = {
             kind: j.event,
             newId: row.id,
@@ -303,15 +309,24 @@ class DedupEngine {
       }
       markDone.run(row.id);
     }
-    this.emit({ type: "dedup", scanned, merged, queued, tokens: this.tokensUsed });
-    return { scanned, merged, queued, acted: merged + queued, tokens: this.tokensUsed };
+    const roundTokens = this.tokensUsed - tokensBefore;
+    this.emit({ type: "dedup", scanned, merged, queued, tokens: roundTokens });
+    return { scanned, merged, queued, acted: merged + queued, tokens: roundTokens };
   }
 
   /** 写入路径的异步补判（L3→L4），memory_write 返回后调用 */
   async resolveQueued(id) {
     const row = this.service.index.db.prepare("SELECT * FROM mem WHERE id = ?").get(id);
     if (!row) return { ok: false };
-    const cand = this.candidateByBm25(row.title, row.project, 5).filter((c) => c.id !== id);
+    // 隐私白名单（与 scanAll 同口径）：自身是 localOnly 项目的不进 LLM；
+    // 候选是 localOnly 项目的也不进 prompt——否则写入路径会把隐私项目内容送进模型
+    const only = this.flat()["privacy.localOnlyProjects"];
+    const isLocalOnly = (r) => !!(Array.isArray(only) && only.length && r && r.project && only.includes(r.project));
+    if (isLocalOnly(row)) {
+      this.service.index.db.prepare("UPDATE mem SET dedup_status = 'done' WHERE id = ?").run(id);
+      return { ok: true, action: "add" };
+    }
+    const cand = this.candidateByBm25(row.title, row.project, 5).filter((c) => c.id !== id && !isLocalOnly(c));
     if (!cand.length) return { ok: true, action: "add" };
     let judgements = [];
     try {
@@ -328,9 +343,12 @@ class DedupEngine {
     const conf = Number(target.confidence) || 0.5;
     const autoUpdate = Number(this.flat()["dedup.l4.autoUpdateThreshold"] ?? 0.8);
     if (target.event === "UPDATE" && conf >= autoUpdate && this.flat()["timeline.requireConfirm"] === false) {
-      await this.service.markSuperseded(target.target_id, id, target.reason || "去重自动合并");
-      this.service.index.db.prepare("UPDATE mem SET dedup_status = 'merged' WHERE id = ?").run(id);
-      return { ok: true, action: "merged", targetId: target.target_id };
+      const r = await this.service.markSuperseded(target.target_id, id, target.reason || "去重自动合并");
+      if (r.ok) {
+        this.service.index.db.prepare("UPDATE mem SET dedup_status = 'merged' WHERE id = ?").run(id);
+        return { ok: true, action: "merged", targetId: target.target_id };
+      }
+      // 合并失败（只读/记忆不存在）：回落人工队列，不静默丢弃
     }
     const dedupPayload = {
       kind: target.event,
@@ -351,7 +369,7 @@ class DedupEngine {
     const byStatus = db.prepare("SELECT dedup_status AS s, COUNT(*) AS c FROM mem GROUP BY dedup_status").all();
     const total = byStatus.reduce((s, r) => s + r.c, 0) || 1;
     const get = (k) => (byStatus.find((r) => r.s === k) || { c: 0 }).c;
-    const queued = db.prepare("SELECT COUNT(*) AS c FROM review_queue WHERE status = 'pending'").get().c;
+    const queued = db.prepare("SELECT COUNT(*) AS c FROM review_queue WHERE status = 'pending' AND kind = 'dedup'").get().c;
     const skipped = get("done");
     return {
       total,
@@ -383,9 +401,18 @@ class DedupEngine {
     }
     if (!data || typeof data !== "object") return { ok: false, message: "队列项数据损坏，无法解析" };
     const svc = this.service;
+    // 引用记忆已消失（被删除/清理）：除「忽略」外的动作都没有可执行对象，
+    // 作废收口，不让用户在"处理失败"上反复点击（与 index.resolveReview 同口径）
+    if (action !== "dismiss" && (!data.targetId || !data.newId || !svc.getById(data.targetId) || !svc.getById(data.newId))) {
+      // 只读库写不进作废标记：如实失败，不能报"已作废"却没落库
+      if (!svc.index.reviewResolve(id, "stale")) return { ok: false, message: "索引库来自更新版本的 AgentHub，当前处于只读模式：请升级应用后再操作" };
+      return { ok: true, stale: true, message: "建议引用的记忆已不存在（可能已被删除或并入其它记忆），该建议已自动作废" };
+    }
     if (action === "adoptNew") {
-      // DELETE 也需人工确认才会走到这，两臂同处理：采纳新记忆 = 把旧记忆标失效
-      await svc.markSuperseded(data.targetId, data.newId, data.reason || "人工采纳新记忆");
+      // DELETE 也需人工确认才会走到这，两臂同处理：采纳新记忆 = 把旧记忆标失效。
+      // 失败不 resolve——队列项保留，用户可重试（曾经的写法直接 resolve，标记失败被静默吞掉）
+      const r = await svc.markSuperseded(data.targetId, data.newId, data.reason || "人工采纳新记忆");
+      if (!r.ok) return { ok: false, message: r.message || "标记旧记忆失效失败，队列项保留" };
       svc.index.reviewResolve(id, "adoptNew");
       return { ok: true };
     }
@@ -393,14 +420,17 @@ class DedupEngine {
       const target = svc.getById(data.targetId);
       const fresh = svc.getById(data.newId);
       if (target && fresh) {
-        // 把新记忆的来源并入旧记忆，然后删掉新记忆
+        // 把新记忆的来源并入旧记忆，然后删掉新记忆。
+        // 两步都必须校验：updateMemory 失败就删新记忆 = 数据丢失（曾经的写法正是如此）
         const targetBody = (target.body || "").trim();
         const freshBody = (fresh.body || "").trim();
         const merged = freshBody
           ? (targetBody ? `${targetBody}\n\n（来自 ${fresh.id} · ${fresh.agent || "未知"}）\n${freshBody}` : freshBody)
           : targetBody;
-        await svc.updateMemory(target.id, { body: merged });
-        await svc.deleteMemory(fresh.id);
+        const ur = await svc.updateMemory(target.id, { body: merged });
+        if (!ur.ok) return { ok: false, message: `${ur.message || "来源并入失败"}，新记忆未删除，队列项保留` };
+        const dr = await svc.deleteMemory(fresh.id);
+        if (!dr.ok) return { ok: false, message: `${dr.message || "删除新记忆失败"}，来源已并入旧记忆` };
       }
       svc.index.reviewResolve(id, "keepOld");
       return { ok: true };
@@ -414,8 +444,11 @@ class DedupEngine {
       return { ok: true };
     }
     if (action === "merge" && payload && typeof payload.text === "string") {
-      await svc.updateMemory(data.newId, { body: payload.text });
-      await svc.markSuperseded(data.targetId, data.newId, "人工编辑合并");
+      // 先写新记忆再标旧失效：任一步失败都不 resolve，两步都成功才收口
+      const ur = await svc.updateMemory(data.newId, { body: payload.text });
+      if (!ur.ok) return { ok: false, message: `${ur.message || "编辑合并写入失败"}，队列项保留` };
+      const r = await svc.markSuperseded(data.targetId, data.newId, "人工编辑合并");
+      if (!r.ok) return { ok: false, message: `${r.message || "标记旧记忆失效失败"}，队列项保留` };
       svc.index.reviewResolve(id, "merged");
       return { ok: true };
     }

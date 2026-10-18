@@ -245,11 +245,16 @@ async function execute(ctx, prepared, credentials) {
     await driveStream(tctx, stream, guard, history, emit);
     return { status: 200, planLimit: false };
   } catch (error) {
-    if (!guard.settled) {
+    // spurious 判定（对齐参照实现 Drop）：round 从未成功（guard.active=false）时
+    // conversation 上没有进行中的轮次，向一个从未 round 过的 conversation 发 turn/stop
+    // 是多余的往返 + 噪声——只 close（其内部 active=false 不报终态，只放开占用）
+    if (!guard.settled && guard.active) {
       // 未显式收尾的兜底（等价参照实现的 Drop）：打断上游轮次 + 回报 canceled，
       // 上游硬约束要求 conversation 不能停在「执行中」
       log.verbose(`轮次未显式收尾（异常路径），补 stop + canceled：${(error && error.message) || ""}`);
       await guard.interrupt();
+      await guard.close("canceled", null);
+    } else if (!guard.settled) {
       await guard.close("canceled", null);
     }
     throw error;

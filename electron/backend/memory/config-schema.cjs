@@ -36,6 +36,7 @@ const SCHEMA = {
   "search.weightImportance":{ type: "number",  def: 0.1,  min: 0, max: 1, step: 0.05, label: "权重·重要度", group: "检索", hot: true, tier: "internal" },
   "search.weightAffinity":  { type: "number",  def: 0.15, min: 0, max: 1, step: 0.05, label: "权重·项目/Agent 亲和", group: "检索", hot: true, tier: "internal" },
   "search.weightGraph":     { type: "number",  def: 0.05, min: 0, max: 1, step: 0.05, label: "权重·图扩散", group: "检索", hot: true, tier: "internal" },
+  "search.weightHeat":      { type: "number",  def: 0.1,  min: 0, max: 1, step: 0.05, label: "权重·使用热度（命中越多越靠前，0=关闭）", group: "检索", hot: true, tier: "internal" },
   "search.weightLayer":     { type: "number",  def: 0.05, min: 0, max: 1, step: 0.05, label: "权重·层级", group: "检索", hot: true, tier: "internal" },
   "search.synonymsEnabled": { type: "boolean", def: true, label: "同义词表扩展", group: "检索", hot: true, tier: "basic" },
   "search.graphExpansionDepth": { type: "number", def: 1, min: 0, max: 3, label: "图扩散深度", group: "检索", hot: true, tier: "internal" },

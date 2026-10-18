@@ -42,8 +42,9 @@ async function runTests() {
         if (id === "mem_new") return { id: "mem_new", body: "新记忆补充正文内容", agent: "zcode" };
         return null;
       },
-      updateMemory: async (id, patch) => { updatedPayload = patch.body; },
-      deleteMemory: async (id) => { deletedId = id; },
+      // 生产代码 keepOld 走「两步都必须校验」：mock 必须回 {ok:true}，否则 !ur.ok 会抛 TypeError
+      updateMemory: async (id, patch) => { updatedPayload = patch.body; return { ok: true }; },
+      deleteMemory: async (id) => { deletedId = id; return { ok: true }; },
     };
 
     const dedup = new DedupEngine({ service: mockService, client: null });
@@ -245,9 +246,63 @@ async function runTests() {
     assert.strictEqual(redactRes.hits.length, 0, "恶意 ReDoS 正则必须被安全规则编译器拒绝");
     console.log("  ✓ [Test 8 通过] ReDoS 嵌套量词被成功识别并过滤，主进程事件循环得到保护！");
 
+    // ----------------------------------------------------
+    // 测试 9: 验证 indexer.cjs 链接分型 (FIX-09: file: 引用不得计为断链)
+    // ----------------------------------------------------
+    console.log("\n[Test 9] 验证 indexer.cjs 引用分型：file:/topic:/project:/mem 各归其类...");
+    const idx9 = svc.index;
+    idx9.upsertOne({
+      id: "mem_link_probe", path: "notes/link-probe.md", title: "Link Probe",
+      refs: ["file:Tex/x.tex", "topic:虚拟化", "project:thesis", "mem_absent_node"],
+    });
+    const kinds = Object.fromEntries(
+      idx9.db.prepare("SELECT dst, kind FROM mem_link WHERE src = 'mem_link_probe'").all().map((r) => [r.dst, r.kind]),
+    );
+    assert.strictEqual(kinds["file:Tex/x.tex"], "file", "file: 引用必须归为 kind='file'，否则会被断链口径误统计");
+    assert.strictEqual(kinds["虚拟化"], "topic", "topic: 引用必须归为 kind='topic'");
+    assert.strictEqual(kinds["thesis"], "project", "project: 引用必须归为 kind='project'");
+    assert.strictEqual(kinds["mem_absent_node"], "mem", "无前缀引用按记忆间链接处理");
+    // 断链口径只认 kind='mem'：file 链接不该被算进去，真悬空的 mem 链接仍要被抓到
+    const probeBroken = idx9.db.prepare(`
+      SELECT COUNT(*) AS c FROM mem_link l
+      WHERE l.src = 'mem_link_probe' AND l.kind = 'mem'
+        AND NOT EXISTS (SELECT 1 FROM mem m WHERE m.id = l.dst)
+    `).get().c;
+    assert.strictEqual(probeBroken, 1, "仅真正的悬空 mem 链接计入断链，file 引用必须排除");
+    idx9.removeByPath("notes/link-probe.md");
+    console.log("  ✓ [Test 9 通过] file: 引用不再被误报为断链，真悬空链接仍能检出！");
+
+    // ----------------------------------------------------
+    // 测试 10: 验证 service.cjs init 的一次性迁移 (FIX-09 配套: 存量误标行启动自愈)
+    // ----------------------------------------------------
+    console.log("\n[Test 10] 验证存量 file: 误标行在 service.init 时一次性改标...");
+    // 造一行「旧版误标」数据：kind='mem' 但 dst 是 file: 前缀（真实库里全是这么误标出来的）
+    idx9.setMeta("mem_link_file_kind_v1", ""); // 清掉闸门，让迁移在下面的新实例里能跑
+    idx9.db.prepare("INSERT OR REPLACE INTO mem_link (src, dst, kind) VALUES ('mem_stale_probe', 'file:stale.tex', 'mem')").run();
+    const staleBefore = idx9.db.prepare("SELECT kind FROM mem_link WHERE src = 'mem_stale_probe' AND dst = 'file:stale.tex'").get();
+    assert.strictEqual(staleBefore.kind, "mem", "前置状态必须是旧版误标的 kind='mem'");
+    svc.close();
+    // 重新开一个 service 实例：init() 里的一次性迁移必须把这行改标
+    const svc2 = new MemoryService(tmpDir, dummyCfg, { deviceId: "unit-test-dev" }).init();
+    const staleAfter = svc2.index.db.prepare("SELECT kind FROM mem_link WHERE src = 'mem_stale_probe' AND dst = 'file:stale.tex'").get();
+    assert.strictEqual(staleAfter.kind, "file", "启动时的一次性迁移必须把 file: 误标行改判为 kind='file'");
+    assert.strictEqual(svc2.index.getMeta("mem_link_file_kind_v1"), "done", "迁移完成后必须落下 meta 闸门，避免每次启动重复执行");
+    // 迁移之后再写入的新链接必须直接就是正确分型（走源码修复路径，不靠迁移兜底）
+    svc2.index.upsertOne({
+      id: "mem_link_probe2", path: "notes/link-probe2.md", title: "Link Probe 2",
+      refs: ["file:Tex/y.tex", "mem_still_absent"],
+    });
+    const freshKinds = Object.fromEntries(
+      svc2.index.db.prepare("SELECT dst, kind FROM mem_link WHERE src = 'mem_link_probe2'").all().map((r) => [r.dst, r.kind]),
+    );
+    assert.strictEqual(freshKinds["file:Tex/y.tex"], "file", "迁移后的新数据直接走修复后的分型");
+    assert.strictEqual(freshKinds["mem_still_absent"], "mem", "无前缀引用仍按记忆间链接处理");
+    svc2.close();
+    console.log("  ✓ [Test 10 通过] 存量误标行启动自愈，meta 闸门防重复，新数据直接正确分型！");
+
     svc.close();
     console.log("\n=========================================");
-    console.log("🎉 全部 8 项纯代码自动化回归测试 100% 通过！");
+    console.log("🎉 全部 10 项纯代码自动化回归测试 100% 通过！");
     console.log("=========================================\n");
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}

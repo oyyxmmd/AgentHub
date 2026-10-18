@@ -1,0 +1,487 @@
+{
+  "stream-ok": {
+    "id": "stream-ok",
+    "desc": "流式正常：role→正文→usage→finish→[DONE]",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"想想\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"，世界\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":5,\"total_tokens\":12}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 7,
+        "completionTokens": 5,
+        "error": ""
+      }
+    ]
+  },
+  "nonstream-ok": {
+    "id": "nonstream-ok",
+    "desc": "非流式正常：同一批事件由 Aggregator 聚成一条 message",
+    "status": 200,
+    "body": "{\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"你好，世界\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"p\\\":1}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 3,
+        "completionTokens": 2,
+        "error": ""
+      }
+    ]
+  },
+  "refresh-401": {
+    "id": "refresh-401",
+    "desc": "401 → single-flight 刷新成功 → 同账号重发",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"刷新后的回答\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": ""
+      }
+    ]
+  },
+  "rate-429-rotate": {
+    "id": "rate-429-rotate",
+    "desc": "第一把 Key 吃 429（无明示重置时间）→ 退避重试同号 → 仍失败则换第二把",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"换号后成功\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [
+      {
+        "fn": "coolAccountMs",
+        "id": "acc1",
+        "bucket": "0",
+        "detail": "Too Many Requests"
+      }
+    ],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      },
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      },
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": "acc1"
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "二号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": ""
+      }
+    ]
+  },
+  "model-rate-6004": {
+    "id": "model-rate-6004",
+    "desc": "6004 模型级限流（带『将在 … 重置』墙钟）→ 罚账号×模型而非整号，换号继续",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"另一个号答了\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [
+      {
+        "fn": "coolAccountModel",
+        "id": "acc1",
+        "model": "glm-4.6",
+        "bucket": "1d+",
+        "reason": "上游返回 6004，将在 2030-01-01 04:00 重置"
+      }
+    ],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      },
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": "acc1"
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "二号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": ""
+      }
+    ]
+  },
+  "plan-limit-after-delta": {
+    "id": "plan-limit-after-delta",
+    "desc": "积分耗尽但以流中 error 到达且正文已出线 → 绝不换号重发（否则正文拼接），就地收尾",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"半截\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"credits insufficient\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [
+      {
+        "fn": "coolAccount",
+        "id": "acc1",
+        "kind": "credit",
+        "detail": ""
+      }
+    ],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": "notice:truncated:credits insufficient"
+      }
+    ]
+  },
+  "plan-limit-cold": {
+    "id": "plan-limit-cold",
+    "desc": "积分耗尽且一条内容都没出 → 换号，客户端完全无感",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好号答的\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [
+      {
+        "fn": "coolAccount",
+        "id": "acc1",
+        "kind": "credit",
+        "detail": ""
+      }
+    ],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      },
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": "acc1"
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "二号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": ""
+      }
+    ]
+  },
+  "waf-channel-block": {
+    "id": "waf-channel-block",
+    "desc": "WAF Block Page 是渠道级故障：短退避整个渠道，不逐个冷却账号（followup 验退避真的生效）",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"[ah:REQID] 已尝试 1 个渠道（trae(一号)）均不可用：渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
+    "followups": [
+      {
+        "status": 200,
+        "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"[ah:REQID] 未发起任何上游请求（候选渠道号池为空或降级中）：已尝试 1 个渠道（trae(渠道降级中)）均不可用：渠道 trae 降级中（WAF Block），120s 后回切重试\",\"type\":\"upstream_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n",
+        "picks": []
+      }
+    ],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "glm-4.6",
+        "status": 503,
+        "error": "[ah:REQID] 已尝试 1 个渠道（trae(一号)）均不可用：渠道 trae 被上游边缘拦截（WAF Block Page）：与账号无关，已跳备选渠道"
+      },
+      {
+        "channel": "",
+        "accountName": "",
+        "model": "glm-4.6",
+        "status": 503,
+        "error": "[ah:REQID] 未发起任何上游请求（候选渠道号池为空或降级中）：已尝试 1 个渠道（trae(渠道降级中)）均不可用：渠道 trae 降级中（WAF Block），120s 后回切重试"
+      }
+    ]
+  },
+  "stream-error-inflight": {
+    "id": "stream-error-inflight",
+    "desc": "流中出现 error 事件且已出线 → 把 OpenAI 错误对象注入流并照常 [DONE]",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"前半段\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"上游中断\",\"type\":\"upstream_error\",\"param\":null,\"code\":9}}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": "notice:truncated:上游中断"
+      }
+    ]
+  },
+  "noise-only-frames": {
+    "id": "noise-only-frames",
+    "desc": "全是空噪声帧后吃流中 error：噪声不得算已出线——必须静默换号，客户端看不到错误帧",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"真内容\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      },
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": "acc1"
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "二号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": ""
+      }
+    ]
+  },
+  "nonstream-plan-limit-rotate": {
+    "id": "nonstream-plan-limit-rotate",
+    "desc": "非流式 + 第一个号吐出半截正文后判积分耗尽 → 换号重发：Aggregator 必须重建，否则两号正文拼进同一条 content（这条场景是变异测出来的：没有它，删掉 resetAttemptState 全绿）",
+    "status": 200,
+    "body": "{\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"换号后的正文\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}",
+    "followups": [],
+    "coolLog": [
+      {
+        "fn": "coolAccount",
+        "id": "acc1",
+        "kind": "credit",
+        "detail": ""
+      }
+    ],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      },
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": "acc1"
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "二号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 4,
+        "completionTokens": 6,
+        "error": ""
+      }
+    ]
+  },
+  "fallback-comment-stream": {
+    "id": "fallback-comment-stream",
+    "desc": "模型回退明示（流式）：头已冲刷，改发 SSE 注释帧，客户端可见但不进正文",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"no-such-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n: fallback no-such-model -> glm-4.6\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"no-such-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"回退后答\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"no-such-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "no-such-model",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": "fallback→glm-4.6"
+      }
+    ]
+  },
+  "fallback-json-nonstream": {
+    "id": "fallback-json-nonstream",
+    "desc": "模型回退明示（非流式）：只挂响应头，绝不得往 JSON 正文里塞注释帧",
+    "status": 200,
+    "body": "{\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion\",\"created\":CREATED,\"model\":\"no-such-model\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"回退后答\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "no-such-model",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": "fallback→glm-4.6"
+      }
+    ]
+  },
+  "reasoning-tail-no-finish": {
+    "id": "reasoning-tail-no-finish",
+    "desc": "思考链两段且第二段落在合批时间窗内、上游没发 finish 就结束：尾段必须靠收尾冲刷才出得来",
+    "status": 200,
+    "body": "data: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"第一段思考\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"尾段\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion.chunk\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\ndata: [DONE]\n\n",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": ""
+      }
+    ]
+  },
+  "finish-without-reason": {
+    "id": "finish-without-reason",
+    "desc": "finish 事件不带 reason：非流式的 finish_reason 必须沿用累加值（默认 stop），不能被本帧的 undefined 覆盖",
+    "status": 200,
+    "body": "{\"id\":\"chatcmpl-REQID\",\"object\":\"chat.completion\",\"created\":CREATED,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"正文\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [
+      {
+        "channel": "trae",
+        "strategy": "expire_first",
+        "excluded": ""
+      }
+    ],
+    "usageRows": [
+      {
+        "channel": "trae",
+        "accountName": "一号",
+        "model": "glm-4.6",
+        "status": 200,
+        "promptTokens": 8,
+        "completionTokens": 1,
+        "error": ""
+      }
+    ]
+  },
+  "unknown-model": {
+    "id": "unknown-model",
+    "desc": "模型无人拥有且没配有回退 → 400 并在提示里列出可用模型",
+    "status": 400,
+    "body": "{\"error\":{\"message\":\"模型 \\\"no-such-model\\\" 不在任何渠道目录中。可用模型：Doubao-Seed-Evolving, Doubao-Seed-2.1-Pro, seed-code-pro-0430, Doubao-Seed-2.1-Turbo, computer_use_subagent, Doubao-Seed-2.0-Code, browser_use_subagent, glm-5.3, glm-5.2, glm-5-turbo, glm-5, DeepSeek-V4-Flash-Official, DeepSeek-V4-Flash, DeepSeek-V4-Pro-Official, DeepSeek-V4-Pro, kimi-k3, kimi-k2.7-code, kimi-k2.6, minimax-m3, qwen3.8-max, qwen-3.7-plus, sagitta, aquila, custom_model_gemini, custom_model_placeholder, custom_model_1M_text, custom_model_1M, custom_model_doubao_1M, custom_model_doubao_256k, custom_model_kimi, custom_model_claude, custom_model_gpt-5, custom_model_no-fc, custom_model_deepseek_chat, custom_model_deepseek_reasoner, custom_model_deepseek_v4, file_search_agent, explore_sub_agent_v2, summary, deepseek-v4, glm-4.6, kimi-k2, doubao-seed-1.6, qwen3-coder, minimax-m2, claude-sonnet-4.5, claude-opus-4.1, gpt-5, gpt-5-codex, hy3-preview, deepseek-v3.2, default-model, fast-model, balanced-model, primary-model, deep-model, kimi-k2.8-preview, deepseek-v4.1-flash, deepseek-v4.1-flash-sg, gpt-6-astra, hy4-preview-f, hy4-preview, hy3, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gemini-3.5-flash, raccoon-chat-ml-5-5, deepseek-ai/DeepSeek-V4.1-Flash, deepseek-ai/DeepSeek-V4-Flash-0731, deepseek-ai/DeepSeek-V4-Pro, deepseek-ai/DeepSeek-V4-Pro-0813, ZhipuAI/GLM-5.3-Flash, ZhipuAI/GLM-5.2, ZhipuAI/GLM-4.7-Flash, Qwen/Qwen3.8-Flash-Next, Qwen/Qwen3.8-27B, Qwen/Qwen3.5-397B-A17B, Qwen/Qwen3.5-122B-A10B, Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-27B, MiniMax/MiniMax-M3, MiniMax/MiniMax-M1-80k, meituan-longcat/LongCat-Flash-Lite, stepfun-ai/Step-3.5-Flash, stepfun-ai/Step-3.7-Flash, Shanghai_AI_Laboratory/Intern-S1, Shanghai_AI_Laboratory/Intern-S2-Preview, mistralai/Mistral-Large-Instruct-2407, nex-agi/Nex-N2.5-Pro, nex-agi/Nex-N2.5-mini, deepseek-flash, deepseek-v4-flash-vision-exp, glm-5.3-flash, glm-5.3-flashx, MiniMax-M3.1-Flash-Preview, MiniMax-M2.7, qwen3.5-plus-2026-04-20, qwen3.6-plus, doubao-seed-2-1-turbo-260628, kimi-k2.5, qwen3.7-plus, doubao-seed-2-0-code-preview-260215, doubao-seed-2-1-pro-260915, qwen3.8-flash, qwen3.8-omni-flash, glm-5v-turbo, glm-5.1, qwen3.7-max, kimi-k2.7-code-highspeed, GLM-4.7, GLM-4.5-Air, auto, qfmodel, qmodel_38max, qmodel, q37fmodel, qmodel_latest, dfmodel, dmodel, gfmodel, gmodel, gm51model, kmodel, kmodel_latest, mmodel, cline-free/deepseek-v4.1-flash, cline-free/muse-spark-1.3-contributor, cline-free/solar-pro4, z-ai/glm-5.3-flash, poolside/laguna-s-2.1:free, cline-pass/deepseek-v4.1-flash, cline-pass/deepseek-v4-pro, cline-pass/glm-5.3, cline-pass/kimi-k3, cline-pass/qwen3.8-max\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"model_not_found\"}}",
+    "followups": [],
+    "coolLog": [],
+    "pickLog": [],
+    "usageRows": [
+      {
+        "channel": "",
+        "accountName": "",
+        "model": "no-such-model",
+        "status": 400,
+        "error": "unknown model"
+      }
+    ]
+  }
+}

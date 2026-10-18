@@ -1,5 +1,5 @@
 // 反代网关跨渠道故障转移自测（v1.40.0）：503 耗尽 → 渠道降级 → 请求内跳备选 → 降级避让 →
-// 半开回切 → 指数退避翻倍 → failover 开关 → 全渠道耗尽带轨迹报错
+// 半开回切 → 指数退避翻倍 → failover 开关 → 全渠道耗尽带轨迹报错 → 上限归一化/每模型预算边界（T0）
 // 用法：ELECTRON_RUN_AS_NODE=1 electron tools/proxy-failover-selftest.cjs <临时数据目录>
 //
 // 时序语义说明：本脚本用 base=1500ms 的压缩节奏，让「半开探测再失败」落在 noteChannelFail
@@ -31,6 +31,44 @@ async function main() {
   store.open();
   rules.init();
   assert(Object.keys(server.channelHealthSnapshot()).length === 0, "初始渠道健康快照为空");
+
+  // ===== T0 渠道数上限归一化 / 每模型上游尝试预算（纯函数边界；failover 契约的前置） =====
+  assert(
+    typeof server.normalizeChannelFailoverMax === "function" && typeof server.perModelUpstreamBudget === "function",
+    "T0 server 应导出故障转移规模纯函数（自测契约）"
+  );
+  for (const [m, want] of [[1, 6], [2, 6], [3, 6], [4, 6], [5, 6], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11]])
+    assert(
+      server.perModelUpstreamBudget(true, m) === want,
+      `T0 预算 failover=on 上限=${m} 应为 ${want}，实际 ${server.perModelUpstreamBudget(true, m)}`
+    );
+  assert(server.perModelUpstreamBudget(false, 3) === 6 && server.perModelUpstreamBudget(false, 10) === 6, "T0 failover 关：预算恒 6");
+  assert(
+    server.normalizeChannelFailoverMax(100) === 10 && server.perModelUpstreamBudget(true, 100) === 11,
+    "T0 手改 100 → 上限钳 10、预算 11"
+  );
+  assert(
+    [0, -5, NaN, "abc", 2.5].every((v) => server.perModelUpstreamBudget(true, v) === 6),
+    "T0 脏值（0/负数/NaN/字母/小数）一律回存量预算 6"
+  );
+  assert(
+    server.normalizeChannelFailoverMax(0) === 3 && server.normalizeChannelFailoverMax("") === 3 &&
+      server.normalizeChannelFailoverMax(NaN) === 3 && server.normalizeChannelFailoverMax(null) === 3 &&
+      server.normalizeChannelFailoverMax(-5) === 1,
+    "T0 脏值落点与旧运行时逐值一致（0/空/NaN/null → 3，负数 → 1）"
+  );
+  assert([1, 2, 3, 4, 5].every((m) => server.normalizeChannelFailoverMax(m) === m), "T0 存量档 1~5 归一化逐值不变");
+  // 源码契约（防「导出了但没接线」；先例：modelscope 自测读源文本断言）：maxTries 与队列截断必须消费上述纯函数。
+  // 空白折叠后再匹配（正向正则另容错括号内侧空白）：换行/缩进调整不应误伤契约断言
+  const srvFlat = fs
+    .readFileSync(path.join(__dirname, "..", "electron", "backend", "proxy", "server.cjs"), "utf8")
+    .replace(/\s+/g, " ");
+  assert(
+    /const maxTries = perModelUpstreamBudget\(\s*settings\.channelFailover,\s*settings\.channelFailoverMax\s*\)/.test(srvFlat),
+    "T0 maxTries 必须消费 perModelUpstreamBudget"
+  );
+  assert(!/maxTries = 6 \* modelChain\.length/.test(srvFlat), "T0 预算算式不得回潮为 6 * modelChain.length 硬编码");
+  assert(/normalizeChannelFailoverMax\(\s*settings\.channelFailoverMax\s*\)/.test(srvFlat), "T0 队列截断必须消费 normalizeChannelFailoverMax");
 
   // ===== 假上游：trae / workbuddy_ai 两个渠道的 chatUrl 都指过来，mode 可切换 boom/ok =====
   const http = require("node:http");
@@ -113,6 +151,11 @@ async function main() {
     humanizeJitter: false, disabledModels: [],
     channelFailover: true, channelFailoverMax: 3,
     channelCooldownMs: 1500, channelCooldownCapMs: 6000,
+    // 瞬时错误同账号原地重发（Step 1 引入）：本套自测的 T1/T2/T4a/T4b/T5a/T5b/T6 的
+    //「渠道级打 N 次」断言钉的是 5xx 直接换号的旧节奏——原地重发会把主渠道真实命中
+    // 从 1 次抬成 2 次（首发 + 重发），让降级/半开的打点计数与断言失配。
+    // 置 0 关掉原地重发，保持这套既有契约逐值不变（原地重发由独立场景另行核验）。
+    retrySameAccountCount: 0,
   };
   const sr = await server.start(() => cfg);
   assert(sr.ok, "网关启动: " + (sr.message || ""));
@@ -345,6 +388,43 @@ async function main() {
     const ownersRev = adapters.modelOwners("glm-5.3", { modelReverseAliases: { "glm-5.3": { raccoon: "sn-glm-5-3-flash" } } });
     assert(ownersRev[0] === "raccoon", "T10 反向映射命中的渠道排最前: " + ownersRev.join("/"));
     assert(ownersRev.length >= 2, "T10 反向映射不得收窄备选（实际 " + ownersRev.join("/") + "）");
+
+    // 历史 UI 曾写入自映射；配置残留时也必须跳过该渠道，不能把虚拟名透传给 CatPaw。
+    const realCatPaw = adapters.ADAPTERS.catpaw;
+    let catPawHits = 0;
+    adapters.ADAPTERS.catpaw = {
+      ...realCatPaw,
+      models: () => ["kimi-k3"],
+      stateful: () => true,
+      chatSession: async () => {
+        catPawHits++;
+        throw Object.assign(new Error("CatPaw should not receive a virtual reverse-alias name"), { status: 400 });
+      },
+    };
+    try {
+      cfg.modelReverseAliases = {
+        "rev-failover": { trae: "glm-5.3", workbuddy_ai: "glm-5.3", catpaw: "rev-failover" },
+      };
+      mode.trae = "ok";
+      // 前置用例（T1/T4a/T4b 的 3 次 500）会把 trae 账号打成账号级 5xx 熔断（连续 3 次 →
+      // 30 分钟冷却），压缩节奏下这个窗口不会自然过期；可用性优先排序会正确地绕开它落到
+      // 另一健康渠道。本用例的意图是「key 指到无有效映射渠道时落到有映射的 trae」，
+      // 故先复位该账号冷却，让断言保持确定性（与 T9 头部同款复位）
+      store.updateAccount(t1, { status: "online", coolUntil: 0, coolReason: "" });
+      store.updateKey(k.id, { route: "catpaw" });
+      const h10 = { ...hits };
+      rr = await call({ model: "rev-failover", stream: false, messages: bodyMsg });
+      const b10 = await rr.text();
+      assert(rr.status === 200, "T10 指定无效映射渠道时应落到有效渠道: " + rr.status + " " + b10.slice(0, 200));
+      assert(catPawHits === 0, "T10 自映射的 CatPaw 渠道不得收到请求");
+      assert(hits.trae === h10.trae + 1, "T10 实际请求打到已配置映射的 trae: " + JSON.stringify(hits));
+      row = store.recentRequests(1)[0];
+      assert(row.channel === "trae" && /rev→glm-5\.3/.test(row.error || ""), "T10 记账为 trae + rev→glm-5.3: " + row.error);
+      store.updateKey(k.id, { route: "auto" });
+      cfg.modelReverseAliases = {};
+    } finally {
+      adapters.ADAPTERS.catpaw = realCatPaw;
+    }
   }
 
   // ===== 收尾：恢复规则文件，关服务与假上游，清种子 =====
@@ -355,7 +435,7 @@ async function main() {
   store.deleteKey(k.id);
   store.removeAccount(t1);
   store.removeAccount(w1);
-  console.log("FAILOVER SELFTEST OK（跨渠道跳转 / 降级避让 / fixed 跳备选 / 半开翻倍 / 成功回切清零 / 开关 / 全渠道轨迹 / 渠道身份拒绝自救不罚号 / 真参数 400 不放宽 / 反向映射不收窄备选）");
+  console.log("FAILOVER SELFTEST OK（跨渠道跳转 / 降级避让 / fixed 跳备选 / 半开翻倍 / 成功回切清零 / 开关 / 全渠道轨迹 / 渠道身份拒绝自救不罚号 / 真参数 400 不放宽 / 反向映射不收窄备选 / 上限归一化与预算边界 T0）");
 }
 
 main()

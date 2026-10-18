@@ -36,7 +36,10 @@ const profileCache = require("./profile-cache.cjs");
 let service = null;
 let memCfg = null;
 let httpApi = null;
+let booting = false; // boot 重入闸（异步启动期间防连点）
 let access = null;
+/** 启动延后任务的定时器句柄：shutdown 时统一取消 */
+let bootTimers = [];
 let watcher = null;
 let watchTimer = null;
 let watchPending = null;
@@ -140,7 +143,9 @@ function flatSettings() {
 
 function init() {
   const framework = configMod.loadConfig();
-  if (framework.memory && framework.memory.enabled === false) {
+  // 启用开关唯一事实源 modules.memory.enabled（issue #91）；旧版 memory.enabled=false
+  // 已由 loadConfig 迁移进 modules，这里不再读旧字段
+  if (framework.modules && framework.modules.memory && framework.modules.memory.enabled === false) {
     return { enabled: false };
   }
   if (memCfg && service) return { enabled: true, root: rootDir };
@@ -246,36 +251,50 @@ function deviceId() {
 }
 
 async function boot() {
-  const r = init();
-  if (!r.enabled) return r;
+  // 重入闸（审查整改）：init 只保证服务对象存在，这里会无条件新建 HTTP API——
+  // 已在运行时再 boot 会旧实例被覆盖、新实例 EADDRINUSE，桥状态显示错乱
+  if (httpApi || booting) return { enabled: true, root: rootDir, booted: true };
+  booting = true;
   try {
-    httpApi = new MemoryHttpApi(service, runtimeFile(), { onEvent: (p) => emit(p) });
-    const started = await httpApi.start();
-    emit({ type: "bridge", running: true, port: started.port });
-  } catch (e) {
-    emit({ type: "bridge", running: false, message: String(e.message || e) });
-  }
-  startWatch();
-  if (scheduler) scheduler.start();
-  // 存量项目元数据自愈：老版本用显式项目名写入时不探测 Git，项目卡因此缺远程/本地路径。
-  // 延后到启动流程之外异步跑，且逐项目最多读少量文件——不能阻塞启动（曾因同步扫描主进程冻结数十秒）。
-  setTimeout(() => {
+    const r = init();
+    if (!r.enabled) return r;
     try {
-      const r = service && service.reconcileProjectMetadata();
-      if (r && r.healed) emit({ type: "projects", healed: r.healed });
+      httpApi = new MemoryHttpApi(service, runtimeFile(), { onEvent: (p) => emit(p) });
+      const started = await httpApi.start();
+      emit({ type: "bridge", running: true, port: started.port });
     } catch (e) {
-      emit({ type: "projects", healed: 0, message: String((e && e.message) || e) });
+      emit({ type: "bridge", running: false, message: String(e.message || e) });
     }
-  }, 6000);
-  if (flatSettings()["agents.autoVerify"] !== false) {
-    // 异步巡检，不阻塞启动
-    setTimeout(() => reconcileAgents().catch(() => {}), 4000);
+    startWatch();
+    if (scheduler) scheduler.start();
+    // 存量项目元数据自愈：老版本用显式项目名写入时不探测 Git，项目卡因此缺远程/本地路径。
+    // 延后到启动流程之外异步跑，且逐项目最多读少量文件——不能阻塞启动（曾因同步扫描主进程冻结数十秒）。
+    // 句柄存引用：shutdown 时取消，否则关闭 6 秒后 reconcile 仍在已关闭的 service 上跑
+    bootTimers = [
+      setTimeout(() => {
+        try {
+          const r = service && service.reconcileProjectMetadata();
+          if (r && r.healed) emit({ type: "projects", healed: r.healed });
+        } catch (e) {
+          emit({ type: "projects", healed: 0, message: String((e && e.message) || e) });
+        }
+      }, 6000),
+    ];
+    if (flatSettings()["agents.autoVerify"] !== false) {
+      // 异步巡检，不阻塞启动
+      bootTimers.push(setTimeout(() => reconcileAgents().catch(() => {}), 4000));
+    }
+    return r;
+  } finally {
+    booting = false;
   }
-  return r;
 }
 
 async function shutdown() {
   stopWatch();
+  // 取消启动延后任务：否则关闭 6 秒后 reconcile 仍在已关闭的 service 上跑
+  for (const t of bootTimers) clearTimeout(t);
+  bootTimers = [];
   // 先等在途任务收尾再关库：任务在已关闭的 db 上写索引会报错，MD 已写而索引缺行
   if (scheduler) await scheduler.stopAndDrain().catch(() => {});
   if (syncer && syncer.running) syncer.cancel();
@@ -291,6 +310,7 @@ async function shutdown() {
   syncer = null;
   dedupEngine = null;
   importer = null;
+  access = null;
   booted = false;
 }
 
@@ -389,7 +409,7 @@ function writeReport(kind, title, lines) {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${kind}-${new Date().toISOString().slice(0, 10)}.md`);
   const content = `# ${title}\n\n> 生成时间：${new Date().toLocaleString("zh-CN")}\n\n${lines.join("\n")}\n`;
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.tmp.${process.pid}`;
   fs.writeFileSync(tmp, content, "utf8");
   if (fs.existsSync(file)) fs.rmSync(file, { force: true });
   fs.renameSync(tmp, file);
@@ -610,13 +630,16 @@ function register(ipcMain) {
   ipcMain.handle("memory_index_rebuild", handle(() => need().withWrite(async () => {
     const total = need().store.walkMemoryFiles().length;
     emit({ type: "index", running: true, done: 0, total });
+    // sidecar 路径提到 try 外：catch 的失败清理要引用它，若声明在 try 内，
+    // require 失败时 catch 里会先抛 ReferenceError（TDZ），把「worker 不可用」的
+    // 真实原因盖掉，退化路径的 fallbackReason 变成无意义的 "sidecar is not defined"
+    const sidecar = path.join(configMod.dataDir(), "memory-rebuild-sidecar.sqlite");
     // 优先走 worker 建旁路库 + 事务换入：全量重建是几十秒的同步 CPU/IO，跑在主进程会把
     // 界面、记忆中枢本地 API 与 9527 模型网关一起冻住（实测 43~56s）。worker 期间主进程
     // 照常服务读写，只有最后的换入需要独占写（实测 ~1.5s，且是单事务）。
     try {
       const { rebuildInWorker, snapshotDb, checkpointWithRetry } = require("./rebuild-worker.cjs");
       const dbFile = path.join(rootDir, "index", "memory.sqlite");
-      const sidecar = path.join(configMod.dataDir(), "memory-rebuild-sidecar.sqlite");
       // 先把主库 WAL 落盘再复制，保证旁路库拿到的是完整快照（占用时重试后放弃，拿陈旧快照兜底）
       checkpointWithRetry(need().index.db);
       snapshotDb(dbFile, sidecar);
@@ -779,11 +802,15 @@ function register(ipcMain) {
   ipcMain.handle("memory_status", handle(() => status()));
   ipcMain.handle("memory_toggle", handle(async ({ enabled }) => {
     const framework = configMod.loadConfig();
-    framework.memory = { ...(framework.memory || {}), enabled: enabled !== false };
+    // modules.memory.enabled 是唯一事实源（issue #91）；memory.enabled 旧字段同步写，
+    // 兼容回滚到旧版本时不丢开关状态
+    const on = enabled !== false;
+    framework.memory = { ...(framework.memory || {}), enabled: on };
+    framework.modules = { ...(framework.modules || {}), memory: { ...((framework.modules || {}).memory || {}), enabled: on } };
     configMod.saveConfig(framework);
-    if (framework.memory.enabled) await boot();
+    if (on) await boot();
     else await shutdown();
-    return ok({ enabled: framework.memory.enabled });
+    return ok({ enabled: on });
   }));
 
   // ===== 模型与网关（供应商 / 模型池 / 路由 / 三级测试） =====
@@ -864,6 +891,13 @@ function register(ipcMain) {
   // ===== 深层记忆 / 蒸馏 / 画像 =====
   ipcMain.handle("memory_distill_run", handle(({ project }) => tasksRunner.runDistill({ project })));
   ipcMain.handle("memory_profile_generate", handle(() => tasksRunner.runProfile({})));
+  // ===== 记忆体检（纯本地统计）：手动触发 + 取最近一次报告 =====
+  ipcMain.handle("memory_health_run", handle(() => scheduler.runTask("health")));
+  ipcMain.handle("memory_health_get", handle(() => {
+    const raw = service && service.index ? service.index.getMeta("mem_health_report") : null;
+    if (!raw) return ok({ report: null });
+    try { return ok({ report: JSON.parse(raw) }); } catch { return ok({ report: null }); }
+  }));
   ipcMain.handle("memory_profile_get", handle(() => {
     // 读取前自愈兜底：若本地文件因版本更新或仓库重置缺失，自动从全局持久缓存恢复
     // （need() 返回的就是 MemoryService 本身，没有 .service 属性——写成 need().service
@@ -904,7 +938,11 @@ function register(ipcMain) {
     } catch {}
     return ok({});
   }));
-  ipcMain.handle("memory_review_list", handle(({ kind }) => ok({ items: need().index.reviewList("pending", kind) })));
+  ipcMain.handle("memory_review_list", handle(({ kind }) => {
+    // 惰性清扫：引用已消失/损坏的 pending 建议先作废，死项不再出现在收件箱里
+    need().index.sweepStaleReview();
+    return ok({ items: need().index.reviewList("pending", kind) });
+  }));
   ipcMain.handle("memory_review_resolve", handle(({ id, action, payload }) => resolveReview(need(), id, action, payload)));
 
   // ===== WebDAV 同步 =====
@@ -922,7 +960,10 @@ function register(ipcMain) {
   // ===== 记忆中枢：去重 =====
   ipcMain.handle("memory_dedup_status", handle(() => ok(dedupEngine.status())));
   ipcMain.handle("memory_dedup_scan", handle(({ useModel }) => dedupEngine.scanAll({ useModel: useModel !== false })));
-  ipcMain.handle("memory_dedup_review_list", handle(() => ok({ items: need().index.reviewList("pending", "dedup") })));
+  ipcMain.handle("memory_dedup_review_list", handle(() => {
+    need().index.sweepStaleReview();
+    return ok({ items: need().index.reviewList("pending", "dedup") });
+  }));
   ipcMain.handle("memory_dedup_review_resolve", handle(({ id, action, payload }) => dedupEngine.resolveQueue(id, action, payload)));
   ipcMain.handle("memory_dedup_pairs_get", handle(() => ok({ pairs: dedupEngine.learnedList() })));
   ipcMain.handle("memory_dedup_pairs_clear", handle(({ pair }) => dedupEngine.clearLearned(pair)));
@@ -957,6 +998,22 @@ function register(ipcMain) {
   ipcMain.handle("memory_import_map_save", handle(({ id, mapping }) => importer.mapSave(id, mapping)));
 }
 
+/** 队列项引用的记忆是否已消失（与 service 层判存在口径一致，与 indexer.sweepStaleReview 同源）。
+    这类建议没有任何可执行动作：作废收口，不能让用户在"处理失败"上反复点击。 */
+function staleRefReason(svc, kind, data) {
+  if (kind === "supersede") {
+    if (!data.oldId) return "建议缺少原记忆引用";
+    if (!svc.getById(data.oldId)) return `原记忆 ${data.oldId} 已不存在`;
+    return "";
+  }
+  if (kind === "classify") {
+    if (!data.memoryId) return "建议缺少记忆引用";
+    if (!svc.getById(data.memoryId)) return `记忆 ${data.memoryId} 已不存在`;
+    return "";
+  }
+  return "";
+}
+
 /** 待确认队列裁决：失效建议 / 归类建议 */
 async function resolveReview(svc, id, action, payload) {
   const row = svc.index.db.prepare("SELECT * FROM review_queue WHERE id = ?").get(id);
@@ -970,6 +1027,13 @@ async function resolveReview(svc, id, action, payload) {
     return fail("待确认项数据损坏，无法解析");
   }
   if (!data || typeof data !== "object") return fail("待确认项数据损坏，无法解析");
+  // 引用的记忆已消失（被删除/合并/清理，或模型输出 id 时漂移）→ 作废并如实告知
+  const stale = staleRefReason(svc, row.kind, data);
+  if (stale) {
+    // 只读库写不进作废标记：如实失败，不能报"已作废"却没落库（与其它动作的只读口径一致）
+    if (!svc.index.reviewResolve(id, "stale")) return fail("索引库来自更新版本的 AgentHub，当前处于只读模式：请升级应用后再操作");
+    return ok({ stale: true, message: `${stale}（可能已被删除或并入其它记忆），该建议已自动作废` });
+  }
   if (row.kind === "supersede") {
     if (action === "confirm") {
       const r = await svc.markSuperseded(data.oldId, data.newId, data.reason || "人工确认失效");
@@ -984,10 +1048,16 @@ async function resolveReview(svc, id, action, payload) {
     if (action === "merge" && data.newId) {
       const old = svc.getById(data.oldId);
       const next = svc.getById(data.newId);
-      if (old && next) {
-        await svc.updateMemory(data.newId, { body: `${next.body}\n\n---\n\n（来自 ${old.id}）\n${old.body}` });
-        await svc.markSuperseded(data.oldId, data.newId, "人工选择合并");
+      if (!old || !next) {
+        if (!svc.index.reviewResolve(id, "stale")) return fail("索引库来自更新版本的 AgentHub，当前处于只读模式：请升级应用后再操作");
+        return ok({ stale: true, message: "要合并的记忆之一已不存在（可能已被删除或并入其它记忆），该建议已自动作废" });
       }
+      // 两步都成功才收口（与 dedup.resolveQueue 的 merge 同口径）：
+      // 原先不查返回值就 resolve，只读/节丢失等失败会被静默吞成"假成功"
+      const ur = await svc.updateMemory(data.newId, { body: `${next.body}\n\n---\n\n（来自 ${old.id}）\n${old.body}` });
+      if (!ur.ok) return fail(ur.message || "合并写入失败，队列项保留");
+      const r = await svc.markSuperseded(data.oldId, data.newId, "人工选择合并");
+      if (!r.ok) return fail(r.message || "标记旧记忆失效失败，队列项保留");
       svc.index.reviewResolve(id, "merged");
       return ok({});
     }
@@ -996,13 +1066,16 @@ async function resolveReview(svc, id, action, payload) {
   if (row.kind === "classify") {
     if (action === "assign") {
       const r = await svc.projectAssign([data.memoryId], payload && payload.slug ? payload.slug : data.slug);
+      // 失败不 resolve：原写法不查返回值就 resolve，只读等失败会被静默吞掉
+      if (r && r.ok === false) return fail(r.message || "归入失败，队列项保留");
       svc.index.reviewResolve(id, `assign:${(payload && payload.slug) || data.slug}`);
-      return ok(r);
+      return ok({});
     }
     if (action === "newProject" && payload && payload.name) {
       const r = await svc.projectAssign([data.memoryId], payload.name);
+      if (r && r.ok === false) return fail(r.message || "归入失败，队列项保留");
       svc.index.reviewResolve(id, `newProject:${payload.name}`);
-      return ok(r);
+      return ok({});
     }
     if (action === "general") {
       svc.index.reviewResolve(id, "general");
@@ -1040,6 +1113,8 @@ function copyTree(from, to, skipDirs) {
 module.exports = {
   init, boot, shutdown, register, status, settings, flatSettings, emit,
   tools, agents, runtimeFile,
+  // 自测钩子：待确认裁决入口（覆盖"引用已消失 → 自动作废"分支），svc 由调用方提供
+  resolveReview,
   get service() { return service; },
   get rootDir() { return rootDir; },
   // 自测钩子（只读）：断言调度器装配完整，如 scheduler.syncer 是否真的挂上了

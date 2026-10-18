@@ -12,12 +12,25 @@ const wakeGuard = require("../wakeGuard.cjs");
 let timer = null;
 let refreshing = false;
 
+/** 该渠道有没有「余额」这个概念：自定义提供商是 API Key 直连，通用适配器刻意不定义 queryCredits
+ *  （见 adapters.cjs 的 makeOpenaiCompat）。缺这个方法还去刷，等于拿用户的第三方 Key 打一个
+ *  不存在的余额接口。三条刷新入口（单账号 / 单渠道 / 定时全量）全部先过这道判断。 */
+function creditsCapable(channel) {
+  const ad = adapters.get(channel);
+  return !!(ad && typeof ad.queryCredits === "function");
+}
+
+function noCreditsMessage(channel) {
+  return store.isBuiltinChannel(channel) ? "该渠道不提供额度查询（官方无对外余额接口）" : "该渠道为 API Key 直连，无余额概念";
+}
+
 /** 单账号额度刷新：成功回写余额缓存 + credits_history 日快照 */
 async function refreshAccount(id) {
   const acc = store.getAccount(id);
   if (!acc) throw new Error("账号不存在");
   const adapter = adapters.get(acc.channel);
   if (!adapter) throw new Error(`未知渠道 ${acc.channel}`);
+  if (!creditsCapable(acc.channel)) throw new Error(noCreditsMessage(acc.channel));
   let secrets = store.accountSecrets(acc);
   if (!secrets.token) throw new Error("该账号没有凭据");
 
@@ -30,7 +43,8 @@ async function refreshAccount(id) {
   if (dec.exp && dec.exp * 1000 < Date.now() + windowSec * 1000 && secrets.refreshToken) {
     const rr = await adapters.refreshTokenLocked(acc.channel, acc, secrets).catch(() => ({ ok: false }));
     if (rr.ok) {
-      store.updateAccount(acc.id, { token: rr.token, refreshToken: rr.refreshToken });
+      // noPersist 渠道（AutoClaw）：新凭证只进适配器进程缓存，不落库（方案 §7）
+      if (!rr.noPersist) store.updateAccount(acc.id, { token: rr.token, refreshToken: rr.refreshToken });
       secrets = { token: rr.token, refreshToken: rr.refreshToken };
     }
   }
@@ -55,7 +69,7 @@ async function refreshAccount(id) {
     // 401 → 先刷新凭证重试一次（single-flight，与 chat 链路共享互斥）
     const rr = await adapters.refreshTokenLocked(acc.channel, acc, secrets).catch(() => ({ ok: false }));
     if (rr.ok) {
-      store.updateAccount(acc.id, { token: rr.token, refreshToken: rr.refreshToken });
+      if (!rr.noPersist) store.updateAccount(acc.id, { token: rr.token, refreshToken: rr.refreshToken });
       secrets = { token: rr.token, refreshToken: rr.refreshToken };
       r = await adapter.queryCredits(acc, secrets).catch((e) => ({ error: String((e && e.message) || e) }));
     }
@@ -70,20 +84,58 @@ async function refreshAccount(id) {
     throw new Error(r.error);
   }
 
+  // 逐包明细：adapter 返回 packages 时落库，并以包集为单一事实源派生账号级 credits/expiresAt——
+  // 剩余 = Σ未过期包剩余，最近到期 = min(剩余>0 且未过期 的包到期)。返回里没有 packages 的渠道
+  // （上游接口就不拆包）走原口径，账号级聚合值不受影响。
+  let credits = r.credits;
+  let expiresAt = r.expiresAt || 0;
+  // 派生成功就整体信派生值：expiresAt=0 是「长期/没有在用到期」，不得回填旧账号级到期——
+  // 否则混合包场景（有限包过期 + 不限量包）下，pickAccount 的「余额已到期」会把不限量号
+  // 永久标死，跟下面的复活判据打乒乓。回填只属于无包集的原口径（adapter 没给就沿用旧值）。
+  let fromPackages = false;
+  if (Array.isArray(r.packages)) {
+    store.setCreditPackages(acc.id, acc.channel, r.packages);
+    const derived = pool.deriveAccountCredits(r.packages);
+    if (derived) {
+      credits = derived.credits;
+      expiresAt = derived.expiresAt;
+      fromPackages = true;
+    }
+  }
+
   // 复活逻辑：拿到新余额后，relogin / exhausted（余额不足或到期被自动切走的）账号回 online。
   // 注意 acc 是本次刷新开始前的旧快照，中间隔了上游网络请求（数秒）——期间请求链路可能刚把
   // 该号冷却（429 → cooling），必须用最新状态判定复活，不然会把新冷却无条件覆盖回 online
   const cur = store.getAccount(acc.id) || acc;
+  // credits === -1 = 「不限额度」哨兵（pool.cjs 选号、server.cjs 扣减都按这个念法豁免）。
+  // 本条之前它只是防御性写法、没有 producer 真产得出 -1；逐包链路里一个 remaining=-1 的包
+  // 经上面派生就会让 credits 变成 -1。而 exhausted 不只由余额判据产生——错误分类走 pool.cjs 的
+  // coolAccount("exhausted") 也会打进来，于是「无限额度的号被误标耗尽」再也刷不回来：
+  // 拿不到有限余额就无法证伪「余额不足」，按可用复活。
   const revive =
-    cur.status === "relogin" || (cur.status === "exhausted" && (r.credits > 0 || (r.expiresAt || 0) > Date.now()));
+    cur.status === "relogin" || (cur.status === "exhausted" && (credits > 0 || credits === -1 || (expiresAt || 0) > Date.now()));
   store.updateAccount(acc.id, {
-    credits: r.credits,
+    credits,
     creditsAt: Date.now(),
-    expiresAt: r.expiresAt || cur.expires_at,
+    expiresAt: fromPackages ? expiresAt : expiresAt || cur.expires_at,
     ...(revive ? { status: "online", coolUntil: 0, coolReason: "" } : {}),
   });
-  store.snapshotCredits(acc.channel, acc.id, r.credits, r.expiresAt || 0);
-  return { id: acc.id, credits: r.credits, expiresAt: r.expiresAt || 0 };
+  store.snapshotCredits(acc.channel, acc.id, credits, expiresAt || 0);
+  return { id: acc.id, credits, expiresAt: expiresAt || 0 };
+}
+
+/** 逐账号批量刷新的共享内核：每批 2 并发、Promise.allSettled 容错、结果统一补 ok。
+ *  refreshChannel 与 refreshAll 只在「收集哪些账号 id」上分家，批量节奏与结果组装收敛到这一处 */
+async function refreshBatch(ids) {
+  const results = [];
+  for (let i = 0; i < ids.length; i += 2) {
+    const batch = await Promise.allSettled(ids.slice(i, i + 2).map((id) => refreshAccount(id)));
+    // 成功必须补 ok:true：refreshAccount 正常返回不带 ok，直接推入会被 failed 统计全判成失败
+    for (const b of batch) {
+      results.push(b.status === "fulfilled" ? { ok: true, ...b.value } : { ok: false, message: String((b.reason && b.reason.message) || b.reason) });
+    }
+  }
+  return results;
 }
 
 /** 单渠道逐账号批量刷新（号池页「刷新当前渠道」用），每渠道并发 ≤2；单账号失败不影响其余 */
@@ -91,18 +143,14 @@ async function refreshChannel(channel) {
   if (refreshing) return { ok: false, message: "刷新进行中" };
   // 关闭的渠道不刷（上游启闭：调用类操作对它一律不存在）
   if (!adapters.channelOn(channel)) return { ok: false, message: "该渠道已关闭" };
+  if (!creditsCapable(channel)) return { ok: false, message: noCreditsMessage(channel) };
   refreshing = true;
   try {
     const ids = store
       .listAccounts(channel)
       .filter((a) => a.status !== "disabled" && a.hasToken)
       .map((a) => a.id);
-    const results = [];
-    for (let i = 0; i < ids.length; i += 2) {
-      const batch = await Promise.allSettled(ids.slice(i, i + 2).map((id) => refreshAccount(id)));
-      // 成功必须补 ok:true：refreshAccount 正常返回不带 ok，直接推入会被 failed 统计全判成失败
-      for (const b of batch) results.push(b.status === "fulfilled" ? { ok: true, ...b.value } : { ok: false, message: String((b.reason && b.reason.message) || b.reason) });
-    }
+    const results = await refreshBatch(ids);
     events.emit({ type: "credits" });
     const failed = results.filter((x) => !x.ok);
     return { ok: true, total: results.length, failed: failed.length, results };
@@ -119,6 +167,7 @@ async function refreshAll() {
     const byChannel = new Map();
     for (const acc of store.listAccounts()) {
       if (acc.status === "disabled" || !acc.hasToken) continue;
+      if (!creditsCapable(acc.channel)) continue; // 提供商不参与额度刷新（见 creditsCapable 注释）
       // 关闭的渠道不刷（上游启闭：定时全量刷新不碰它，避免无谓的上游请求）
       if (!adapters.channelOn(acc.channel)) continue;
       if (!byChannel.has(acc.channel)) byChannel.set(acc.channel, []);
@@ -126,11 +175,7 @@ async function refreshAll() {
     }
     const results = [];
     for (const ids of byChannel.values()) {
-      // 渠道内两两并发
-      for (let i = 0; i < ids.length; i += 2) {
-        const batch = await Promise.allSettled(ids.slice(i, i + 2).map((id) => refreshAccount(id)));
-        for (const b of batch) results.push(b.status === "fulfilled" ? { ok: true, ...b.value } : { ok: false, message: String((b.reason && b.reason.message) || b.reason) });
-      }
+      results.push(...await refreshBatch(ids));
     }
     events.emit({ type: "credits" });
     const failed = results.filter((r) => !r.ok);

@@ -336,6 +336,8 @@ async function downloadSkillDir(cfg, remoteRel, destDir, expectHash) {
 async function run(cfg) {
   if (state.running) throw new Error("同步已在进行中");
   if (!configured(cfg)) throw new Error("WebDAV 未配置完整（服务器地址 / 账号 / 密码）");
+  // 远端同步跨模块互斥（issue #92）：号池/用量/记忆同步进行中时跳过本轮（定时下轮补跑）
+  if (!webdav.tryBeginSync("skills")) throw new Error("其他模块的远端同步正在进行，本轮已跳过");
 
   state = { running: true, stage: "connect", pct: STAGE_BASE.connect, detail: "", lastError: "", lastSyncAt: state.lastSyncAt };
   cancelSignal = new AbortController();
@@ -545,6 +547,7 @@ async function run(cfg) {
     if (onFinish && !aborted) onFinish(false, state.lastError);
     return { ok: false, cancelled: aborted, message: aborted ? "同步已取消" : state.lastError };
   } finally {
+    webdav.endSync();
     saveHashCache(); // 本轮算过的新哈希落盘，下轮同步签名命中就免全量读盘
     cancelSignal = null;
     webdav.setActiveSignal(null);

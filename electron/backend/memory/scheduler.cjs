@@ -28,6 +28,8 @@ const TASK_DEFS = [
   { id: "index-scan", name: "索引自愈扫描", needsModel: false, defaultInterval: 360, estimate: "0（本地扫描）" },
   // 每天清理：回收站到期彻底删除（恒定执行）+ 按五个清理开关删除异常记忆（开关默认全关）
   { id: "cleanup", name: "异常记忆清理", needsModel: false, daily: "11:20", estimate: "0（本地扫描）" },
+  // 记忆体检（纯 SQL 统计，零 LLM）：僵尸/趋势/分布/演化链/回收站，报告落 mem_meta + 广播
+  { id: "health", name: "记忆体检", needsModel: false, daily: "11:30", estimate: "0（本地统计）" },
 ];
 
 const TICK_MS = 60000;
@@ -203,7 +205,7 @@ class MemoryScheduler {
     this.timer = setInterval(() => {
       this._tick().catch((e) => this.emit({ type: "task", phase: "error", detail: String(e.message || e) }));
     }, TICK_MS);
-    this._firstTick = setTimeout(() => this._tick().catch(() => {}), FIRST_TICK_DELAY_MS);
+    this._firstTick = setTimeout(() => this._tick().catch((e) => this.emit({ type: "task", phase: "error", detail: `首轮调度失败：${String(e.message || e)}` })), FIRST_TICK_DELAY_MS);
   }
 
   stop() {
@@ -259,7 +261,7 @@ class MemoryScheduler {
     if (this.running && this.running.id === id) return { ok: true, started: true, detail: `「${def.name}」正在执行中` };
     if (this.queue.some((q) => q.id === id)) return { ok: true, queued: true, detail: `「${def.name}」已在队列中` };
     this.queue.push({ id, at: Date.now(), manual: true });
-    void this._drain();
+    this._drain().catch((e) => this.emit({ type: "task", phase: "error", detail: `队列执行失败：${String(e.message || e)}` }));
     return { ok: true, queued: !!this.running, detail: this.running ? "已加入队列，等当前任务执行完" : "已开始执行" };
   }
 
@@ -295,9 +297,13 @@ class MemoryScheduler {
       if (this.pausedUntil && now >= this.pausedUntil) this.resume();
       else return;
     }
-    // 时间回拨保护：系统时间被调早时不误触发
+    // 时间回拨保护：系统时间被调早时整体跳过本轮，不推进任何任务记账。
+    // 曾经的写法是把 9 个任务的 lastRun 全写成回拨后的 now——按天/按周任务的判重看日期，
+    // 写一次就让「当天未到点的日任务 / 当周任务」被误判为已跑完整个周期，
+    // 只能等下一个周期（用户把时间调回去也救不回来）。这里保持 lastRun 原值不动。
     if (now < this._lastTickAt - 5 * 60000) {
-      for (const d of TASK_DEFS) this.service.index.setMeta(`mem_sched_${d.id}`, String(now));
+      this._lastTickAt = now; // 只更新水位，避免下一轮又判回拨
+      return;
     }
     this._lastTickAt = now;
 
@@ -453,7 +459,8 @@ class MemoryScheduler {
       //   （蒸馏手动失败后当天 11:10 不再跑，L2 白等一天）。
       if (record.ok || opts.auto) this.service.index.setMeta(`mem_sched_${id}`, String(Date.now()));
       this.pruneHistory();
-      this.service.index.setMeta("mem_sched_history", JSON.stringify(this.history.slice(-200)));
+      // 持久化与内存同口径：都用 keep（曾写死 slice(-200)，配置调大后磁盘侧仍只留 200 条）
+      this.service.index.setMeta("mem_sched_history", JSON.stringify(this.history.slice(-keep)));
     }
     return record;
   }
@@ -480,6 +487,8 @@ class MemoryScheduler {
         return Promise.resolve(this._runIndexScan());
       case "cleanup":
         return this._runCleanup();
+      case "health":
+        return Promise.resolve(this._runHealth());
       default:
         throw new Error(`任务 ${id} 未实现`);
     }
@@ -565,9 +574,29 @@ class MemoryScheduler {
     return { processed: r.total, updated: r.total, tokens: 0, detail };
   }
 
+  /**
+   * 记忆体检（纯 SQL 统计，零 LLM）：产出报告落 mem_meta（前端/IPC 可取），
+   * 广播 memory-health 事件（前端后续做面板时直接用）。只读模式下跳过。
+   */
+  _runHealth() {
+    if (this.service.index.readOnly) {
+      return { processed: 0, updated: 0, tokens: 0, detail: "索引库只读模式，跳过体检" };
+    }
+    const report = this.service.healthReport();
+    this.service.index.setMeta("mem_health_last", String(Date.now()));
+    this.service.index.setMeta("mem_health_report", JSON.stringify(report));
+    this.emit({ type: "health", report });
+    const queries = report.trend.reduce((sum, t) => sum + t.queries, 0);
+    return {
+      processed: this.service.index.counts().total,
+      updated: 0,
+      tokens: 0,
+      detail: `体检完成：僵尸 ${report.zombies.count} 条 · 近 4 周检索 ${queries} 次 · 回收站 ${report.trash.count} 个`,
+    };
+  }
+
   /** 自动定时同步：sync.auto + sync.intervalMin（此前只有手动按钮，配置项是"假旋钮"） */
-  async maybeAutoSync(now) {
-    const cfg = this.getConfig();
+  async maybeAutoSync(now) {    const cfg = this.getConfig();
     if (cfg["sync.enabled"] === false || cfg["sync.auto"] === false) return;
     if (!this.syncer || typeof this.syncer.run !== "function") return;
     if (this.syncer.running) return;
@@ -628,10 +657,16 @@ class MemoryScheduler {
     const t = this.taskConfig("extract");
     if (t.enabled === false) return false;
     const threshold = Number(t.thresholdCount || 20);
-    const count = this.service.index.db.prepare("SELECT COUNT(*) AS c FROM mem WHERE ai_processed = 0 AND (valid_to IS NULL OR valid_to > ?)").get(Date.now()).c;
+    // 计数语句常驻：写入热路径上每次 prepare 等于每次重新编译
+    if (!this._countUnprocessed) {
+      this._countUnprocessed = this.service.index.db.prepare("SELECT COUNT(*) AS c FROM mem WHERE ai_processed = 0 AND (valid_to IS NULL OR valid_to > ?)");
+    }
+    const count = this._countUnprocessed.get(Date.now()).c;
     if (count >= threshold && !this.queue.some((q) => q.id === "extract")) {
       this.queue.push({ id: "extract", at: Date.now() });
-      void this._drain();
+      // drain 的 Promise 必须兜底：emit 回调抛错时会变成未处理的 rejection（Node 默认只告警，
+      // 严格模式下直接杀进程）——周期 tick 已有 .catch，手动触发与阈值触发同口径
+      this._drain().catch((e) => this.emit({ type: "task", phase: "error", detail: `队列执行失败：${String(e.message || e)}` }));
       return true;
     }
     return false;

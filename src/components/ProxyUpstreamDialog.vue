@@ -15,6 +15,12 @@ import qoderIcon from "../assets/channels/qoder.png";
 import zcodeIcon from "../assets/channels/zcode.png";
 // CatPaw 无官方客户端图标可提取，为自绘（tools/gen-catpaw-icon.cjs 生成，可复现）
 import catpawIcon from "../assets/channels/catpaw.png";
+// AutoClaw 双区共用爪印图形，地区角标区分（tools/gen-autoclaw-icon.cjs 生成，可复现）
+import autoclawIcon from "../assets/channels/autoclaw.png";
+import autoclawIntlIcon from "../assets/channels/autoclaw_intl.png";
+// Cline 双池共用「终端窗」图形，池角标区分（tools/gen-cline-icon.cjs 生成，可复现）
+import clineFreeIcon from "../assets/channels/cline_free.png";
+import clinePassIcon from "../assets/channels/cline_pass.png";
 
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{ (e: "close"): void }>();
@@ -30,6 +36,10 @@ const CHANNEL_ICONS: Record<string, string> = {
   qoder_intl: qoderIcon,
   zcode: zcodeIcon,
   catpaw: catpawIcon,
+  autoclaw: autoclawIcon,
+  autoclaw_intl: autoclawIntlIcon,
+  cline_free: clineFreeIcon,
+  cline_pass: clinePassIcon,
 };
 const initial = (id: string) => (channelName(id) || id || "?").trim().slice(0, 1).toUpperCase() || "?";
 
@@ -123,14 +133,20 @@ async function toggle(row: ProxyChannelView, next: boolean) {
                 {{ row.enabled === false ? "已关闭 —— 反代网关全部页面隐藏该渠道" : row.summary.accountCount ? `${row.summary.onlineCount}/${row.summary.accountCount} 账号可用` : "空号池" }}
               </div>
             </div>
-            <el-tooltip :content="row.enabled === false ? '开启该渠道（立即恢复显示与调用）' : '关闭该渠道（全部页面立即隐藏，路由与调用不再使用）'" placement="top">
-              <button
-                class="switch"
-                :class="{ on: row.enabled !== false }"
-                :disabled="busyId === row.id"
-                @click="toggle(row, row.enabled === false)"
-              ></button>
-            </el-tooltip>
+            <button
+              class="switch"
+              :class="{ on: row.enabled !== false }"
+              :disabled="busyId === row.id"
+              @click="toggle(row, row.enabled === false)"
+            ></button>
+          </div>
+          <!-- 占位卡：提示后续新渠道会出现在这里（不参与交互） -->
+          <div v-if="rows.length" class="up-row up-more">
+            <span class="up-more-icon"><i class="ph ph-plus"></i></span>
+            <div class="up-info">
+              <div class="up-name">更多渠道等待添加</div>
+              <div class="up-meta">后续支持的新渠道会出现在这里</div>
+            </div>
           </div>
         </div>
 
@@ -145,7 +161,7 @@ async function toggle(row: ProxyChannelView, next: boolean) {
 
 <style scoped>
 .up-dlg {
-  width: 440px;
+  width: 580px;
 }
 /* 头部：图标 + 标题 + 关闭（与号池页 add-dlg 同构） */
 .up-head {
@@ -222,18 +238,21 @@ async function toggle(row: ProxyChannelView, next: boolean) {
   font-size: 11px;
 }
 
-/* 渠道行：图标 + 名称 + 开关 */
+/* 渠道列表：两列卡片网格（minmax(0,1fr) 防长渠道名把列撑破溢出） */
 .up-list {
   margin-top: 12px;
-  display: flex;
-  flex-direction: column;
-  max-height: 320px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  max-height: 440px;
   overflow-y: auto;
+  padding-right: 2px;
 }
 .up-list::-webkit-scrollbar {
   width: 4px;
 }
 .up-empty {
+  grid-column: 1 / -1;
   padding: 20px 0;
   text-align: center;
   font-size: 11px;
@@ -243,10 +262,35 @@ async function toggle(row: ProxyChannelView, next: boolean) {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 9px 4px;
+  padding: 10px 12px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.04);
 }
-.up-row + .up-row {
-  border-top: 1px solid var(--line);
+:root[data-theme="light"] .up-row {
+  background: rgba(15, 23, 42, 0.04);
+}
+/* 占位卡：虚线弱化态，与渠道卡同构但不可交互 */
+.up-more {
+  border-style: dashed;
+  background: transparent;
+}
+/* 亮色下 :root[data-theme] .up-row 特异性更高，须同特异性覆盖回透明 */
+:root[data-theme="light"] .up-more {
+  background: transparent;
+}
+.up-more-icon {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-sm);
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+}
+.up-more-icon .ph {
+  font-size: 14px;
 }
 .up-icon {
   flex: none;

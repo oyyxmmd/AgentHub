@@ -5,6 +5,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyKeyRow, ProxyRoute, ProxyRouteOrder } from "../../types";
 import { useAppStore } from "../../stores/app";
+import { toast as ElMessage } from "../../utils/toast";
 import { fmtInt, fmtK } from "./format";
 
 const app = useAppStore();
@@ -60,6 +61,9 @@ async function refresh() {
   try {
     keys.value = await api.proxyKeysList();
     channels.value = await api.proxyPool().catch(() => channels.value);
+    // 列表变化后剔除已不存在的选中项，避免选中计数与实际行数不符
+    const alive = new Set(keys.value.map((k) => k.id));
+    selectedIds.value = new Set([...selectedIds.value].filter((id) => alive.has(id)));
     err.value = "";
   } catch (e) {
     err.value = String((e as Error).message || e);
@@ -146,6 +150,49 @@ async function doDelete() {
   }
 }
 
+// ===== 列表多选 / 全选 + 批量删除（列表最左选择列） =====
+const selectedIds = ref<Set<string>>(new Set());
+const batchDelOpen = ref(false);
+const batchDelBusy = ref(false);
+const selectedCount = computed(() => keys.value.filter((k) => selectedIds.value.has(k.id)).length);
+const allSelected = computed(() => keys.value.length > 0 && keys.value.every((k) => selectedIds.value.has(k.id)));
+
+function toggleSelect(id: string) {
+  const next = new Set(selectedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  selectedIds.value = next;
+}
+function toggleSelectAll() {
+  selectedIds.value = allSelected.value ? new Set() : new Set(keys.value.map((k) => k.id));
+}
+
+/** 批量删除：主进程逐个走单删链路（墓碑先行，经 WebDAV 传播到其他设备） */
+async function doBatchDelete() {
+  if (batchDelBusy.value) return;
+  const ids = keys.value.filter((k) => selectedIds.value.has(k.id)).map((k) => k.id);
+  if (!ids.length) {
+    batchDelOpen.value = false;
+    return;
+  }
+  batchDelBusy.value = true;
+  try {
+    const r = await api.proxyKeysDeleteBatch(ids);
+    // r 缺失（IPC 返回了非预期形状）不能当成成功：原来是 `r.ok !== false`，
+    // undefined !== false 为真，会弹「已删除 N 个」而实际一条都没删
+    const done = !!r && r.ok !== false;
+    if (done) ElMessage.success(`已删除 ${r.removed ?? ids.length} 个 Key`);
+    else ElMessage.error(r.message || "批量删除失败");
+    batchDelOpen.value = false;
+    selectedIds.value = new Set();
+    await refresh();
+  } catch (e) {
+    ElMessage.error(String((e as Error).message || e));
+  } finally {
+    batchDelBusy.value = false;
+  }
+}
+
 onMounted(refresh);
 // 页面 v-show 保活：onMounted 只跑一次；切回本页时补一次刷新，Key 列表不停留在旧数据
 watch(
@@ -160,15 +207,20 @@ watch(
   <section class="page">
     <div class="page-body">
       <div v-if="err" class="card err-card"><div class="set-desc err-text">{{ err }}</div></div>
-      <!-- 工具栏（页头已去标题化，「生成 Key」贴在正文顶部右侧） -->
+      <!-- 工具栏（页头已去标题化，「生成 Key」贴在正文顶部右侧；多选后左侧出现批量删除） -->
       <div class="toolbar">
+        <button v-if="selectedCount" class="btn danger" :disabled="batchDelBusy" @click="batchDelOpen = true">批量删除（{{ selectedCount }}）</button>
         <button class="btn btn-primary" @click="createOpen = true">生成 Key</button>
       </div>
       <div class="tbl-wrap" style="margin-top: 12px">
-        <table class="tbl">
+        <table class="tbl keys-tbl">
           <tbody>
-            <tr><th>KEY</th><th>名称</th><th>路由</th><th>今日请求</th><th>今日 Token</th><th>每日配额</th><th>状态</th><th>操作</th></tr>
+            <tr>
+              <th class="sel-col"><input type="checkbox" :checked="allSelected" :disabled="!keys.length" @change="toggleSelectAll" /></th>
+              <th>KEY</th><th>名称</th><th>路由</th><th>今日请求</th><th>今日 Token</th><th>每日配额</th><th>状态</th><th>操作</th>
+            </tr>
             <tr v-for="k in keys" :key="k.id">
+              <td class="sel-col"><input type="checkbox" :checked="selectedIds.has(k.id)" @change="toggleSelect(k.id)" /></td>
               <td class="mono">{{ k.mask }}</td>
               <td>{{ k.name }}</td>
               <td>
@@ -188,7 +240,7 @@ watch(
               </td>
             </tr>
             <tr v-if="!keys.length">
-              <td colspan="8" style="text-align: center; color: var(--text-3); padding: 18px">
+              <td colspan="9" style="text-align: center; color: var(--text-3); padding: 18px">
                 还没有 Key —— 点上方「生成 Key」；生成后可随时在列表复制 / 查看完整 Key
               </td>
             </tr>
@@ -310,6 +362,18 @@ watch(
           </div>
         </div>
       </div>
+
+      <!-- 批量删除确认（列表多选后出现） -->
+      <div v-if="batchDelOpen" class="p-mask" @click.self="batchDelOpen = false">
+        <div class="p-dlg glass">
+          <div class="p-title">批量删除 Key</div>
+          <div class="set-desc">确定删除选中的 {{ selectedCount }} 个 Key？删除立即生效，使用这些 Key 的客户端将返回 401。</div>
+          <div class="p-actions">
+            <button class="btn" @click="batchDelOpen = false">取消</button>
+            <button class="btn btn-primary danger-solid" :disabled="batchDelBusy" @click="doBatchDelete">{{ batchDelBusy ? "删除中…" : "删除" }}</button>
+          </div>
+        </div>
+      </div>
     </Teleport>
   </section>
 </template>
@@ -331,6 +395,20 @@ watch(
 }
 .danger {
   color: var(--err, #e05555);
+}
+/* 选择列：全选与行选 checkbox 居中（与号池列表同一版式） */
+.sel-col {
+  width: 34px;
+  text-align: center;
+}
+.sel-col input[type="checkbox"] {
+  vertical-align: middle;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+/* 列表内容水平居中：与居中的表头对齐，整表视觉居中 */
+.keys-tbl td {
+  text-align: center;
 }
 /* 弹窗（.p-mask / .p-dlg / .p-title / .p-actions / .danger-solid）改用 global.css 的全站统一版式 */
 .secret-box {

@@ -28,6 +28,7 @@ const crypto = require("node:crypto");
 const store = require("./store.cjs");
 const discovery = require("./discovery.cjs");
 const util = require("./util.cjs");
+const adapters = require("./adapters.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
 const raccoonClient = require("./raccoonClient.cjs");
 const zcodeSwitch = require("./zcodeSwitch.cjs");
@@ -762,15 +763,50 @@ function switchWorkbuddyAccount(acc, opts) {
   const secrets = store.accountSecrets(acc);
   if (!secrets.token) throw new Error("该账号没有凭据");
 
+  // 闸⓪-1：账号能不能用。上游对「模型调用」面有账号级风控（403 code 11140），被拦的账号
+  //   写进本地客户端后表现恰好是最难自查的那种：客户端登录正常、刷新正常、界面一切正常，
+  //   一发提问就报「内容未通过安全审核，请调整后重试」——用户只会去改提问，改到天亮也不会好。
+  //   切号前用真实对话链路探一次活（同 headers / 同 body 管线 / 同 URL 候选，max_tokens=1），
+  //   拦在这里；拦下时**未动任何文件、未碰任何进程**，客户端还是原来那个能用的号。
+  //   只有明确拿到 11140 才拦——网络不通、超时、模型名不认一律放行（探活失败 ≠ 账号坏）。
+  return wbProbeThenSwitch(acc, opts, secrets, file);
+}
+
+/** 探活 + 正式写回（拆成两段只是为了让上面那道闸的意图读起来是顺序的） */
+async function wbProbeThenSwitch(acc, opts, secrets, file) {
+  const adapter = adapters.get(acc.channel);
+  if (adapter && typeof adapter.probeChat === "function") {
+    const probe = await adapter
+      .probeChat(acc, secrets)
+      .catch((e) => ({ ok: false, inconclusive: true, message: String((e && e.message) || e) }));
+    if (probe && probe.blocked) {
+      return {
+        ok: false,
+        channel: acc.channel,
+        message:
+          `该账号已被上游风控拦截（403 request illegal / code 11140）：模型调用被上游整体拒绝，` +
+          `与提问内容无关。切到本地客户端后同样用不了，已中止切换（未改动任何文件）。` +
+          `请改用其它账号；若仍要用它，请在客户端内重新登录该账号以更换会话后再试。`,
+      };
+    }
+  }
+  return wbSwitchWrite(acc, opts, secrets, file);
+}
+
+/** WorkBuddy 双区写回本体：关客户端（内存态会回写覆盖）→ 等退出 → 读文件 → 备份 → 合并式只改
+ *  凭据字段 → 写前哈希比对 → 原子写 + 回读校验 + 失败回滚 → 按原状拉起客户端。
+ *  既有的三道安全闸（加密包装 / 写前哈希 / 写后回读）实现保持原样。 */
+function wbSwitchWrite(acc, opts, secrets, file) {
   // 闸⓪：客户端进程。它内存里持有当前登录态，刷新时会回写登录文件把本次切换覆盖掉。
   //   读文件必须放在关闭之后——退出瞬间的回写落定后，读到的才是稳定态（对齐小浣熊的顺序）。
   const run = wbClient.isWorkbuddyRunning(acc.channel);
   let relaunchExe = "";
   if (run.running) {
     if (!opts.confirmAck) {
-      // 兜底（正常路径下入口已拦并弹过确认框）
+      // 兜底（正常路径下入口已拦并弹过确认框）。needConfirm 必须 ok:true（本文件头协议：
+      // 前端 call() 对 ok:false 直接抛错，确认框永远弹不出来；对齐 raccoon 同路径）
       return {
-        ok: false,
+        ok: true,
         channel: acc.channel,
         needConfirm: true,
         message: `${CLIENT_LABELS[acc.channel] || acc.channel} 正在运行，切换需要先关闭它。确认关闭客户端并切换吗？`,
@@ -856,7 +892,9 @@ function switchWorkbuddyAccount(acc, opts) {
   const accountFor = { uid: acc.uid, name: acc.name, expiresAt: acc.expires_at, tokenType: acc.meta && acc.meta.tokenType };
   const merged = encrypted ? mergeAuthFieldsEncrypted(json, accountFor, secrets) : mergeAuthFields(json, accountFor, secrets);
   try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch {}
-  const tmp = `${file}.tmp`;
+  // 中转名带 pid：本文件另外两处原子写（Qoder/Claude 侧）早就带 pid，只有 WorkBuddy 这处落的是
+  // 用户家目录里的真实登录文件——两个实例同刻切号时固定名会互相踩
+  const tmp = `${file}.tmp.${process.pid}`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), "utf8");
     fs.renameSync(tmp, file);
@@ -972,7 +1010,8 @@ function ideSwitchStatus() {
   } catch { /* 探测失败按未安装处理 */ }
   out.channels.trae = { installed: out.traeInstalled, file: "", uid: "" };
   // 小浣熊：~/.box-agent 目录在即视为已安装（官方「退出登录」会删 auth.json，但号池凭据完整、
-  //   切号时可重建文件——不能因文件缺失把切号按钮禁掉）；uid 取 JWT 的 iss（与 scanRaccoon 同口径）
+  //   切号时可重建文件——不能因文件缺失把切号按钮禁掉）；uid 取 JWT 的 sub（账号 ID，与
+  //   scanRaccoon / raccoonAuth.tokenUid 同口径；iss 是签发方常量，不是账号 ID）
   try {
     const rf = raccoonAuthFile();
     const home = path.dirname(path.dirname(rf)); // ~/.box-agent
@@ -982,7 +1021,7 @@ function ideSwitchStatus() {
       if (rjson && rjson.access_token) {
         const p = String(rjson.access_token).split(".");
         const payload = p.length >= 2 ? JSON.parse(Buffer.from(p[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) : null;
-        ruid = String((payload && (payload.iss || payload.sid)) || "");
+        ruid = String((payload && (payload.sub || payload.uid || payload.id || payload.iss)) || "");
       }
     } catch { /* 未登录 / 文件不存在 */ }
     out.raccoonInstalled = fs.existsSync(rf) || fs.existsSync(home);

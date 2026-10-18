@@ -188,19 +188,26 @@ function list(cfg) {
     configPath: resolveConfig(a),
     configExists: existsSync(resolveConfig(a)),
     instruction: resolveInstruction(a),
-  })).concat(custom.map((c) => ({
-    id: c.id,
-    name: c.name || c.id,
-    configCandidates: [c.path],
-    format: c.format || "json-mcpServers",
-    container: ["mcpServers"],
-    custom: true,
-    enabled: true,
-    configPath: c.path,
-    configExists: existsSync(c.path),
-    instruction: { path: c.instructionPath || "", exists: c.instructionPath ? existsSync(c.instructionPath) : false },
-    snippetHint: `自定义：${c.format || "json-mcpServers"}`,
-  })));
+  })).concat(custom.map((c) => {
+    // 容器按 format 推导，不再硬编码 ["mcpServers"]：自定义 toml 适配器若沿用 JSON 容器
+    // 结构，注入会写坏配置文件（toml 路径认 table 不认 container）
+    const fmt = c.format || "json-mcpServers";
+    const container = fmt === "json-mcp.servers" ? ["mcp", "servers"] : ["mcpServers"];
+    return {
+      id: c.id,
+      name: c.name || c.id,
+      configCandidates: [c.path],
+      format: fmt,
+      container,
+      ...(fmt === "toml-mcp_servers" ? { table: "mcp_servers" } : {}),
+      custom: true,
+      enabled: true,
+      configPath: c.path,
+      configExists: existsSync(c.path),
+      instruction: { path: c.instructionPath || "", exists: c.instructionPath ? existsSync(c.instructionPath) : false },
+      snippetHint: `自定义：${fmt}`,
+    };
+  }));
 }
 
 function byId(id) {

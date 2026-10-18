@@ -4,7 +4,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import * as api from "../../api/ipc";
-import type { CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, CcSwitchTiers, ProxyKeyRow, ProxyModel } from "../../types";
+import type { CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, CcSwitchTiers, CcSwitchLiveRoute, ProxyKeyRow, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
 
 const app = useAppStore();
@@ -66,11 +66,35 @@ function entry(appType: CcSwitchAppType) {
   return (st.value?.entries || []).find((x) => x.appType === appType);
 }
 
-/** 各应用的本地路由接管状态：claude-desktop 无独立行，读全局代理网关在线状态（takeover.claudeDesktop） */
+/** 各应用的本地路由接管状态：claude-desktop 无独立行，读 claude 行的 proxy_enabled（当前是否接管中） */
 function takeoverOf(appType: CcSwitchAppType) {
   const tk = st.value?.takeover;
   if (!tk) return false;
   return appType === "claude-desktop" ? !!tk.claudeDesktop : !!tk[appType];
+}
+
+/** 链路格：live 配置当前实际指向的文案 / 配色 / 悬停说明。
+ *  「路由」格读的是库里的接管开关，那只是意图——CC Switch 退出时会自动把 live 恢复为直连网关；
+ *  这里读的是客户端配置文件里的真实服务地址，两者不一致时以本格为准 */
+function liveLabel(r?: CcSwitchLiveRoute) {
+  if (!r) return "—";
+  if (r.target === "gateway") return "直连网关";
+  if (r.target === "ccswitch") return "经 CC Switch";
+  return "未指向网关";
+}
+function liveCls(r?: CcSwitchLiveRoute) {
+  if (!r) return "";
+  if (r.target === "gateway") return "acc";
+  if (r.target === "ccswitch") return "warn";
+  return "";
+}
+function liveTitle(r?: CcSwitchLiveRoute) {
+  if (!r) return "";
+  const u = r.url || "（未配置服务地址）";
+  if (r.target === "gateway") return `live 配置直连 AgentHub 网关：${u}`;
+  if (r.target === "ccswitch") return `live 配置经 CC Switch 本地代理转换后到网关，需 CC Switch 保持运行：${u}`;
+  if (r.target === "other") return `live 配置未指向 AgentHub 网关，当前：${u}`;
+  return "live 配置未设置服务地址（走客户端默认）";
 }
 
 /** 提示语里的条目名：用后端回传的真实名（与 CC Switch 列表一致），
@@ -266,7 +290,7 @@ onMounted(() => {
           已注册但未开启本地路由。CC Switch 只在本地路由开启时做协议转换，直接「打开终端」或普通切换会把原生请求打到网关而报 404。
         </div>
         <div v-else-if="installed && !incompatible" class="set-desc" style="margin-top: 8px">
-          本地路由已开启；请勿使用条目的「打开终端」直连，那条路径不经过 CC Switch 协议转换。
+          本地路由已开启；请勿使用条目的「打开终端」直连，那条路径不经过 CC Switch 协议转换。下方「路由」格读 CC Switch 库里的接管开关（只是意图：它退出时会自动把 live 配置恢复为直连网关），「链路」格读客户端配置文件里的实际服务地址（地面真相），两者不一致时以「链路」为准。
         </div>
         <div class="kpis" style="margin-top: 12px">
           <div class="kpi"><span>网关地址</span><b class="mono">127.0.0.1:{{ port }}/v1</b></div>
@@ -274,8 +298,20 @@ onMounted(() => {
           <div class="kpi"><span>Claude Desktop</span><b :class="entry('claude-desktop')?.registered ? 'acc' : ''">{{ entry("claude-desktop")?.registered ? "已注册" : "未注册" }}</b></div>
           <div class="kpi"><span>Codex</span><b :class="entry('codex')?.registered ? 'acc' : ''">{{ entry("codex")?.registered ? "已注册" : "未注册" }}</b></div>
           <div class="kpi"><span>路由 · Claude Code</span><b :class="takeoverOf('claude') ? 'acc' : 'err'">{{ takeoverOf("claude") ? "已开启" : "未开启" }}</b></div>
-          <div class="kpi"><span>路由 · Claude Desktop</span><b :class="takeoverOf('claude-desktop') ? 'acc' : 'err'">{{ takeoverOf("claude-desktop") ? "已开启" : "未开启" }}</b></div>
+          <div class="kpi">
+            <span>链路 · Claude Code</span>
+            <el-tooltip :content="liveTitle(st?.live?.claude)" :disabled="!liveTitle(st?.live?.claude)" placement="top">
+              <b :class="liveCls(st?.live?.claude)">{{ liveLabel(st?.live?.claude) }}</b>
+            </el-tooltip>
+          </div>
           <div class="kpi"><span>路由 · Codex</span><b :class="takeoverOf('codex') ? 'acc' : 'err'">{{ takeoverOf("codex") ? "已开启" : "未开启" }}</b></div>
+          <div class="kpi">
+            <span>链路 · Codex</span>
+            <el-tooltip :content="liveTitle(st?.live?.codex)" :disabled="!liveTitle(st?.live?.codex)" placement="top">
+              <b :class="liveCls(st?.live?.codex)">{{ liveLabel(st?.live?.codex) }}</b>
+            </el-tooltip>
+          </div>
+          <div class="kpi"><span>路由 · Claude Desktop</span><b :class="takeoverOf('claude-desktop') ? 'acc' : 'err'">{{ takeoverOf("claude-desktop") ? "已开启" : "未开启" }}</b></div>
           <div class="kpi"><span>数据库</span><b class="mono">{{ st?.dbPath || "-" }}</b></div>
         </div>
       </div>
@@ -358,6 +394,11 @@ onMounted(() => {
 }
 .err-text {
   color: var(--err, #e05555);
+}
+/* 链路格「经 CC Switch」：可用但依赖 CC Switch 保持运行，用警示色与直连/未指向区分 */
+.kpi b.warn {
+  color: var(--warn);
+  text-shadow: 0 0 18px var(--warn-dim);
 }
 .co-row {
   display: flex;

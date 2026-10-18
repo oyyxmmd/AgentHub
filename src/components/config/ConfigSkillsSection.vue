@@ -286,7 +286,7 @@ async function openDataDir() {
 
           <div class="probe-area">
             <div class="sk-row" style="gap:10px">
-              <button class="btn btn-ghost" :disabled="probeLoading" @click="doProbe"><i class="ph ph-radar"></i>扫描电脑发现</button>
+              <button class="btn btn-ghost" :disabled="probeLoading" @click="doProbe"><i class="ph ph-scan"></i>扫描电脑发现</button>
               <button class="btn btn-ghost" @click="openManual"><i class="ph ph-plus"></i>手动新增适配器</button>
               <span class="sk-small sk-muted" style="align-self:center">探测只读不写配置，你点添加才会进列表。</span>
             </div>

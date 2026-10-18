@@ -432,6 +432,16 @@ function loadConfig() {
         merged.webdav.endpoint = shared.endpoint;
         merged.webdav.username = shared.username;
         merged.webdav.password = shared.password;
+        // S3 兼容存储（issue #89）：把 __s3 标记与桶参数一并带给同步引擎，
+        // webdav.cjs 据此分派到 S3 传输——引擎对存储类型无感知
+        if (shared.type === "s3") {
+          merged.webdav.__s3 = true;
+          merged.webdav.bucket = shared.s3.bucket;
+          merged.webdav.region = shared.s3.region;
+          merged.webdav.pathStyle = shared.s3.pathStyle;
+        } else {
+          delete merged.webdav.__s3;
+        }
       } catch { /* 框架配置不可达时保留本段旧值 */ }
     }
     // 总量口径归一化：platform 选项从未实现（等效 compact），已从 UI 移除，旧配置值回退为 compact
@@ -473,7 +483,7 @@ function saveConfig(cfg) {
   const p = configPath();
   const out = { ...cfg, webdav: { ...(cfg.webdav || {}) } };
   if (out.webdav) out.webdav.password = encryptPassword(out.webdav.password);
-  const tmp = p + ".tmp";
+  const tmp = `${p}.tmp.${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(out, null, 2), "utf8");
   fs.renameSync(tmp, p);
 }

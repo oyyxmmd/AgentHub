@@ -182,7 +182,9 @@ async function packageBackup(cfg) {
   if (fs.existsSync(configFile)) entries.push({ name: "config.json", data: fs.readFileSync(configFile) });
   const zipBuf = zip.createZip(entries);
   const target = path.join(dir, config.BACKUP_FILE);
-  const tmp = target + ".tmp";
+  // 中转名带 pid：备份目录用户可自定义，两个实例（dev 版与安装版并存）或同刻多次打包都会
+  // 落同一个 target——固定名会让两个写入者互相 rename 踩掉，甚至把对方的半成品当自己的压缩包收走
+  const tmp = `${target}.tmp.${process.pid}`;
   fs.writeFileSync(tmp, zipBuf);
   fs.renameSync(tmp, target);
   log("package", "ok", `备份压缩包已生成：${target}`, `${entries.length} 个文件 · ${(zipBuf.length / 1048576).toFixed(2)} MB`);
@@ -620,6 +622,9 @@ async function run(cfg, opts = {}) {
   if (state.restoring) throw new Error("正在恢复备份，请稍后再同步");
   if (state.running) throw new Error("同步正在进行中");
   if (localBusy) throw new Error("本地统计进行中");
+  // 远端同步跨模块互斥（issue #92）：本地/备份模式不碰远端，不占锁
+  const remoteRun = webdavReady(cfg) && !((opts && opts.mode) === "backup");
+  if (remoteRun && !webdav.tryBeginSync("usage")) throw new Error("其他模块的远端同步正在进行，本轮已跳过");
   state = { running: true, cancelled: false, stage: "extract", percent: 0, message: "准备抽取", lastSyncAt: state.lastSyncAt || null, localOnly: false, backupOnly: false, restoring: false };
   currentAbort = new AbortController();
   webdav.setActiveSignal(currentAbort.signal);
@@ -681,6 +686,7 @@ async function run(cfg, opts = {}) {
     if (onFinish) onFinish(false, msg);
     return { ok: false, error: msg };
   } finally {
+    if (remoteRun) webdav.endSync();
     webdav.setActiveSignal(null);
     currentAbort = null;
   }
@@ -720,6 +726,8 @@ async function runRemote(cfg) {
   if (state.restoring) throw new Error("正在恢复备份，请稍后再同步");
   if (state.running) throw new Error("同步正在进行中");
   if (localBusy) throw new Error("本地统计进行中，远程同步已跳过");
+  // 远端同步跨模块互斥（issue #92）：其他模块同步中时跳过本轮（定时下轮补跑）
+  if (!webdav.tryBeginSync("usage")) throw new Error("其他模块的远端同步正在进行，本轮已跳过");
   state = { running: true, cancelled: false, stage: "upload", percent: 0, message: "准备上传", lastSyncAt: state.lastSyncAt || null, localOnly: false, backupOnly: false, restoring: false };
   currentAbort = new AbortController();
   webdav.setActiveSignal(currentAbort.signal);
@@ -745,6 +753,7 @@ async function runRemote(cfg) {
     if (onFinish) onFinish(false, msg);
     return { ok: false, error: msg };
   } finally {
+    webdav.endSync();
     webdav.setActiveSignal(null);
     currentAbort = null;
   }

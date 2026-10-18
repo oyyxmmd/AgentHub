@@ -9,6 +9,7 @@ const store = require("./store.cjs");
 const util = require("./util.cjs");
 const raccoonAuth = require("./raccoonAuth.cjs");
 const config = require("../config.cjs");
+const platform = require("./platform/index.cjs");
 
 function proxyConfig() {
   try {
@@ -32,6 +33,12 @@ const FIRST_BYTE_MAX_MS = 180000; // 首字节预算封顶（超长 prompt 的 p
 const FIRST_BYTE_PER_10K_MS = 1000; // 每 1 万输入 token 追加的预算
 const STREAM_IDLE_MS = 300000; // 流中读超时 300s
 
+/** 从配置读取超时值（0/缺省/非法 → 内置默认；保证可运行时调整且不被脏配置打穿） */
+function timeoutMs(key, fallback) {
+  const n = Number((proxyConfig() || {})[key]);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
+}
+
 /** 估算输入规模（按序列化字符数折算 token，中英混排约 3 字符/token；宁高勿低，避免误杀超大 prompt） */
 function estimateInputTokens(payload) {
   return Math.ceil(String(payload == null ? "" : payload).length / 3);
@@ -44,8 +51,10 @@ function estimateInputTokens(payload) {
  * 小请求仍是 30s 起步，不放松对真正卡死上游的判定。
  */
 function firstByteBudgetMs(payload) {
+  const base = timeoutMs("firstByteBaseMs", FIRST_BYTE_MS);
+  const cap = timeoutMs("firstByteMaxMs", FIRST_BYTE_MAX_MS);
   const extra = Math.floor(estimateInputTokens(payload) / 10000) * FIRST_BYTE_PER_10K_MS;
-  return Math.min(FIRST_BYTE_MS + extra, FIRST_BYTE_MAX_MS);
+  return Math.min(base + extra, cap);
 }
 
 // ===== HTTP 基础 =====
@@ -54,9 +63,13 @@ function firstByteBudgetMs(payload) {
  *  opts.firstByteMs 由调用方按 prompt 规模给定（缺省 FIRST_BYTE_MS） */
 async function fetchStream(url, opts) {
   const { firstByteMs, ...rest } = opts || {};
-  const budgetMs = Math.max(1000, Number(firstByteMs) || FIRST_BYTE_MS);
+  const budgetMs = Math.max(1000, Number(firstByteMs) || timeoutMs("firstByteBaseMs", FIRST_BYTE_MS));
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), budgetMs);
+  // 到点置位：调用方据此区分「网关首字节预算掐断」与「上游自己断流」——两者都表现为
+  // body 读失败，只有这个标志能把截断如实归因并给出可执行文案（issue #107 的根因即在
+  // 调用方既没解除计时器、又无法分辨这次失败是超时还是断流）
+  let budgetFired = false;
+  const timer = setTimeout(() => { budgetFired = true; ctrl.abort(); }, budgetMs);
   let resp;
   try {
     // redirect 默认 follow，但**必须允许调用方覆盖**：Qoder 的请求头带签名且签名覆盖
@@ -87,13 +100,15 @@ async function fetchStream(url, opts) {
     });
     throw err;
   }
-  return { resp, cancelTimer: () => clearTimeout(timer) };
+  return { resp, cancelTimer: () => clearTimeout(timer), budgetFired: () => budgetFired };
 }
 
-/** 普通 JSON 请求（额度查询 / token 刷新），60s 总超时（参考项目 120s 口径的折中：含冷启动排队） */
+/** 普通 JSON 请求（额度查询 / token 刷新），默认 60s 总超时（参考项目 120s 口径的折中：含冷启动排队）；
+ *  超时值可经 proxy.httpJsonTimeoutMs 配置（0/缺省回退 60s 内置默认） */
 async function httpJson(url, opts) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 60000);
+  const budget = timeoutMs("httpJsonTimeoutMs", 60000);
+  const timer = setTimeout(() => ctrl.abort(), budget);
   try {
     const resp = await fetch(url, { ...opts, signal: ctrl.signal });
     const text = await resp.text();
@@ -105,17 +120,19 @@ async function httpJson(url, opts) {
   }
 }
 
-/** 逐块读 SSE：web stream 异步迭代 + 空闲 300s 判死；客户端断连后继续消费至 EOF（保 usage 完整） */
+/** 逐块读 SSE：web stream 异步迭代 + 空闲判死（默认 300s，可经 proxy.streamIdleMs 配置）；
+ *  客户端断连后继续消费至 EOF（保 usage 完整） */
 async function pumpSse(resp, onEvent) {
   const scanner = new util.SseScanner(onEvent);
   const decoder = new TextDecoder();
   const reader = resp.body.getReader();
-  // 单个 idle 定时器循环重置：原来每读一个 chunk 就新挂一个 300s 定时器且旧的不清，
+  const idleMs = timeoutMs("streamIdleMs", STREAM_IDLE_MS);
+  // 单个 idle 定时器循环重置：原来每读一个 chunk 就新挂一个定时器且旧的不清，
   // 长流（几千 chunk）会同时挂几千个待触发定时器，高并发时随流量线性膨胀
   let idleTimer = null;
   const armIdle = () =>
     new Promise((_, rej) => {
-      idleTimer = setTimeout(() => rej(Object.assign(new Error("流中读超时（300s）"), { idleTimeout: true })), STREAM_IDLE_MS);
+      idleTimer = setTimeout(() => rej(Object.assign(new Error(`流中读超时（${Math.round(idleMs / 1000)}s）`), { idleTimeout: true })), idleMs);
     });
   try {
     for (;;) {
@@ -323,6 +340,86 @@ function pickEntitlementPack(packs) {
   }
   // 档位都不认识（上游加了新套餐）：退化成余量最大的那个包
   return shaped.reduce((a, b) => (b.credits > a.credits ? b : a), { productType: 0, credits: 0, expiresAt: 0 });
+}
+
+/** Trae 逐包 + 账号级折叠：user_entitlement_pack_list → 到期日历的包行（纯函数，自测直接喂合成样本）。
+ *  返回 { packages, credits, expiresAt }；调用点只看 packages.length 决定要不要用这份结果。
+ *  两条 -1 的分工与 pool.deriveAccountCredits 同口径：remaining=-1 才是「额度不限」，
+ *  total=-1 只是「上游不给这一包的面值」，混了会把整号派生成无限并绕开 cost-first。 */
+function traeCredits(packs) {
+  const packages = [];
+  for (const p of Array.isArray(packs) ? packs : []) {
+    // 参考项目 trae/usage.rs 的三条过滤：隐藏包、已取消(status=3)、兑换码包(product_type=3)。
+    // 只在 entitlement_base_info 这一层**直接读**（字段就在那），且只在结构存在时生效——
+    // 老响应没这层嵌套时照常出包，不做全域 dig（那会误吃到别的 status）。
+    const base = p && typeof p.entitlement_base_info === "object" && p.entitlement_base_info ? p.entitlement_base_info : null;
+    if (base) {
+      if (base.is_hide === true) continue;
+      if (Number(base.status) === 3) continue;
+      if (Number(base.product_type) === 3) continue;
+    }
+    const limit = Number(util.dig(p, /^credits_limit$/i));
+    if (!Number.isFinite(limit) || limit === 0) continue; // 无该字段 / 面值为 0 = 这份包不属于该号
+    const used = Number(util.dig(p, /^credits_amount$/i)) || 0;
+    // limit < 0 是上游「不限量」哨兵。旧判据 `limit <= 0 continue` 把这种包**整条丢掉**
+    // ⇒ 日历少一行、连带丢掉它的到期。翻成本仓形状：total/remaining 各落 -1（分工见函数头）。
+    const unlimited = limit < 0;
+    packages.push({
+      code: String(util.dig(p, /^entitlement_pack_id$|^pack_id$|^id$/i) || `pack${packages.length}`).slice(0, 128),
+      name: String(util.dig(p, /^display_desc$|^name$|^pack_name$/i) || "资源包").slice(0, 128),
+      total: unlimited ? -1 : limit,
+      used,
+      remaining: unlimited ? -1 : Math.max(limit - used, 0),
+      // 与 lobster / qoder 那两族同口径走 normalizeExpiryMs（纯日期串补当天末尾、远未来脏值当长期
+      // 有效），不再用裸 toMs——不限量包最可能带的就是哨兵型到期，不归一会在日历排出一行「还剩几万年」。
+      expiresAt: util.normalizeExpiryMs(util.dig(p, /end_time|expire|deadline|valid_until/i)),
+    });
+  }
+  // 账号级折叠：任一包 remaining=-1 ⇒ 整号「不限」（与 pool.deriveAccountCredits 同判据），
+  // 且此后不再累加——把 -1 当欠款加进和里会得到 59 这种「既不是数也不是哨兵」的值。
+  // ⚠ 这里不按到期过滤（沿用本渠道既有口径）；落库那份由 credits.cjs 用
+  // pool.deriveAccountCredits 覆盖成「Σ 未过期包剩余」。两处口径不同是有意的，
+  // 但同一批包在没有过期包时必须给同一个数——闸里钉着这条。
+  let credits = 0;
+  let expiresAt = 0;
+  for (const p of packages) {
+    if (p.remaining === -1) credits = -1;
+    else if (credits !== -1) credits += p.remaining;
+    if (p.expiresAt > Date.now() && (!expiresAt || p.expiresAt < expiresAt)) expiresAt = p.expiresAt;
+  }
+  return { credits, expiresAt, packages };
+}
+
+/** zcode（JWT 侧）逐包：balances 一条 = 一个套餐额度（纯函数，自测直接喂合成样本）。
+ *  plan 的名字在 plans 里，按 plan_id join 过来，否则日历每行只能显示一串 id。
+ *  ⚠ remaining 一律夹成 >=0：上游欠额时给的是负数，而 store 的入库归一只把 **< -1** 夹成 0、
+ *  原样保留 -1（-1 是「额度不限」哨兵）。不夹的话一个欠额到 -1 的包会把整个账号的余额
+ *  派生成无限，并绕开 cost-first 路由——这个坑在 lobster 那侧已经踩过一次。 */
+function zcodeCreditPackages(balances, plans) {
+  const planName = {};
+  for (const pl of Array.isArray(plans) ? plans : []) {
+    const pid = String((pl && (pl.plan_id || pl.planId)) || "");
+    if (pid) planName[pid] = String((pl && pl.name) || pid);
+  }
+  return (Array.isArray(balances) ? balances : []).map((b, idx) => {
+    if (!b || typeof b !== "object") return null;
+    const total = Number(b.total_units);
+    const used = Number(b.used_units);
+    const raw = b.remaining_units != null ? Number(b.remaining_units)
+      : (b.available_units != null ? Number(b.available_units) : NaN);
+    const pid = String(b.plan_id || b.planId || b.entitlement_id || "");
+    const remaining = Number.isFinite(raw) ? raw
+      // 缺 remaining 时退回 total-used：与本渠道账号级 credits 同口径，少一个字段不至于把整包读成 0
+      : (Number.isFinite(total) && Number.isFinite(used) ? total - used : 0);
+    return {
+      code: (pid || `pack${idx}`).slice(0, 128),
+      name: String(b.show_name || b.name || planName[pid] || pid || "套餐额度").slice(0, 128),
+      total: Number.isFinite(total) ? total : 0,
+      used: Number.isFinite(used) ? used : 0,
+      remaining: Math.max(0, remaining),
+      expiresAt: util.toMs(b.expires_at ?? b.expiresAt),
+    };
+  }).filter(Boolean);
 }
 
 const trae = {
@@ -679,21 +776,14 @@ const trae = {
         }
         const packs = findList(r.data, "user_entitlement_pack_list") || [];
         if (packs.length) {
-          let credits = 0;
-          let expiresAt = 0;
-          for (const p of packs) {
-            const limit = Number(util.dig(p, /^credits_limit$/i)) || 0;
-            if (limit <= 0) continue;
-            const used = Number(util.dig(p, /^credits_amount$/i)) || 0;
-            credits += Math.max(limit - used, 0);
-            const end = util.toMs(util.dig(p, /end_time|expire|deadline|valid_until/i));
-            if (end && end > Date.now() && (!expiresAt || end < expiresAt)) expiresAt = end;
-          }
-          if (credits > 0) return { credits, expiresAt };
-          // 新版字段缺失时退回旧档位口径（单一包 remain）
+          const t = traeCredits(packs);
+          // 守卫从 `credits > 0` 换成 `packages.length`：不限量账号的 credits 是 -1，沿用旧守卫
+          // 会掉进下面「退回旧档位口径」，把刚解析出来的包整个扔掉——正是本条要修的那个丢失。
+          if (t.packages.length) return t;
+          // 三条过滤把全部包都滤掉 / 新版字段缺失时，退回旧档位口径（单一包 remain）
           const best = pickEntitlementPack(packs);
           if (best.credits > 0) return { credits: best.credits, expiresAt: best.expiresAt };
-          return { credits: 0, expiresAt };
+          return { credits: 0, expiresAt: t.expiresAt };
         }
         lastErr = "上游未返回订阅包";
       }
@@ -873,6 +963,7 @@ function parseWbResource(data, isEnterprise) {
   let used = 0;
   let size = 0;
   let earliestEnd = 0;
+  const packages = [];
   const num = (a, re) => Number(util.dig(a, re)) || 0;
   for (const a of accounts) {
     // 单包口径（参考项目 packageRemainUsed）：Cycle 期套餐优先，缺 Cycle 退回 Capacity 三字段
@@ -895,6 +986,16 @@ function parseWbResource(data, isEnterprise) {
     const end = util.toMs(util.dig(a, /^PackageEndTime$|^CycleEndTime$|^CycleResetTime$/i));
     // 只取未来的到期时间：响应里混着已过期的历史包（Status=3），取其到期会把账号误判成「余额已到期」
     if (end && end > Date.now() && (!earliestEnd || end < earliestEnd)) earliestEnd = end;
+    // 逐包明细：上面三个数（r/u/s）与到期本来就是**按包**算出来的，此前只在 return 里被折成
+    // 账号级两个标量。per-pack 的到期刻意不做「只取未来」过滤——已过期的包正是要在日历里看得见。
+    packages.push({
+      code: String(util.dig(a, /^PackageCode$|^SubProductCode$|^ProductCode$/i) || `pack${packages.length}`).slice(0, 128),
+      name: String(util.dig(a, /^PackageName$|^SubProductName$|^ProductName$/i) || "资源包").slice(0, 128),
+      total: s,
+      used: u,
+      remaining: r,
+      expiresAt: end,
+    });
   }
   // TotalDosage 作 size 下限（已消耗的总量不该小于套餐总量）
   const dosage = Number(util.dig(data, /^TotalDosage$/i)) || 0;
@@ -904,7 +1005,7 @@ function parseWbResource(data, isEnterprise) {
   } else if (size > 0 && size - remain > used) {
     used = size - remain;
   }
-  return { credits: Math.max(remain, 0), expiresAt: earliestEnd };
+  return { credits: Math.max(remain, 0), expiresAt: earliestEnd, packages };
 }
 
 /** 官方客户端会话头族（参考项目 ChatMeta 实证：后台按 X-Conversation-Request-ID 聚合请求，
@@ -931,6 +1032,19 @@ function wbConversationHeaders(body, meta) {
   const convId = body && (body.conversation_id || body.conversationId);
   if (typeof convId === "string" && convId) h["x-conversation-id"] = convId;
   return h;
+}
+
+/** WorkBuddy 账号级风控拦截识别：HTTP 403 + code 11140「request illegal」。
+ *  上游把它的 displayMsg 伪装成内容审核（「内容未通过安全审核，请调整后重试」），实测与提问内容、
+ *  请求头、UA、x-domain 全都无关：同一 body 换个账号立刻 200，同一账号换任何 body 仍 403；
+ *  同账号的目录（/v3/config）与计费端点也照常 200——是账号在「模型调用」这一面上的风控状态，
+ *  不是请求指纹问题，更不是提问内容问题。原样透传会把用户引到「改提问」这条死路上。
+ *  双通道判定：HTTP 路径从 body 文本认码，流内 error 事件走 code 字段（与 11128 同口径）。 */
+function isWbAccountBlocked(e) {
+  if (!e) return false;
+  if (Number(e.code) === 11140) return true;
+  const s = String(e.body || e.message || "");
+  return /\b11140\b/.test(s) || /request illegal/i.test(s);
 }
 
 /** X-Device-Token 文件兜底（参考项目 device_token.go：≤1KB、5min 缓存） */
@@ -1135,8 +1249,14 @@ function makeWorkBuddy(channelId) {
         if (Number.isFinite(mct) && mct > 0 && out.max_tokens == null) out.max_tokens = mct;
         delete out.max_completion_tokens;
       }
-      // tool_choice 归一（对象报 400 code 11101）：{type:function} → name；none→none；any/required→required；其余→auto
-      if (out.tool_choice && typeof out.tool_choice === "object") {
+      // tool_choice 归一（对象报 400 code 11101）：{type:function} → name；none→none；any/required→required；其余→auto。
+      // 字符串 "none" 也要撤 tools/functions（对齐 trae rewriteBody 与参考 normalize 实测：
+      // 上游语义是不调用工具时连声明一起撤，保留 tools 会报参数错误）
+      if (out.tool_choice === "none") {
+        delete out.tools;
+        delete out.functions;
+        delete out.tool_choice;
+      } else if (out.tool_choice && typeof out.tool_choice === "object") {
         const tc = out.tool_choice;
         if (tc.function && tc.function.name) out.tool_choice = tc.function.name;
         else if (tc.type === "none") out.tool_choice = "none";
@@ -1352,6 +1472,41 @@ function makeWorkBuddy(channelId) {
         cancelTimer();
       }
       return result;
+    },
+
+    /** 渠道私有业务码分类（扩展点见本文件尾契约）：11140 = 账号在模型调用面上被风控拦截。
+     *  单独成一档是为了两件事：① 立即冷却该账号（通用层会把它当 5xx，连错 3 次才熔断，
+     *  期间每次请求都白撞一趟）；② 让调用方能把上游那句「内容未通过安全审核」改写成本机能
+     *  执行的说法（见 server.cjs 的 ACCOUNT_BLOCKED_MSG）。不进渠道降级——这是账号状态，
+     *  不是渠道故障，罚渠道会误伤同渠道的其它好号 */
+    classifyError(e) {
+      if (isWbAccountBlocked(e)) return { kind: "account_blocked", switchable: true, status: 403 };
+      return null;
+    },
+
+    /** 切号前探活：这条链路与真实对话逐字节同构（同 headers / 同 rewriteBody / 同 URL 候选），
+     *  所以「探活通过」就等于「网关能拿这个号正常对话」。只回答一件事——账号是否被上游风控拦截，
+     *  其余失败（网络不通、超时、模型名不认）一律 inconclusive，由调用方放行：探活失败 ≠ 账号坏，
+     *  拿它当否决条件会让一次网络抖动挡掉正常切号。max_tokens=1，代价是一次极小的上游请求 */
+    async probeChat(account, secrets) {
+      const model = "default-model"; // 官方桌面端自带别名，两个区都存在；探活只关心闸门，不关心具体模型
+      // 首条必须是 system：上游的校验顺序是「先形状、后风控」——体形状不对只会拿到 11128，
+      // 根本摸不到 11140 那道闸，探活就白做了（实测：同账号 user 打头 → 11128，system 打头 → 11140）
+      const body = {
+        model,
+        max_tokens: 1,
+        messages: [{ role: "system", content: "You are CodeBuddy, an AI coding assistant." }, { role: "user", content: "hi" }],
+      };
+      let streamErr = null;
+      try {
+        await this.chat({ account, secrets, model, body, meta: {}, emit: (ev) => { if (ev && ev.type === "error") streamErr = ev; } });
+      } catch (e) {
+        if (isWbAccountBlocked(e)) return { ok: false, blocked: true, message: String((e && e.message) || e) };
+        return { ok: false, inconclusive: true, message: String((e && e.message) || e) };
+      }
+      // 流内 error 事件（非 2xx 之外的业务拒绝）同样要认
+      if (streamErr && isWbAccountBlocked(streamErr)) return { ok: false, blocked: true, message: String(streamErr.message || "") };
+      return { ok: true };
     },
 
     /**
@@ -2083,6 +2238,87 @@ function normalizeGlmReasoning(out) {
   if (out.extra_body && typeof out.extra_body === "object") delete out.extra_body.thinking;
 }
 
+/** 兜底取新凭据：从远端号池拉一次（只拉取合并，preferKeys 让本号优先采纳远端那份），
+ *  返回合并后本机这一号的凭据。用于「refresh 被服务端拒绝」——另一台设备可能刚轮换出新值。
+ *  WebDAV 未配置 / 别的同步在进行 / 网络失败 / 超时一律回 { pulled:false }：刷新链路绝不能被
+ *  远端拖死；pulled 只是「确实发起过拉取」，决定失败文案是「已尝试过但没取到」还是「没试成」，
+ *  免得对用户谎报动作。 */
+async function pullRaccoonCreds(account) {
+  if (!account || !account.id) return { pulled: false };
+  try {
+    const poolsync = require("./poolsync.cjs");
+    const r = await Promise.race([
+      poolsync.pullChannel("raccoon", { preferKeys: new Set([poolsync.accountKeyOf(account)]) }),
+      new Promise((res) => {
+        const t = setTimeout(() => res({ ok: false, message: "拉取远端号池超时" }), 8000);
+        if (t.unref) t.unref();
+      }),
+    ]);
+    if (!r || !r.ok) return { pulled: false };
+    const row = store.getAccount(account.id);
+    if (!row) return { pulled: true };
+    const s = store.accountSecrets(row);
+    return { pulled: true, token: s.token || "", refreshToken: s.refreshToken || "" };
+  } catch {
+    return { pulled: false };
+  }
+}
+
+/** access 是否已过期（本地解 exp，留 60s 余量；解不出当过期） */
+function raccoonAccessExpired(token) {
+  const exp = Number(util.jwtDecode(token).exp || 0);
+  return !exp || exp * 1000 <= Date.now() + 60000;
+}
+
+/** 账号 meta 读成对象（行里 meta 是 JSON 串、调用方手里的可能是对象，两形状都收） */
+function raccoonMetaOf(account) {
+  try {
+    const raw = account && account.meta;
+    if (raw && typeof raw === "object") return raw;
+    const p = JSON.parse(String(raw || "{}"));
+    return p && typeof p === "object" && !Array.isArray(p) ? p : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 刷新成功后比对 sid（会话6 §2.3 的欠账）：sid 是同一次登录会话的标识，刷新不该改变它；
+ *  变了说明该账号在别处被重新登录过（服务端按 sid 互踢，旧会话可能被作废）。
+ *  只留一条可诊断的警告、不改账号状态——这一刻的凭据是可用的，真实影响由下一次刷新结果说了算。 */
+function noteRaccoonSid(account, token) {
+  try {
+    if (!account || !account.id) return false;
+    const sid = String((util.jwtDecode(token).payload || {}).sid || "");
+    if (!sid) return false;
+    const row = store.getAccount(account.id);
+    if (!row) return false;
+    const meta = raccoonMetaOf(row);
+    const prev = String(meta.sid || "");
+    if (prev === sid) return false;
+    store.updateAccount(account.id, { meta: { ...meta, sid } });
+    // 首次记录不算异常，只有「换过」才是
+    if (prev) {
+      store.noteError(account.id, "会话标识(sid)已变化：该账号疑似在其他设备或客户端重新登录过（同号多会话会被服务端互踢）。若别处已掉登录，请勿在多台机器重复登录同一个号");
+    }
+    return !!prev;
+  } catch {
+    return false;
+  }
+}
+
+/** 刷新失败文案分流：把服务端给的拒绝码翻成用户能照做的下一步。
+ *  triedPull 只表示「确实发起过远端拉取」——没配 WebDAV / 别的同步占着 / 网络失败时不能
+ *  对用户说「已尝试从其他设备拉取」，那是在谎报动作。 */
+function raccoonRefreshFailHint(rejectCode, triedPull) {
+  const why = rejectCode === 200822
+    ? "（服务端返回 200822：该 refresh_token 已被并发刷新替换）"
+    : "";
+  const tail = triedPull
+    ? "；已从其他设备拉取过最新凭据但没取到更新的一份——若确实在别的设备重新登录过该账号，本机也需重新登录一次"
+    : "；若刚在小浣熊客户端点过「退出登录」，服务端凭据会被吊销，号池内该账号需重新导入或登录";
+  return why + tail;
+}
+
 const raccoon = {
   id: "raccoon",
 
@@ -2370,17 +2606,29 @@ const raccoon = {
    *  与桌面端共用 ~/.box-agent/config/auth.json：刷前以文件里的最新 refresh_token 为准
    *  （桌面端可能刚刷过并旋转，用号池快照里的旧值会吃 401 —— 掉登录根因），
    *  刷新成功后原子写回，让两边始终持同一份凭据；文件归属校验不过则绝不碰文件。
-   *  旋转竞态兜底：401 可能是并发刷新已旋转 refresh——重读文件，值变了就用新值再试一次，
-   *  仍 401 才判失效（方案文档 §2.3：/401 后重读文件再试一次） */
+   *
+   *  refresh_token 是**单副本、用后轮换作废**的凭据，于是"谁手里的是旧值"这件事必然发生
+   *  （同机是与桌面端抢，跨机是与同步过去的另一台抢）。被拒后按三级兜底依次尝试，
+   *  全都不成立才判失效：
+   *   ① 本机共用文件：重读 auth.json，值变了就用新值再试（同机并发刷新竞态）；
+   *   ② 跨机号池：拉一次远端号池取另一台刚轮换出来的凭据——新 refresh 就用它重试；
+   *      对端 refresh 与手里这份相同但 access 还没过期，则直接采用（省一次刷新与一次轮换，
+   *      避免两台机器互相把对方轮换掉）；
+   *   ③ access 双保险：refresh 被拒但当前 access 仍在线（userInfo 验通）就不判失效。
+   *  成功刷新后触发一次去抖回传（poolsync.pushSoon）：不推的话对端手里的 refresh 立刻作废，
+   *  下次同步之前它都是"需重新登录"。 */
   async refreshToken(account, secrets) {
     const c = this.cfg();
     const uid = account && account.uid;
     const own0 = raccoonAuth.ownedTokens(uid, secrets && secrets.refreshToken);
     let refreshToken = (own0 && own0.refreshToken) || (secrets && secrets.refreshToken) || "";
     if (!refreshToken) return { ok: false, message: "无 refreshToken，请重新登录或粘贴" };
-    let headers = raccoonRefreshHeaders(c, account);
+    const headers = raccoonRefreshHeaders(c, account);
+    let pulledRemote = false; // 跨机兜底只做一次（重试预算有限，也避免反复打 WebDAV）
+    let triedPull = false;    // 是否已经试过拉远端（供失败文案区分「试过没取到」与「压根没试成」）
+    let rejectCode = 0;       // 401 / 200822，用于失败文案分流
 
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const body = JSON.stringify({ refresh_token: refreshToken });
       const r = await httpJson(c.refreshUrl, { method: "POST", headers, body }).catch((e) => ({ ok: false, status: 0, data: null, message: String((e && e.message) || e) }));
       const d = (r.data && (r.data.data || r.data)) || null;
@@ -2391,30 +2639,50 @@ const raccoon = {
         // 回写共用文件（仅当文件确属本号）：桌面端下次刷新读到新值，不再拿旧 refresh 撞 401
         const own = raccoonAuth.ownedTokens(uid, nextRefresh);
         if (own) raccoonAuth.writeTokens({ accessToken: String(token), refreshToken: nextRefresh });
-        return { ok: true, token: String(token), refreshToken: nextRefresh };
+        // 本轮凭据已轮换，对端手里那份作废：就近回传一次，别让它一路跌到"需重新登录"
+        try { require("./poolsync.cjs").pushSoon(); } catch { /* 回传是尽力而为 */ }
+        const sidChanged = noteRaccoonSid(account, String(token));
+        return { ok: true, token: String(token), refreshToken: nextRefresh, sidChanged };
       }
-      if (r.status === 401 || (r.status === 400 && Number(r.data && r.data.code) === 200822)) {
-        // 401 或 200822 (refresh token conflict or reused)：
-        // 可能是桌面端并发刷新旋转了 refresh——重读文件，值变了就用新值再试一次
-        const own = raccoonAuth.ownedTokens(uid, refreshToken);
-        const latest = (own && own.refreshToken) || "";
-        if (latest && latest !== refreshToken) {
-          refreshToken = latest;
-          continue; // 值变了，再试一次
-        }
-        // 双保险容错：如果当前 access_token 依然有效（未过期且 user_info 正常），绝不误判为 expired！
-        if (secrets && secrets.token) {
-          const u = await this.userInfo(secrets.token, account).catch(() => null);
-          if (u && u.uid && String(u.uid) === String(uid)) {
-            // 当前 access_token 仍然在线，仅 refresh_token 存在单侧冲突，继续保持 online 态
-            return { ok: true, token: secrets.token, refreshToken };
-          }
-        }
-        return { ok: false, expired: true, message: "登录态已过期，请重新登录；若刚在小浣熊客户端点过「退出登录」，服务端凭据会被吊销，号池内该账号需重新导入或登录" };
+      const rejected = r.status === 401 || (r.status === 400 && Number(r.data && r.data.code) === 200822);
+      if (!rejected) return { ok: false, message: (d && (d.message || d.msg)) || r.message || `刷新失败 HTTP ${r.status}` };
+      rejectCode = Number(r.data && r.data.code) === 200822 ? 200822 : 401;
+
+      // ① 本机共用文件：同机并发刷新可能刚把它换掉
+      const own = raccoonAuth.ownedTokens(uid, refreshToken);
+      const latest = (own && own.refreshToken) || "";
+      if (latest && latest !== refreshToken) {
+        refreshToken = latest;
+        continue; // 值变了，再试一次
       }
-      return { ok: false, message: (d && (d.message || d.msg)) || r.message || `刷新失败 HTTP ${r.status}` };
+
+      // ② 跨机号池：另一台设备可能刚轮换掉这份
+      if (!pulledRemote && !triedPull) {
+        triedPull = true;
+        const got = await pullRaccoonCreds(account);
+        pulledRemote = !!got.pulled; // 只有真拉成了，失败文案才能说「已尝试过」
+        if (got.refreshToken && got.refreshToken !== refreshToken) {
+          refreshToken = got.refreshToken;
+          continue; // 取到对端的新 refresh，再试一次
+        }
+        // 对端 refresh 与手里这份相同（它也没换过）：但它的 access 还没过期就直接用——
+        // 两台机器各刷一次只会互相作废，能省掉的轮换就省掉
+        if (got.token && got.token !== (secrets && secrets.token) && !raccoonAccessExpired(got.token)) {
+          return { ok: true, token: got.token, refreshToken: got.refreshToken || refreshToken, adopted: true };
+        }
+      }
+
+      // ③ 双保险容错：如果当前 access_token 依然有效（未过期且 user_info 正常），绝不误判为 expired！
+      if (secrets && secrets.token) {
+        const u = await this.userInfo(secrets.token, account).catch(() => null);
+        if (u && u.uid && String(u.uid) === String(uid)) {
+          // 当前 access_token 仍然在线，仅 refresh_token 存在单侧冲突，继续保持 online 态
+          return { ok: true, token: secrets.token, refreshToken };
+        }
+      }
+      return { ok: false, expired: true, message: `登录态已过期，请重新登录${raccoonRefreshFailHint(rejectCode, pulledRemote)}` };
     }
-    return { ok: false, expired: true, message: "登录态已过期（重试后仍 401），请重新登录；客户端「退出登录」会吊销服务端凭据，号池内该账号需重新导入或登录" };
+    return { ok: false, expired: true, message: `登录态已过期（重试后仍被服务端拒绝），请重新登录${raccoonRefreshFailHint(rejectCode, pulledRemote)}` };
   },
 
   /** 用户信息（导入后补全 uid/昵称）：GET /auth/v1/user_info（会话4 §6）。
@@ -2431,8 +2699,9 @@ const raccoon = {
         name: String(d.name || d.nickname || d.user_name || ""),
       };
     }
-    // 接口不可用时本地解码兜底：小浣熊 JWT 顶层是 iss（账户 ID）/ sid，util.jwtDecode 读不出，
-    // 必须用 raccoon 自己的口径（与 discovery.scanRaccoon 一致），否则 uid 恒空、号池去重失效
+    // 接口不可用时本地解码兜底：小浣熊 JWT 顶层的 sub 才是账号 ID（iss 是签发方常量、sid 是会话 ID），
+    // util.jwtDecode 读不出，必须用 raccoon 自己的口径（tokenUid 的 sub 链，与 discovery.scanRaccoon
+    // 完全一致），否则 uid 恒空、或与 OAuth 登录落库的口径不一致导致号池去重失效
     return { uid: raccoonAuth.tokenUid(token), name: "" };
   },
 };
@@ -3178,7 +3447,8 @@ const modelscope = {
     }
     const meta = (account && account.meta) || {};
     const clientId = String(meta.oauthClientId || "");
-    const clientSecret = String(meta.oauthClientSecret || "");
+    // clientSecret 落库时经 DPAPI 加密（msCookie 同款），此处解回明文（兼容存量明文）
+    const clientSecret = config.decryptSecret(String(meta.oauthClientSecret || ""));
     if (!clientId || !clientSecret) {
       return { ok: false, terminal: true, message: "缺少 OAuth 客户端信息（meta.oauthClientId/Secret），无法续期，请重新执行 OAuth 登录" };
     }
@@ -3196,6 +3466,34 @@ const modelscope = {
 let modelScopeRefreshImpl = null;
 function setModelScopeRefresh(fn) {
   modelScopeRefreshImpl = typeof fn === "function" ? fn : null;
+}
+
+/** LobsterAI（有道）逐包：profile-summary 的 creditItems[] → 到期日历的包行。三条实测口径：
+ *  · 上游**不下发逐包面值** ⇒ total 落 -1 =「不给总额」（渲染成「5297 / —」）。
+ *    落 0 会被读成「已用完」，落别的数字就是编出来的。
+ *  · expiresAt 是 string|null，且可能是空格形式 "2099-01-01 00:00:00"；统一走 normalizeExpiryMs
+ *    （它认 ISO / 空格形式 / 秒毫秒，并把远未来哨兵夹成 0 = 长期有效）。
+ *  · creditsRemaining 是浮点且**可为负**（欠额）。负值一律夹成 0：既因为「已用完」才是它的真实
+ *    语义，更因为 -1 在本项目是「不限」哨兵，透下去会把整号余额派生成无限、绕开 cost-first 路由。
+ *  非数组 / 空数组 ⇒ []，调用方回落到账号级聚合行（上游结构变更时不会把余额读成 0）。 */
+function lobsterCreditPackages(items) {
+  if (!Array.isArray(items) || !items.length) return [];
+  const out = [];
+  for (const it of items) {
+    if (!it || typeof it !== "object") continue;
+    const remaining = Number(it.creditsRemaining ?? it.credits_remaining);
+    if (!Number.isFinite(remaining)) continue;
+    out.push({
+      code: String(it.type || `item${out.length}`).slice(0, 128),
+      name: String(it.label || it.labelEn || it.type || "积分包").slice(0, 128),
+      total: -1,
+      used: 0,
+      remaining: Math.max(0, remaining),
+      expiresAt: util.normalizeExpiryMs(it.expiresAt ?? it.expires_at),
+      ord: out.length,
+    });
+  }
+  return out;
 }
 
 const lobster = {
@@ -3475,7 +3773,7 @@ const lobster = {
     }
     const d = r.data.data || r.data;
     const credits = Number(d.totalCreditsRemaining ?? d.total_credits_remaining ?? d.remainingCredits) || 0;
-    return { credits, raw: d };
+    return { credits, packages: lobsterCreditPackages(d.creditItems ?? d.credit_items), raw: d };
   },
 
   /** 签到状态：读活动 context 的 claimedToday（不消费签到动作） */
@@ -4014,7 +4312,8 @@ const zcode = {
         last = { error: "额度数据为空（新账号可能激活延迟）" };
         continue;
       }
-      return { credits, expiresAt, raw: { balances: balances.length, plans: plans.length } };
+      const packages = zcodeCreditPackages(balances, plans);
+      return { credits, expiresAt, packages, raw: { balances: balances.length, plans: plans.length } };
     }
     // 终判：全程 401 → 最后再等 1.5s 用同一 jwt 试一次，仍 401 才算凭证失效
     if (last && last.authError) {
@@ -4180,9 +4479,8 @@ const zcode = {
       region: String((cc && cc.region) || "cn"),
     };
 
-    // ② 调起独立沙箱验证窗
-    const zcodeCapture = require("./zcodeCapture.cjs");
-    const cap = await zcodeCapture.solveCaptcha(captchaCfg, { forceShow: true });
+    // ② 调起人机校验（桌面 = 沙箱验证窗；无图形环境返回 needCaptcha，由调用方如实标记人工）
+    const cap = await platform.solveCaptcha(captchaCfg, { forceShow: true });
     if (!cap.ok) {
       return { ok: false, message: cap.message || "人机校验未完成" };
     }
@@ -4253,6 +4551,340 @@ function assertAdapterContract(channel, ad) {
   }
 }
 
+// ===== 自定义提供商：通用 OpenAI 兼容适配器（按 agents 行动态实例化，一张表行 = 一个上游端点） =====
+
+/** extraBody 深合并：只递归普通对象，数组与标量整体替换。
+ *  拼接语义会让用户写 {"stop":["a"]} 时拿到意外的并集，替换语义才可预测。 */
+function deepMerge(base, patch) {
+  if (patch === undefined) return base;
+  if (!isPlainObj(base) || !isPlainObj(patch)) return patch;
+  const out = { ...base };
+  for (const k of Object.keys(patch)) out[k] = deepMerge(base[k], patch[k]);
+  return out;
+}
+function isPlainObj(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/** 用户 extraBody 里允许落到上游的键。这张白名单的存在理由不是「上游会忽略未知字段」——
+ *  严格端点对未知参数回 400，那会把整条渠道打成不可用，而客户端只会看到"打不通"。
+ *  后续每加一档协议形态都要在这里补它自己那一行，与出站互转模块同时补，缺一不可。 */
+const NATIVE_KEYS_BY_KIND = {
+  openai_compat: ["parallel_tool_calls"],
+};
+
+/** 覆盖权从低到高：上游请求形 < 用户在提供商里手填的 extraBody。
+ *  最后一级必须最高，否则用户没法用配置把某个字段按住。
+ *  被白名单挡下的键如实写日志——静默丢才是问题，语义损失本身是设计里认下的。 */
+function withNative(request, body, kind, row) {
+  const src = body && body.extraBody;
+  const native = {};
+  const dropped = [];
+  if (isPlainObj(src)) {
+    const allow = NATIVE_KEYS_BY_KIND[kind] || [];
+    for (const [k, v] of Object.entries(src)) {
+      if (allow.includes(k)) native[k] = v;
+      else dropped.push(k);
+    }
+  }
+  if (dropped.length) console.warn(`[gateway] ${kind} 形态上游没有这些协议原生字段，已丢弃: ${dropped.join("、")}`);
+  const merged = Object.keys(native).length ? deepMerge(request, native) : request;
+  return deepMerge(merged, row.extraBody || {});
+}
+
+/** models_json 条目归一：字符串 = 裸模型名（上游同名）；对象 = 带元数据与别名。
+ *  {model(客户端裸名), upstream(上游真名，缺省=model), name/rate/capabilities/contextLength/maxOutputTokens} */
+function compatModelEntries(row) {
+  const out = [];
+  for (const m of Array.isArray(row.models) ? row.models : []) {
+    if (typeof m === "string") {
+      if (m.trim()) out.push({ client: m.trim(), upstream: m.trim(), entry: null });
+      continue;
+    }
+    if (!isPlainObj(m) || !m.model) continue;
+    const client = String(m.model).trim();
+    if (!client) continue;
+    out.push({ client, upstream: String(m.upstream || client).trim(), entry: m });
+  }
+  return out;
+}
+
+/** 提供商模型的 catalog 形状（与内置渠道的 catalogMap 同构）：合并目录那一步按 `entry.id` 在
+ *  `catMaps[entry.sources[0]]` 里查元数据，而提供商条目的 id 是带前缀的 `slug/client`，所以两种键
+ *  都铺上（带前缀的给合并目录查，裸名给只知道自己模型清单的调用方用）。
+ *  提供商因此走的是与内置渠道完全同一条富化路径，不第二套实现。 */
+function providerCatalogMap(row) {
+  const map = new Map();
+  for (const e of compatModelEntries(row)) {
+    const m = e.entry || {};
+    const meta = {
+      id: e.client,
+      name: m.name || undefined,
+      rate: m.rate != null ? m.rate : undefined,
+      capabilities: m.capabilities || {},
+      contextLength: Number(m.contextLength) || 0,
+      maxOutputTokens: Number(m.maxOutputTokens) || 0,
+    };
+    map.set(e.client.toLowerCase(), meta);
+    map.set(`${row.id}/${e.client}`.toLowerCase(), meta);
+  }
+  return map;
+}
+
+/** 限流措辞（429 语义：现在慢一点，短退避换号即可）。刻意**不含裸 quota**——
+ *  中转站大量用 "rate limit quota exceeded" / "requests per minute quota exceeded" 报限流。 */
+const RATE_LIMIT_HINT = /rate[_ ]?limit|too many requests|requests per (minute|second)|请求过于频繁|限流|\brpm\b|\btpm\b/i;
+/** 欠费措辞（402 语义：这个号没钱了，才该 coolAccount("credit") 冷却到次日）。
+ *  OpenAI 官方的 insufficient_quota 与「You exceeded your current quota」配的是 429 码，
+ *  但语义确实是欠费，故按措辞收在这里——所以判序必须是「先限流措辞、再欠费措辞」。 */
+const BILLING_HINT = /insufficient_quota|insufficient[_ ]?balance|quota[_ ]?exhausted|quota[_ ]?exceeded|exceeded[^.]{0,24}quota|out of credits|no credits|balance|exhausted|欠费|余额|积分不足|积分耗尽/i;
+
+/** 上游错误 → HTTP 语义。中转站的错误体形状远比内置渠道散，这里只认 OpenAI 形状 + 常见措辞：
+ *  余额/配额类判 402（换号）、鉴权类判 401（冷却该 Key）、其余按码透传，认不出的一律 502（可换号）。 */
+function statusFromCompatError(errObj, data) {
+  const raw = String((errObj && (errObj.type || errObj.code)) || "");
+  const msg = String((errObj && errObj.message) || (data && data.message) || "");
+  const text = `${raw} ${msg}`;
+  // 限流必须排在欠费之前：原来只按裸 "quota" 判 402，把 "rate limit quota exceeded" 这类
+  // 限流也算成欠费 → planLimit → pool.coolAccount("credit") 把账号冷却到次日 04:00，
+  // 一个好号被按「没余额」静默跳过一整天，池子可用容量骤降（本 PR 复查发现）。
+  // 两条正则互斥：限流那条不含裸 quota，欠费那条含 insufficient_quota
+  if (RATE_LIMIT_HINT.test(text)) return 429;
+  if (BILLING_HINT.test(text)) return 402;
+  if (/auth|api[_ ]?key|invalid[_ ]?key|unauthorized/i.test(text)) return 401;
+  const n = Number(errObj && errObj.code);
+  if (n === 429 || n === 401 || n === 404 || n === 400 || n === 402 || (n >= 500 && n < 600)) return n;
+  return 502;
+}
+
+/** 出站端点统一在这里拼：`base_url` 存的是**不含 /v1 的根**（归一化侧保证），所以 /v1 必须由这里补。
+ *  真机实测（一家只开 /v1/messages 的中转站）：只拼 leaf 会打到它的前端页面——回 200 + text/html，
+ *  比 404 更难归因。规则只写这一处：换协议只换 leaf。 */
+function compatUrl(base, leaf) {
+  // 完整端点形态（normalizeBaseUrl 不剥裸 /chat/completions）：该站点不挂 /v1 前缀，
+  // chat 主链路直用 base；其余 leaf 无从推导，退回「剥掉叶子再补 /v1/leaf」——
+  // 辅助端点（models 探测等）在纯根挂载站上本就常缺，可达性让位于对话主链路
+  if (/\/chat\/completions$/i.test(base)) {
+    if (leaf === "chat/completions") return base;
+    return `${base.replace(/\/chat\/completions$/i, "")}/v1/${leaf}`;
+  }
+  return `${base}/v1/${leaf}`;
+}
+
+function makeOpenaiCompat(row, opts) {
+  const entries = compatModelEntries(row);
+  const chatUrl = compatUrl(row.baseUrl, "chat/completions");
+  // 首字节预算函数可注入（opts.firstByteBudgetMs），只为自测能把 30s 缩短到秒级复现
+  // 「首事件不解除预算 → 长回答被掐断」这条现场；生产路径一律用模块内那份口径。
+  // 与 autoclawDeps 注入 firstByteBudgetMs 是同一个先例，不新造第二套预算算法
+  const budgetOf = opts && typeof opts.firstByteBudgetMs === "function" ? opts.firstByteBudgetMs : firstByteBudgetMs;
+  // 客户端名 → 上游真名 / → 条目。别名与模型名同等参与解析（别名不进 /v1/models，
+  // 但客户端拿它发请求必须能命中），所以两张表都要把 aliases 铺进去。
+  const upstreamByClient = new Map();
+  const entryByClient = new Map();
+  for (const e of entries) {
+    upstreamByClient.set(e.client.toLowerCase(), e.upstream);
+    entryByClient.set(e.client.toLowerCase(), e);
+    for (const a of (e.entry && Array.isArray(e.entry.aliases) ? e.entry.aliases : [])) {
+      const k = String(a || "").toLowerCase();
+      if (!k) continue;
+      upstreamByClient.set(k, e.upstream);
+      entryByClient.set(k, e);
+    }
+  }
+  /** 剥掉自家的 `slug/` 前缀（那是路由信息，上游听不懂） */
+  const stripPrefix = (clientModel) => {
+    const s = String(clientModel || "");
+    return s.slice(0, row.id.length + 1).toLowerCase() === `${row.id}/`.toLowerCase() ? s.slice(row.id.length + 1) : s;
+  };
+  return {
+    /** 提供商没有 rules/headers.json 那套 UA/指纹伪装：头 = 标准 JSON + Bearer + 用户自定义覆盖 */
+    headers(secrets) {
+      const h = {
+        "content-type": "application/json",
+        accept: "application/json",
+        authorization: `Bearer ${secrets.token || ""}`,
+      };
+      for (const [k, v] of Object.entries(row.extraHeaders || {})) h[String(k)] = String(v);
+      return h;
+    },
+
+    /** 客户端模型名 → 上游真名：先剥自家的 `slug/` 前缀，再查条目配的 upstream（模型名与别名同表）。
+     *  目录外模型原样透传：用户显式点名了提供商，而中转站实际开放的模型常常领先于它的清单
+     *  （内置渠道同款"透传试错"语义）。 */
+    upstreamFor(clientModel) {
+      const s = stripPrefix(clientModel);
+      return upstreamByClient.get(s.toLowerCase()) || s;
+    },
+
+    /** 客户端模型名（或别名）→ 该条目的元数据；查不到回 null，调用方按"无目录元数据"处理 */
+    entryFor(clientModel) {
+      return entryByClient.get(stripPrefix(clientModel).toLowerCase()) || null;
+    },
+
+    models() {
+      return entries.map((e) => e.client);
+    },
+
+    modelEntries() {
+      return entries;
+    },
+
+    /** 拉上游自己的清单（GET {base}/v1/models）：中转站大多支持，失败如实回错，
+     *  由 UI 引导手填——真没有模型目录接口的站是少数，替上游预判会拒掉有能力的那批。
+     *  形参沿用本文件所有适配器同一条 fetchModels(account, secrets) 调用面，不另立一套。 */
+    async fetchModels(account, secrets) {
+      const r = await httpJson(compatUrl(row.baseUrl, "models"), { method: "GET", headers: this.headers(secrets || {}) })
+        .catch((e) => ({ ok: false, status: 0, data: null, text: String((e && e.message) || e) }));
+      if (!r.ok) {
+        return {
+          ok: false,
+          message: `HTTP ${r.status || 0} ${(r.text || "").slice(0, 200)}` +
+            (r.status === 404 ? "（该上游没有模型目录接口，请在模型清单里手填）" : ""),
+        };
+      }
+      const list = (r.data && (Array.isArray(r.data) ? r.data : r.data.data)) || [];
+      const models = list.map((m) => String((m && (m.id ?? m.model ?? m.name)) || "")).filter(Boolean);
+      return { ok: true, models };
+    },
+
+    /** 思考档位按该模型声明的支持集降级（与内置渠道同一个 util，档位词表也同源）：
+     *  客户端要 low 而上游只有 medium/high 时，透传过去是一个 400，降级才可用。 */
+    applyReasoning(model, out) {
+      const entry = this.entryFor(model);
+      util.normalizeReasoningEffort(out, entry && entry.entry && entry.entry.reasoning);
+      return out;
+    },
+
+    rewriteBody(model, body) {
+      const out = { ...(body || {}) };
+      out.model = this.upstreamFor(model);
+      out.stream = true; // 一律流式打上游，非流式由 server 侧 Aggregator 本地聚合（见 chat() 注释）
+      if (!isPlainObj(out.stream_options)) out.stream_options = {};
+      out.stream_options.include_usage = true;
+      this.applyReasoning(model, out);
+      // 网关自己注入的内部字段，上游不认（内置渠道同款剔除清单）
+      delete out.conversation_id;
+      delete out.conversationId;
+      delete out.prompt_cache_key;
+      // 内部载体不能外泄：跟着 {...body} 原样发给上游，上游会收到一个字面叫 extraBody 的未知字段
+      delete out.extraBody;
+      return withNative(out, body, "openai_compat", row);
+    },
+
+    async chat(ctx) {
+      return this.chatOpenai(ctx);
+    },
+
+    /** OpenAI 协议 1:1 透传 */
+    async chatOpenai({ secrets, model, body, emit }) {
+      const payload = JSON.stringify(this.rewriteBody(model, body));
+      // 首字节预算按 prompt 规模给（与内置渠道同一条口径），不再吃 fetchStream 的固定 30s 缺省
+      const { resp, cancelTimer } = await fetchStream(chatUrl, {
+        method: "POST", headers: this.headers(secrets), body: payload,
+        firstByteMs: budgetOf(payload),
+      });
+      const result = { status: 200, planLimit: false };
+      // 首个字节达标即解除首字节预算计时器：漏这一步会让计时器在整个流期间一直武装，
+      // 到点 abort 掉 resp.body，把一条正常的长回答掐成「HTTP 200 + 半截内容」——客户端与
+      // 请求明细都显示 200，被误读成「上游只回了这一点」（issue #107 的根因）。
+      // 本文件其余内置渠道（workbuddy / raccoon / zcode / qoder / autoclaw）都在首事件里这么做，
+      // 这里是同一条纪律；finally 那次是「一个字节都没到时」的兜底。
+      let settled = false;
+      const settle = () => { if (!settled) { settled = true; cancelTimer(); } };
+      try {
+        // 少数中转站无视 stream:true、直接回一整个 JSON：SseScanner 找不到 data: 行会一条都不产出，
+        // 客户端就拿到 200 空响应。这里按 content-type 单独走非流式分支，别让它静默变空。
+        const ctype = String(resp.headers.get("content-type") || "");
+        if (!ctype.includes("event-stream")) {
+          settle(); // 非流式形态没有"首事件"，读到正文即达标；否则读大 body 期间同样会被 abort
+          const text = await resp.text();
+          const data = parseJson(text);
+          if (!data) throw Object.assign(new Error(`上游返回非 JSON（${text.slice(0, 200)}）`), { status: 502 });
+          this.emitWholeResponse(data, emit, result);
+          return result;
+        }
+        await pumpSse(resp, (_event, raw) => {
+          settle();
+          if (raw === "[DONE]") { emit({ type: "finish", reason: "" }); return; }
+          const data = parseJson(raw);
+          if (!data) return;
+          if (data.error) {
+            const status = statusFromCompatError(data.error, data);
+            if (status === 402) result.planLimit = true;
+            emit({ type: "error", status, code: Number(data.error.code) || 0, message: String(data.error.message || "上游错误") });
+            return;
+          }
+          const choice = Array.isArray(data.choices) && data.choices[0];
+          if (choice) {
+            if (choice.delta && Object.keys(choice.delta).length) emit({ type: "delta", delta: choice.delta });
+            if (choice.message && Object.keys(choice.message).length) emit({ type: "delta", delta: choice.message });
+            if (choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+          }
+          if (data.usage) emit({ type: "usage", usage: compatUsage(data.usage) });
+        });
+      } finally {
+        cancelTimer();
+      }
+      return result;
+    },
+
+    /** 非流式上游响应 → 同一套 emit 词汇（role 帧 + 正文 + tool_calls + usage + finish） */
+    emitWholeResponse(data, emit, result) {
+      if (data.error) {
+        const status = statusFromCompatError(data.error, data);
+        if (status === 402) result.planLimit = true;
+        emit({ type: "error", status, code: Number(data.error.code) || 0, message: String(data.error.message || "上游错误") });
+        return;
+      }
+      const choice = Array.isArray(data.choices) && data.choices[0];
+      if (choice && choice.message && Object.keys(choice.message).length) emit({ type: "delta", delta: choice.message });
+      if (choice && choice.finish_reason) emit({ type: "finish", reason: choice.finish_reason });
+      if (data.usage) emit({ type: "usage", usage: compatUsage(data.usage) });
+    },
+
+    // 提供商是 API Key 直连：没有刷新链路，也没有"余额"这个概念。
+    // 刻意不定义 queryCredits —— credits 的三条刷新入口靠它缺席来跳过（见 credits.cjs 的 creditsCapable），
+    // 补一个假的就会拿用户的第三方 Key 去打一个不存在的余额接口。
+    async refreshToken() {
+      return { ok: false, noRefresh: true, message: "该渠道为 API Key 直连，无自动刷新；Key 失效请换新" };
+    },
+    async userInfo() {
+      return { uid: "", name: "" };
+    },
+  };
+}
+
+/** 中转站的 usage 归一：完整对象照旧透传（保留 prompt_tokens_details.cached_tokens 等扩展字段），
+ *  三个计数按本项目口径落定，并认 input_tokens/output_tokens 那套别名——兼容站两套混用是实测，
+ *  total 缺席时自己补，否则记账那边拿到 0 会把「上游没报」显示成「这次没花 token」。 */
+function compatUsage(u) {
+  const usage = {
+    ...u,
+    prompt_tokens: Number(u.prompt_tokens ?? u.input_tokens) || 0,
+    completion_tokens: Number(u.completion_tokens ?? u.output_tokens) || 0,
+    total_tokens: Number(u.total_tokens) || 0,
+  };
+  if (!usage.total_tokens) usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+  return usage;
+}
+
+// 实例缓存按 `${id}:${updated_at}`：store.saveProvider 会前进 updated_at，于是改完配置自然换实例，
+// 不必重启网关。上限防的是"反复编辑同一个提供商"堆积——每次编辑一个新时间戳、旧实例永不复用。
+const compatCache = new Map();
+function compatAdapter(id) {
+  const row = store.channelList().find((c) => c.id === id && c.kind !== "builtin");
+  if (!row) return null;
+  const key = `${row.id}:${row.updatedAt}`;
+  let ad = compatCache.get(key);
+  if (!ad) {
+    if (compatCache.size > 64) compatCache.clear();
+    ad = makeOpenaiCompat(row);
+    compatCache.set(key, ad);
+  }
+  return ad;
+}
+
 const ADAPTERS = { trae, workbuddy, workbuddy_ai, raccoon, modelscope, lobster, zcode };
 
 // ===== CatPaw（美团）=====
@@ -4280,12 +4912,89 @@ if (store.QODER_INTL_ENABLED) {
   ADAPTERS.qoder_intl = makeQoder("qoder_intl", qoderDeps);
 }
 
+// ===== AutoClaw 双区（国内版 / 国际版：同协议同签名，仅域名与登录方式不同）=====
+// 挂载必须与 store.AUTOCLAW_INTL_ENABLED 同步——ADAPTERS 参与 modelOwners/mergedModels，
+// 只在 CHANNELS 出现而无适配器会让双表一致性校验失败（与 qoder_intl 同口径）。
+// 刷新是「只读不回写」渠道（方案 §7）：refreshToken 返回 noPersist 标记，
+// server/credits 据此跳过 token 落库，新凭证只进适配器进程缓存。
+const { makeAutoClaw } = require("./autoclaw/adapter.cjs");
+const autoclawDeps = { fetchStream, pumpSse, httpJson, rules, util, store, deviceIds, firstByteBudgetMs };
+ADAPTERS.autoclaw = makeAutoClaw("autoclaw", autoclawDeps);
+if (store.AUTOCLAW_INTL_ENABLED) {
+  ADAPTERS.autoclaw_intl = makeAutoClaw("autoclaw_intl", autoclawDeps);
+}
+
+// ===== Cline 双池（cline_free 免费额度池 / cline_pass 订阅池）=====
+// 同套实现按池参数化（与 qoder/autoclaw 双区同款手法）：两池同域同协议同凭证，
+// 差别只有「收哪个池的模型」；配置共用 headers.json 的 cline 段，无地区开关（常开）。
+const { makeCline } = require("./cline/adapter.cjs");
+const clineDeps = { fetchStream, pumpSse, httpJson, rules, util, firstByteBudgetMs };
+ADAPTERS.cline_free = makeCline("cline_free", clineDeps);
+ADAPTERS.cline_pass = makeCline("cline_pass", clineDeps);
+
 // 启动期契约校验：全员必需方法缺失在 require 阶段即抛错（fail-fast），
 // 人为删掉某个适配器的 chat() 后应用启动即崩在明面上，而不是运行期才 404/TypeError
 for (const [channel, ad] of Object.entries(ADAPTERS)) assertAdapterContract(channel, ad);
 
 function get(channel) {
-  return ADAPTERS[channel] || null;
+  // 内置渠道查静态表，未命中再试动态实例化的提供商（ADAPTERS 本身保持只含内置，
+  // 那让 modelOwners 的裸名归属判定完全留给内置渠道，见那里的注释）
+  return ADAPTERS[channel] || compatAdapter(channel) || null;
+}
+
+/** 渠道适配器声明的原始模型 id。
+ * 管理页配置反向映射时必须使用这份清单，不能从 mergedModels.sources 反推：
+ * mergedModels 会把统一请求名注入映射渠道，反推会让统一名自身混入“实际模型”候选。 */
+function channelModelIds(channel) {
+  const ad = get(channel);
+  if (!ad) return [];
+  const out = [];
+  for (const value of ad.models()) {
+    const id = String(value || "").trim();
+    if (id && !out.some((item) => item.toLowerCase() === id.toLowerCase())) out.push(id);
+  }
+  return out;
+}
+
+function reverseAliasEntry(model, cfg) {
+  const rev = (cfg || proxyConfig()).modelReverseAliases || {};
+  const direct = rev[String(model || "")];
+  if (direct && typeof direct === "object") return direct;
+  const lower = String(model || "").toLowerCase();
+  for (const [key, value] of Object.entries(rev)) {
+    if (key.toLowerCase() === lower && value && typeof value === "object") return value;
+  }
+  return null;
+}
+
+/** 反向映射的渠道目标。自映射（统一名 -> 同名）是历史 UI 污染，不构成可转发目标。 */
+function reverseAliasTarget(model, channel, cfg) {
+  const entry = reverseAliasEntry(model, cfg);
+  if (!entry) return null;
+  const raw = entry[channel];
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const target = raw.trim();
+  return target.toLowerCase() === String(model || "").trim().toLowerCase() ? null : target;
+}
+
+function nativeModel(channel, model) {
+  const ad = get(channel);
+  const lower = String(model || "").trim().toLowerCase();
+  return !!ad && lower !== "" && ad.models().some((item) => String(item).toLowerCase() === lower);
+}
+
+/** 模型在某渠道上的实际可转发名。
+ * 该渠道显式配了反向映射时，只认映射结果；自映射/空映射不得再回退成“原生模型”，
+ * 否则历史脏目录里恰好混入统一名时，仍可能把统一名发给上游。
+ * 未配该渠道映射时，原生模型名可继续作为合法目标（保留 issue #78 的跨渠道备选）。 */
+function resolveModelTarget(model, channel, cfg) {
+  const normalized = String(model || "").trim();
+  if (!normalized || !get(channel)) return null;
+  const entry = reverseAliasEntry(normalized, cfg);
+  if (entry && Object.prototype.hasOwnProperty.call(entry, channel)) {
+    return reverseAliasTarget(normalized, channel, cfg);
+  }
+  return nativeModel(channel, normalized) ? normalized : null;
 }
 
 // ===== 刷新并发互斥（single-flight） =====
@@ -4313,6 +5022,12 @@ function mergedModels(cfg) {
   const seen = new Map();
   const catMaps = {};
   for (const channel of Object.keys(ADAPTERS)) catMaps[channel] = catalogMap(channel);
+  // 提供商的模型清单也铺成同一种 catalog 形状：下面那条共用的富化循环因此认得它们，
+  // 不必为自建渠道再写第二套 name/rate/capabilities/上限的填法（抄第二遍必然漂）
+  for (const row of store.channelList()) {
+    if (row.kind === "builtin") continue;
+    catMaps[row.id] = providerCatalogMap(row);
+  }
   for (const [channel, ad] of Object.entries(ADAPTERS)) {
     for (const m of ad.models()) {
       const id = String(m);
@@ -4330,7 +5045,7 @@ function mergedModels(cfg) {
   for (const [unifiedId, chMap] of Object.entries(rev)) {
     if (!unifiedId || !chMap || typeof chMap !== "object") continue;
     const lowerUnified = unifiedId.toLowerCase();
-    const mappedSources = Object.keys(chMap).filter((ch) => ADAPTERS[ch]);
+    const mappedSources = Object.keys(chMap).filter((ch) => ADAPTERS[ch] && reverseAliasTarget(unifiedId, ch, c));
     if (!mappedSources.length) continue;
     const existing = seen.get(lowerUnified);
     if (existing) {
@@ -4346,6 +5061,18 @@ function mergedModels(cfg) {
         owned_by: mappedSources[0] || "custom",
         sources: [...mappedSources],
       });
+    }
+  }
+
+  // 自定义提供商的模型**只以 slug/model 出现**，绝不列出裸名：这是防静默遮蔽的结构保证——
+  // 用户建一个名叫 claude-sonnet-5 的提供商，也不会让 /v1/models 里多出第二条同名裸条目去顶掉内置池。
+  // 元数据不在这里填，交给下面那条与内置渠道共用的富化循环（catMaps 里有它们的条目）。
+  for (const row of store.channelList()) {
+    if (row.kind === "builtin") continue;
+    for (const e of compatModelEntries(row)) {
+      const id = `${row.id}/${e.client}`;
+      if (seen.has(id.toLowerCase())) continue;
+      seen.set(id.toLowerCase(), { id, object: "model", created: 0, owned_by: row.id, sources: [row.id] });
     }
   }
 
@@ -4365,8 +5092,9 @@ function mergedModels(cfg) {
           if (rk.toLowerCase() === lowerId) { revMap = rv; break; }
         }
       }
-      if (revMap && revMap[channel]) {
-        lookupId = revMap[channel];
+      if (revMap) {
+        const mapped = reverseAliasTarget(entry.id, channel, c);
+        if (mapped) lookupId = mapped;
       }
       const meta = catMaps[channel].get(lookupId.toLowerCase()) || catMaps[channel].get(entry.id.toLowerCase());
       if (!meta) continue;
@@ -4416,26 +5144,22 @@ function mergedModels(cfg) {
   return [...seen.values()];
 }
 
-/** 模型 → 渠道归属：返回拥有该模型的渠道列表（模型完全不存在 → 空数组） */
-/** 模型 → 渠道归属：反向映射命中的渠道**排在最前**，其后追加目录里同名 id 的渠道（去重、保序）。
- *  反向映射只表达「这个渠道上该用哪个模型名」，不该顺手把跨渠道自救的备选集合收窄成映射里写的那几个——
+/** 模型 → 渠道归属：返回拥有该模型的渠道列表（模型完全不存在 → 空数组）。
+ *  **只算内置渠道**（ADAPTERS 静态表）：自定义提供商的归属走 provider.parseModelRef() 的 slug/ 前缀
+ *  （或 allowBareProviderModel 的兜底），两者都在本函数之外——把提供商掺进来就等于让一个裸名可能
+ *  同时属于内置池和某个中转站，那时"谁赢"就必须靠优先级配置回答，而这里刻意不给它那个可能。
+ *  反向映射命中的渠道**排在最前**，其后追加目录里同名 id 的渠道（去重、保序）：反向映射只表达
+ *  「这个渠道上该用哪个模型名」，不该顺手把跨渠道自救的备选集合收窄成映射里写的那几个——
  *  原实现命中即 return，用户一旦给某模型配了反向映射，它的备选就只剩映射里的渠道（issue #78）。 */
 function modelOwners(model, cfg) {
   const c = cfg || proxyConfig();
   const rev = c.modelReverseAliases || {};
   const lower = String(model || "").toLowerCase();
   const mapped = [];
-  const directRev = rev[model];
-  if (directRev && typeof directRev === "object") {
-    mapped.push(...Object.keys(directRev).filter((ch) => ADAPTERS[ch]));
-  } else {
-    for (const [k, map] of Object.entries(rev)) {
-      if (k.toLowerCase() === lower && map && typeof map === "object") {
-        mapped.push(...Object.keys(map).filter((ch) => ADAPTERS[ch]));
-        break;
-      }
-    }
-  }
+  const entry = reverseAliasEntry(model, c);
+  // channelOn 过滤（与目录循环 4114 同口径）：反向映射命中的已关闭渠道不算归属——
+  // 否则统一请求名的唯一归属/固定策略可把请求强制打进已关闭渠道
+  if (entry) mapped.push(...Object.keys(entry).filter((ch) => ADAPTERS[ch] && channelOn(ch, c) && reverseAliasTarget(model, ch, c)));
   const out = [];
   const seen = new Set();
   for (const ch of mapped) {
@@ -4480,7 +5204,9 @@ function consistencyReport() {
   };
 }
 
-module.exports = { get, ADAPTERS, mergedModels, listableModels, modelOwners, channelOn, httpJson, refreshTokenLocked, setPendingCaptcha, getPendingCaptcha,
+module.exports = { get, ADAPTERS, channelModelIds, reverseAliasEntry, resolveModelTarget, mergedModels, listableModels, modelOwners, channelOn, httpJson, refreshTokenLocked, setPendingCaptcha, getPendingCaptcha,
+  // 自定义提供商：动态实例化的通用 OpenAI 兼容适配器（provider.cjs 的探测与自测直用这一支）
+  makeOpenaiCompat, compatUrl, statusFromCompatError, compatModelEntries,
   // 适配器契约（启动期校验 + 自测复验用）
   REQUIRED_ADAPTER_METHODS, assertAdapterContract, consistencyReport,
   // ModelScope 续期实现注入（避免 adapters ↔ discovery 循环依赖；由 index.cjs 启动时注入）
@@ -4491,4 +5217,11 @@ module.exports = { get, ADAPTERS, mergedModels, listableModels, modelOwners, cha
   // 供自测校验模态识别（通用嗅探 / 能力合并 OR 语义）
   sniffImages, mergeCapabilities,
   // 供自测校验模型上限归一化（缺失/非法 → 0，绝不编造）与 trae 目录结构解析
-  tokenLimit, traeLimits };
+  tokenLimit, traeLimits,
+  // 供自测校验「逐包积分」的三条映射（到期日历的数据源）：都是纯函数，喂合成样本即可，不出网
+  traeCredits, zcodeCreditPackages, lobsterCreditPackages, parseWbResource,
+  // 供自测校验「首个 SSE 事件必须解除首字节预算」（issue #107：漏解除 → 长回答被 30s 掐断）：
+  // 自测用真 fetchStream + 真 pumpSse + 缩短的 firstByteBudgetMs + 假上游复现现场
+  fetchStream, pumpSse,
+  // 设备指纹派生（discovery.cjs 的 OAuth/导入路径复用同一套熵更高的算法，避免弱独立实现）
+  deviceIds };

@@ -12,7 +12,9 @@
 const crypto = require("crypto");
 
 const BUILTIN = [
-  { name: "openai-key", re: /sk-[A-Za-z0-9_-]{8,}/g },
+  // sk- 后至少 20 位：真实的 OpenAI/兼容 key 都是 48 位量级，8 位门槛会把
+  // 普通英文串（如 sk-abcd1234 编号）误脱敏，记忆内容被大面积 {{REDACTED}} 污染
+  { name: "openai-key", re: /sk-[A-Za-z0-9_-]{20,}/g },
   { name: "bearer", re: /Bearer\s+[A-Za-z0-9._\-]{8,}/g },
   { name: "aws-ak", re: /AKIA[0-9A-Z]{16}/g },
   { name: "password", re: /(?:password|passwd|pwd)\s*[:=]\s*\S+/gi },

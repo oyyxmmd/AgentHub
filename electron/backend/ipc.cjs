@@ -16,6 +16,7 @@ const remotesync = require("./remotesync.cjs");
 const webdav = require("./webdav.cjs");
 const watch = require("./watch.cjs");
 const proxy = require("./proxy/index.cjs");
+const proxyRemote = require("./proxy/remote.cjs");
 const memory = require("./memory/index.cjs");
 
 // 渲染层拿到的密码一律是掩码；保存/测试连接收到精确掩码时回填磁盘真值
@@ -65,6 +66,19 @@ function handle(fn) {
   };
 }
 
+/** 配置保存后的回调钩子（由 main.cjs 注册）：全局快捷键重新注册等。
+ *  方向：main → backend 注册，backend 只在保存时回调，避免 backend 反向依赖主进程。 */
+const configSavedHooks = [];
+function onConfigSaved(fn) {
+  if (typeof fn === "function") configSavedHooks.push(fn);
+}
+
+/** 托盘等 main 侧直写配置后调用：作废内存快照，下一次 load_config 重读磁盘。
+ *  不作废的话 C() 会一直返回旧快照（含托盘刚改过的 schedule 字段）。 */
+function refreshConfigCache() {
+  cfg = null;
+}
+
 /** 应用主题同步到原生窗口框架（标题栏/边框）颜色；主题变化时调用 */
 function applyNativeTheme(nativeTheme, cfgObj) {
   const theme = cfgObj && cfgObj.theme;
@@ -86,11 +100,20 @@ function register(ctx) {
   ipcMain.handle("save_config", handle(({ config: next }) => {
     if (!next || typeof next !== "object" || Array.isArray(next)) return fail("配置格式不正确");
     const merged = unmaskPassword(JSON.parse(JSON.stringify(next)));
-    const r = config.saveConfig(merged);
+    // 设置页整份提交：out-of-band 字段（channelEnabled/checkinAutoRules）以磁盘为准，
+    // 否则渲染层的旧快照会把「上游启闭」「按渠道签到」的写入冲掉（issue #90）；
+    // restoreOnLaunch 不在此列——设置页开关自己就是经这里写盘的，磁盘优先会架空它
+    const r = config.saveConfigFromUI(merged);
     // 落盘成功才更新内存快照，写失败时别把脏数据留给 load_config
     cfg = merged;
     applyNativeTheme(nativeTheme, merged);
     config.applyAutoStart(merged);
+    // 通知主进程侧「配置已保存」：全局快捷键要按新值重新注册。
+    // 为什么不用 ipcMain 反向调用：globalShortcut 只有 main.cjs 持有，
+    // backend 不该反向依赖主进程；用一个注册回调把方向理顺（与 remotesync.setOnFinish 同款）。
+    for (const fn of configSavedHooks) {
+      try { fn(merged); } catch { /* 单个钩子失败不影响保存结果 */ }
+    }
     return r;
   }));
 
@@ -148,6 +171,13 @@ function register(ctx) {
       deviceId: c.webdav.deviceId,
       deviceName: c.webdav.deviceName,
     };
+    // S3 兼容存储（issue #89）：带 __s3 标记与桶参数，webdav.cjs 分派到 S3 传输
+    if (shared.type === "s3") {
+      c.webdav.__s3 = true;
+      c.webdav.bucket = shared.s3.bucket;
+      c.webdav.region = shared.s3.region;
+      c.webdav.pathStyle = shared.s3.pathStyle;
+    }
     if (remotesync.isRunning()) return fail("同步已在进行中");
     if (!remotesync.configured(c)) return fail("WebDAV 未配置完整（服务器地址 / 账号 / 密码）");
     remotesync.run(c).catch(() => {}); // 后台跑，进度走事件广播；异常已在 run 内收口
@@ -170,20 +200,46 @@ function register(ctx) {
   // ===== 统一 WebDAV（设置 · 数据存储）：共享服务器 + 三模块根目录 =====
   ipcMain.handle("webdav_shared_get", handle(() => config.maskedSharedWebdav()));
   ipcMain.handle("webdav_shared_save", handle(({ config: form }) => {
+    const before = config.loadSharedWebdav().endpoint;
     const r = config.saveSharedWebdav(form || {});
+    cfg = null; // 内存快照已过期：后续 remove_tool 等若拿旧快照整份写盘会把刚存的服务器配置冲回去（issue #95）
     // WebDAV 密码同时是号池压缩包的加密口令：改动后令历史包标记 keyChange，下次同步重打包
     try { require("./proxy/poolsync.cjs").onSharedPasswordMaybeChanged(); } catch { /* 模块未装载不影响保存 */ }
+    // 首次配置（之前没配服务器，这次配上）自动跑一次号池同步：API Keys 与模型映射随
+    // 共享配置包落到本机，「换台电脑」配好服务器即得，不用去发现「立即同步号池」（issue #92）。
+    // 已配置时改字段不触发；proxy 板块已停用时不触发（轻量模式：停用板块后台不运行）；
+    // 失败静默（号池面板看得到状态，定时同步下轮也会补）
+    const after = config.loadSharedWebdav().endpoint;
+    const pm = (config.loadConfig().modules || {}).proxy || {};
+    const proxyOn = !pm || pm.enabled !== false;
+    if (!before && after && proxyOn) {
+      try { require("./proxy/poolsync.cjs").run({}).catch(() => {}); } catch { /* 同步互斥等静默，状态面板可见 */ }
+    }
+    return r;
+  }));
+  ipcMain.handle("webdav_shared_clear", handle(() => {
+    const r = config.clearSharedWebdav();
+    cfg = null;
     return r;
   }));
   ipcMain.handle("webdav_shared_test", handle(({ config: form }) => {
     const cur = config.loadSharedWebdav();
     const f = form && typeof form === "object" ? form : {};
-    return webdav.test({
+    const fs3 = f.s3 && typeof f.s3 === "object" ? f.s3 : {};
+    const cfg = {
       endpoint: String(f.endpoint ?? cur.endpoint),
       username: String(f.username ?? cur.username),
       password: f.password === config.PASSWORD_MASK || f.password == null ? cur.password : String(f.password),
       root: String(f.root ?? cur.roots.skills),
-    });
+    };
+    // S3 模式（issue #89）：注入 __s3 标记与桶参数，webdav.test 分派到 S3 传输
+    if ((f.type ?? cur.type) === "s3") {
+      cfg.__s3 = true;
+      cfg.bucket = String(fs3.bucket ?? cur.s3.bucket);
+      cfg.region = String(fs3.region ?? cur.s3.region);
+      cfg.pathStyle = fs3.pathStyle ?? cur.s3.pathStyle;
+    }
+    return webdav.test(cfg);
   }));
   ipcMain.handle("webdav_logs", handle(() => remotesync.recentLogs()));
   ipcMain.handle("webdav_devices", handle(async () => {
@@ -245,9 +301,11 @@ function register(ctx) {
   }));
   // 电脑扫描发现：只读探测第三方 agent，命中列表给设置页一键添加
   ipcMain.handle("probe_agents", handle(() => adapter.probeAgents(C())));
-  // 删除自定义工具适配器：不带 confirm 只干跑报影响，带 confirm 才摘挂载删配置
+  // 删除自定义工具适配器：不带 confirm 只干跑报影响，带 confirm 才摘挂载删配置。
+  // 传入的必须是磁盘新鲜读：removeCustomTool 会对传入对象整份 saveConfig，
+  // 若传内存快照 C()，快照里过期的 webdavShared 等字段会把磁盘新值冲掉（issue #95）
   ipcMain.handle("remove_tool", handle(({ id, confirm: doIt }) => {
-    const r = syncer.removeCustomTool(C(), String(id || ""), !!doIt);
+    const r = syncer.removeCustomTool(config.loadConfig(), String(id || ""), !!doIt);
     if (r.ok && doIt) cfg = null; // 配置已删条目，内存快照作废
     return r;
   }));
@@ -419,6 +477,16 @@ function register(ctx) {
         right: { label: "远端版", path: remoteDir, md: readMd(remoteDir) },
       };
     }
+    // diff-link：左侧是链接现在指向的那份（悬空时没有），右侧是中央真身（可能还没有）
+    if (item.kind === "diff-link") {
+      const st = syncer.linkConflictState(item);
+      return {
+        item,
+        left: { label: "链接指向", path: st.resolved || "", md: st.resolves ? readMd(st.resolved) : "" },
+        right: { label: "中央真身", path: st.centralPath, md: readMd(st.centralPath) },
+        link: st,
+      };
+    }
     const leftPath = item.kind === "content" ? path.join(item.dir, item.skill) : null;
     const rightPath = path.join(hub.skillsDir(), item.skill || "");
     return {
@@ -435,7 +503,9 @@ function register(ctx) {
       ? syncer.resolveNormConflict(item, choice, C())
       : item.kind === "remote"
         ? remotesync.resolveRemoteConflict(item, choice, C())
-        : syncer.resolveContentConflict(item, choice, C());
+        : item.kind === "diff-link"
+          ? syncer.resolveDiffLinkConflict(item, choice, C())
+          : syncer.resolveContentConflict(item, choice, C());
     if (r.ok) {
       item.resolved = { at: new Date().toISOString(), choice };
       syncer.saveConflicts(store);
@@ -472,8 +542,17 @@ function register(ctx) {
   // ===== 反代网关（命令实现见 backend/proxy/index.cjs） =====
   proxy.register(ipcMain);
 
+  // ===== 远程网关（桌面连远程 Docker 版：目标管理与命令转发，实现见 backend/proxy/remote.cjs） =====
+  // 转发在主进程做：管理令牌不进渲染进程；地址/协议校验（http 仅私网）内聚在 remote.cjs
+  ipcMain.handle("remote_targets_list", handle(() => proxyRemote.listTargets()));
+  ipcMain.handle("remote_targets_save", handle((p) => proxyRemote.saveTarget(p)));
+  ipcMain.handle("remote_targets_delete", handle(({ id }) => proxyRemote.deleteTarget(id)));
+  ipcMain.handle("remote_targets_activate", handle(({ id }) => proxyRemote.activateTarget(id)));
+  ipcMain.handle("remote_test", handle((p) => proxyRemote.testTarget(p)));
+  ipcMain.handle("remote_invoke", handle(({ cmd, args }) => proxyRemote.rpc(cmd, args)));
+
   // ===== 记忆中枢（命令实现见 backend/memory/index.cjs） =====
   memory.register(ipcMain);
 }
 
-module.exports = { register };
+module.exports = { register, onConfigSaved, refreshConfigCache };

@@ -41,6 +41,10 @@ async function main() {
   assert(store.CHANNELS.some((c) => c.id === "catpaw"), "store.CHANNELS 含 catpaw");
   const ad = adapters.get("catpaw");
   assert(ad && ad.stateful() === true && typeof ad.chatSession === "function", "catpaw 声明 stateful 且有 chatSession");
+  // 反向映射 / 别名 / failover 解析出的上游真名必须写回 body.model——CatPaw 协议层只读 body.model，
+  // 只把真名作为独立参数传入会被丢弃，统一虚拟名（如 AgentHub-1.0）会被原样发给上游并报 400。
+  const aligned = adapterMod.withUpstreamModel({ model: "kimi-k3", body: { model: "AgentHub-1.0", messages: [{ role: "user", content: "x" }] } });
+  assert(aligned.model === "kimi-k3" && aligned.body.model === "kimi-k3" && aligned.body.messages.length === 1, "chatSession 用 ctx.model 覆盖 body.model（反向映射真名直达上游）");
   const noCred = await ad.chat().then(() => null, (e) => e);
   assert(noCred && noCred.status === 503 && /会话式转发/.test(noCred.message), "单发 chat 防御性报错（有状态渠道不该被单请求路径调用）");
   const checkin = await ad.checkinStatus({}, {});
@@ -111,7 +115,26 @@ async function main() {
     { role: "assistant", content: "后半" },
   ], {});
   assert(twoAssistants.messages.length === 2 && twoAssistants.messages[1].content.length === 2, "相邻 assistant 合并");
-  console.log("messages ok（抽离 / 合并 / 配对回填 / 打断合成 / 尾部校验）");
+  // 回归：客户端把指令放在对话中间（真实故障：Claude 系发 messages[2]=system，旧实现直接报 400，
+  // 而 CatPawError.badRequest 带 fatal=true —— 整条请求当场失败，不换号也不回退）
+  const lateDirective = messages.normalizeMessages([
+    { role: "user", content: "你好" },
+    { role: "assistant", content: "在的" },
+    { role: "system", content: "中途追加的系统指令" },
+    { role: "user", content: "继续" },
+  ], {});
+  assert(lateDirective.systemPrompt === "中途追加的系统指令", "对话中间的 system 并入 systemPrompt（不再报 400）");
+  assert(lateDirective.messages.length === 3 && !lateDirective.messages.some((m) => m.type === "system"), "中途 system 不进对话消息流");
+  // 抽离后相邻的 assistant 仍必须合并：指令夹在中间不能把它挡住
+  const lateMerged = messages.normalizeMessages([
+    { role: "user", content: "x" },
+    { role: "assistant", content: "前半" },
+    { role: "developer", content: "中途规则" },
+    { role: "assistant", content: "后半" },
+  ], {});
+  assert(lateMerged.messages.length === 2 && lateMerged.messages[1].content.length === 2, "指令夹在中间不阻断相邻 assistant 合并");
+  assert(lateMerged.rulesMessage === "中途规则", "对话中间的 developer 并入 rulesMessage");
+  console.log("messages ok（抽离 / 合并 / 配对回填 / 打断合成 / 尾部校验 / 中途指令容忍）");
 
   // ===== 3. 块级校验（图片 data URL / 工具参数 / 结果文本）=====
   const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
@@ -586,7 +609,10 @@ async function main() {
   store.open();
   const key = store.createKey({ name: "catpaw 自测", route: "auto", dailyQuota: 100, rateLimit: 0 });
   const accountId = store.addAccount({ channel: "catpaw", uid: "cp-e2e", name: "CatPaw 端到端号", token: "tok-e2e", source: "paste" });
+  // 反向映射用例可切换的配置（server 每请求读一次 settings）
+  let gwReverseAliases = {};
   const gwSettings = () => ({
+    modelReverseAliases: gwReverseAliases,
     port: 19599, bind: "127.0.0.1", rateLimitPerMin: 600, concurrency: 8,
     routeStrategy: "smart", fixedChannel: "", modelOverrides: {}, debugStatus: false,
     humanizeJitter: false, disabledModels: [], modelFallback: {},
@@ -659,6 +685,25 @@ async function main() {
   const offParams = offRound && offRound.body.requestContext && offRound.body.requestContext.modelParams.declarativeParams;
   assert(offRound && (!offParams || offParams.effort === undefined), "off 不应下发 effort");
   assert(offParams && offParams.context === "1024000", "模型默认 context 档位照常下发（off 只影响 effort）");
+  // 13.6 反向映射：统一虚拟名请求 → 上游必须收到映射后的**真实模型**（不得透传统一名）
+  gwReverseAliases = { "AgentHub-1.0": { catpaw: "kimi-k3" } };
+  requests.length = 0;
+  turnScript = [{ content: "反向映射真名" }];
+  const revSse = await (await call({ model: "AgentHub-1.0", stream: true, messages: [{ role: "user", content: "统一名" }] })).text();
+  assert(revSse.includes('"content":"反向映射真名"'), "反向映射统一名过网关 200 且正文来自假上游");
+  const revRound = requests.find((r) => r.path.includes("/round"));
+  assert(revRound && revRound.body.modelType === 83, `上游收到映射后的真实模型 modelType=83（kimi-k3），实际 ${revRound && revRound.body.modelType}`);
+  assert(revSse.includes('"model":"AgentHub-1.0"'), "响应 model 字段保持统一请求名（契约不变）");
+
+  // 13.7 历史脏配置（自映射 catpaw -> AgentHub-1.0）：不得把统一名透传给 CatPaw，且不发上游请求
+  gwReverseAliases = { "AgentHub-1.0": { catpaw: "AgentHub-1.0" } };
+  requests.length = 0;
+  const selfMap = await call({ model: "AgentHub-1.0", stream: false, messages: [{ role: "user", content: "自映射" }] });
+  const selfMapBody = await selfMap.json();
+  assert(selfMap.status === 400, `自映射统一名应 400 而非透传上游（实际 ${selfMap.status}）`);
+  assert(requests.length === 0, `自映射时不得向上游发出任何请求（实际 ${requests.length}）`);
+  assert(/不在任何渠道目录中/.test(selfMapBody.error.message), `报错为路由层未知模型（实际 ${selfMapBody.error.message}）`);
+  gwReverseAliases = {};
   await gateway.stop();
   server.close();
   store.deleteKey(key.id);

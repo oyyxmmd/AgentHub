@@ -61,6 +61,25 @@ function toMs(v) {
   return n < 1e12 ? n * 1000 : n;
 }
 
+/**
+ * 积分包到期归一：上游到期字段名混乱且有脏值，统一成"可比毫秒时间戳"。
+ * - 纯日期串（YYYY-MM-DD，无时分秒）补 23:59:59（当天有效，不因取到 00:00 被误判成前一天就过期）
+ * - 秒/毫秒自动判别沿用 toMs
+ * - "远未来"脏值（如 2049 年这类占位）超过 now + farYears 年 → 视为长期有效，返回 0
+ */
+function normalizeExpiryMs(raw, farYears) {
+  const years = Number(farYears) > 0 ? Number(farYears) : 5;
+  let v = raw;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) v = s + "T23:59:59"; // 纯日期补当天末尾
+  }
+  const ms = toMs(v);
+  if (!ms) return 0;
+  if (ms > Date.now() + years * 365 * 86400000) return 0; // 远未来脏值 → 长期有效
+  return ms;
+}
+
 /** 判定字符串是否为完整 JSON（SSE 紧凑流兼容的判据，参考项目 wb_sse 实证） */
 function isCompleteJson(s) {
   if (!s || s === "[DONE]") return false;
@@ -145,6 +164,9 @@ function injectThinking(obj, defaultEffort) {
 }
 
 const EFFORT_RANK = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+// 档位词表的唯一出处：自定义提供商那条路要校验用户填的支持档，必须用同一份而不是
+// 再抄一个字面量数组——抄第二份的结果是「界面能填、请求期被判非法」这类静默分叉。
+const EFFORT_LEVELS = Object.keys(EFFORT_RANK);
 
 /** reasoning_effort 档位降级（参考项目 normalizeReasoningEffort）：模型目录声明 supportedEfforts
  *  时按其收敛——请求档不在支持集则降到 ≤ 请求档的最高支持档；支持档全高于请求档取最低档。 */
@@ -155,6 +177,11 @@ function normalizeReasoningEffort(obj, reasoningMeta) {
   if (!supported.length || !obj) return;
   const cur = typeof obj.reasoning_effort === "string" ? obj.reasoning_effort : "";
   if (!cur || EFFORT_RANK[cur] == null) return;
+  // "off" 不是档位，是「关思考」这个开关。目录的支持档通常不含 off（不含 ≠ 不支持关思考），
+  // 走下面「降到 ≤ 请求档的最高支持档」会把它抬成最低档 = 用户在模型目录里明确关了思考，
+  // 却被静默改成继续思考。真不接受 off 的上游由 adapters 侧按 provider 改写
+  // （见 LiteLLM 那段带实测流水的注释），不该在这层用抬档代替改写。
+  if (cur === "off") return;
   const sorted = [...new Set(supported)].sort((a, b) => EFFORT_RANK[a] - EFFORT_RANK[b]);
   if (sorted.includes(cur)) return;
   const curRank = EFFORT_RANK[cur];
@@ -435,8 +462,8 @@ function estimateTokens(text) {
 }
 
 module.exports = {
-  uuid, traceId, jwtDecode, dig, toMs,
+  uuid, traceId, jwtDecode, dig, toMs, normalizeExpiryMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
-  isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent,
+  isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_RANK, EFFORT_LEVELS,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, normalizeRoles, estimateTokens,
 };

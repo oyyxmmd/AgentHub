@@ -1,7 +1,7 @@
 <!-- 左栏双卡片：上 = 品牌 + 四大模块切换；下 = 当前模块的总览概况
      概况数据全部来自真实统计：skills 走轻量 IPC（skills_side_stats）、sync 走 usage store、
      proxy 走号池/Keys/网关状态、memory 走记忆中枢统计 IPC；模块顺序自定义在「设置 · 通用」
-     版本 / 署名 / 亮暗 / 设置入口统一收在最左下角 -->
+     版本 / 署名 / GitHub / 亮暗 / 设置入口统一收在最左下角 -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ElMessageBox } from "element-plus";
@@ -12,6 +12,7 @@ import { useUsageStore } from "../stores/usage";
 import * as syncApi from "../api/sync";
 import { formatToken, formatCost, formatInteger, timeAgo } from "../composables/useFormat";
 import { fmtBalance, balanceUnit } from "../views/proxy/format";
+import { isUnusableChannel } from "../views/proxy/channelHealth";
 import type { DeviceMeta } from "../types/sync";
 import type { ModuleKey } from "../types";
 import * as api from "../api/ipc";
@@ -31,12 +32,25 @@ const scheduleMemoryRefresh = coalesceAsync(refreshMemoryStats, 800);
 
 // 版本号从主进程取（浏览器预览时 mock 返回 0.1.0）
 const version = ref("v0.1.0");
+// 板块启用态（issue #91）：停用板块的统计 IPC 一律不打（后台已停，打了也没意义）
+function modOn(k: string) {
+  const mods = app.config.modules as Partial<Record<string, { enabled: boolean }>> | undefined;
+  const m = mods?.[k];
+  return !m || m.enabled !== false;
+}
+function refreshStatsForEnabled(only?: string) {
+  const want = (k: string) => (only ? only === k : true);
+  if (want("proxy") && modOn("proxy")) { refreshProxyMeta(); refreshChannels(); }
+  if (want("skills") && modOn("skills")) refreshSkillsStats();
+  if (want("memory") && modOn("memory")) refreshMemoryStats();
+  if (want("usage") && modOn("usage")) ensureUsageSummary();
+}
+/** 侧栏 GitHub 入口：交由主进程 shell.openExternal 用默认浏览器打开仓库 */
+function openRepo() {
+  api.openRepoPage().catch(() => {});
+}
 onMounted(async () => {
-  refreshChannels();
-  refreshSkillsStats();
-  refreshProxyMeta();
-  refreshMemoryStats();
-  ensureUsageSummary();
+  refreshStatsForEnabled();
   try {
     version.value = "v" + (await api.getAppVersion());
   } catch {
@@ -45,7 +59,12 @@ onMounted(async () => {
   // 网关启停/号池同步都经 app:event 广播：侧栏卡片只订阅不轮询。
   // 原来只在切模块时刷一次，本模块内点「启动服务」后卡片会一直停在「网关未启动」
   offProxyEvent = api.onUpdateEvent((e) => {
-    const p = e as { event?: string; type?: string };
+    const p = e as { event?: string; type?: string; module?: string; enabled?: boolean };
+    // 板块开关切换（issue #91）：启用时补一轮该板块统计，停用时不动（卡片由置灰态呈现）
+    if (p.event === "module-toggled") {
+      if (p.enabled) refreshStatsForEnabled(p.module);
+      return;
+    }
     if (p.event === "proxy" && (p.type === "status" || p.type === "poolsync" || p.type === "credits")) {
       scheduleProxyRefresh();
       return;
@@ -218,6 +237,12 @@ const channels = ref<ProxyChannelRow[]>([]);
 async function refreshChannels() {
   channels.value = (await api.proxyPool().catch(() => channels.value)) || [];
 }
+// 死渠道（有号已过期 且 在线余额合计 0）不占侧栏那一行：它们不可用却和可用渠道长得一样，
+// 渠道一多就把真正要看的挤下去。判据落在 channelHealth.ts 里，理由是那条规则错了会静默藏号。
+const visibleChannels = computed(() => {
+  const now = Date.now();
+  return channels.value.filter((c) => !isUnusableChannel(c.summary, now));
+});
 const fmtDay = (ts: number) => {
   if (!ts) return "-";
   const d = new Date(ts);
@@ -244,7 +269,7 @@ const OVERVIEW = computed<Record<ModuleKey, { title: string; hint: string }>>(()
     hint: skillsStats.value ? `${skillsStats.value.mountOk}/${skillsStats.value.mountTotal} 挂载` : "挂载",
   },
   sync: { title: "设备用量", hint: `${devices.value.length} 台设备` },
-  proxy: { title: "渠道额度", hint: channels.value.length ? `${channels.value.length} 个渠道` : "渠道" },
+  proxy: { title: "渠道额度", hint: visibleChannels.value.length ? `${visibleChannels.value.length} 个渠道` : "渠道" },
   memory: {
     title: "记忆概况",
     hint: memoryOverview.value ? `${memoryOverview.value.total} 条记忆` : "记忆中枢",
@@ -352,9 +377,11 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
           v-for="mod in app.orderedModules"
           :key="mod.key"
           class="module-card"
-          :class="{ active: app.activeModule === mod.key }"
+          :class="{ active: app.activeModule === mod.key, disabled: !mod.enabled }"
+          :aria-disabled="!mod.enabled"
           @click="app.selectModule(mod.key)"
         >
+          <span v-if="!mod.enabled" class="mc-off">已停用</span>
           <span class="mc-state" :class="MODULE_META[mod.key].level === 'warn' ? 'st-warn' : 'st-ok'">
             <i class="mc-dot"></i>{{ MODULE_META[mod.key].state }}
           </span>
@@ -536,7 +563,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
 
         <!-- 反代网关：渠道额度（号池实时数据，渠道增减自动跟进） -->
         <template v-else>
-          <div v-for="c in channels" :key="c.id" class="ov-row">
+          <div v-for="c in visibleChannels" :key="c.id" class="ov-row">
             <div class="grow">
               <div class="ov-name">
                 {{ c.display }}<span v-if="c.summary.expiringSoon" class="ov-tag warn">即将到期</span>
@@ -547,17 +574,22 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
             </div>
             <b class="ov-num">{{ fmtBalance(c.summary.totalCredits, c.id) }}<span class="ov-unit">{{ balanceUnit(c.id) }}</span></b>
           </div>
-          <div v-if="!channels.length" class="ov-row">
-            <div class="grow"><div class="ov-meta">号池尚未接入或加载中</div></div>
+          <div v-if="!visibleChannels.length" class="ov-row">
+            <div class="grow"><div class="ov-meta">{{ channels.length ? "无可用余额渠道（已过期或额度耗尽）" : "号池尚未接入或加载中" }}</div></div>
           </div>
         </template>
       </div>
 
-      <!-- 左下角全局操作：版本 / 亮暗 / 设置 -->
+      <!-- 左下角全局操作：版本 / GitHub / 亮暗 / 设置 -->
       <div class="side-foot">
         <div class="foot-meta">
           <div class="foot-ver">{{ version }}</div>
         </div>
+        <el-tooltip content="Star 支持" placement="top">
+          <button class="btn btn-ghost" @click="openRepo()">
+            <i class="ph ph-github-logo"></i>
+          </button>
+        </el-tooltip>
         <el-tooltip content="切换亮暗主题" placement="top">
           <button class="btn btn-ghost" @click="app.toggleTheme()">
             <i class="ph" :class="app.isDark ? 'ph-moon' : 'ph-sun'"></i>
@@ -656,6 +688,26 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
   cursor: pointer;
   position: relative;
   transition: background 0.2s var(--ease), border-color 0.2s, transform 0.15s;
+}
+/* 已停用板块（issue #91）：低对比置灰、禁用指针交互反馈，右上角「已停用」角标 */
+.module-card.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.6);
+}
+.module-card.disabled:hover { background: rgba(255, 255, 255, 0.025); }
+.module-card.disabled:active { transform: none; }
+.module-card.disabled::after { display: none; }
+.mc-off {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-3);
+  background: var(--surface-3);
+  border-radius: 4px;
+  padding: 2px 5px;
 }
 :root[data-theme="light"] .module-card {
   background: rgba(15, 23, 42, 0.02);
@@ -795,7 +847,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
   font-size: 9px;
   color: var(--text-3);
 }
-/* 上游启闭小按钮（仅反代网关卡）：弱化 ghost 态，悬停点亮，与免责问号同色系 */
+/* 上游启闭小按钮（仅反代网关卡）：绿色描边常态，悬停点亮加深，与免责问号同色系 */
 .mc-up-btn {
   margin-left: auto;
   display: inline-flex;
@@ -803,7 +855,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
   gap: 3px;
   padding: 2px 7px;
   border-radius: var(--r-pill);
-  border: 1px solid var(--line);
+  border: 1px solid var(--accent-line);
   background: transparent;
   color: var(--text-3);
   font-size: 9px;
@@ -817,7 +869,7 @@ const TOOLS = computed<{ name: string; meta: string; label: string; ok: boolean 
 }
 .mc-up-btn:hover {
   color: var(--accent-strong);
-  border-color: var(--accent-line);
+  border-color: var(--accent-strong);
   background: var(--accent-dim);
 }
 .mc-state {

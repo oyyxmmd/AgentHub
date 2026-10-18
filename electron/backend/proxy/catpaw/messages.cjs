@@ -9,7 +9,10 @@
 //   system 消息 → systemPromptContext.systemPromptOverride；developer 消息 → rulesMessage。
 //
 // 归一化规则总览（改前先读参照实现）：
-//   1. system/developer 抽离且必须位于所有对话消息之前；
+//   1. system/developer 抽离成独立字段；**位置不限**——上游 round 只认「一条前置 systemPrompt」，
+//      所以对话中间出现的指令按出现顺序并入对应字段（丢位置、不丢内容）。客户端把 system 放在
+//      对话中间是合法 OpenAI 形态（Claude 系实测 messages[2]=system）；早期这里报 400，而
+//      CatPawError.badRequest 带 fatal:true，会让整条请求不换号也不回退地当场失败；
 //   2. 连续多条 tool 消息（OpenAI 并行工具调用）合并为单条 tool 消息的多个 tool_result 块
 //      —— 上游明确拒绝 tool 消息连续出现；
 //   3. 相邻 assistant 合并（两条都带 tool_use 时无法安全合并，保留原样交给配对校验报错）；
@@ -151,7 +154,15 @@ function mergeAdjacent(stage) {
       merged.push(item);
       continue;
     }
-    const previous = merged.length && merged[merged.length - 1].message ? merged[merged.length - 1].message : null;
+    // 指令项对合并「透明」：它最终会被抽离出对话流，所以 [assistant, system, assistant] 抽离后
+    // 就是两条相邻 assistant，必须在这里先合并掉——不能因为中间夹了一条指令就漏合
+    let previous = null;
+    for (let i = merged.length - 1; i >= 0; i -= 1) {
+      if (merged[i].message) {
+        previous = merged[i].message;
+        break;
+      }
+    }
     if (!previous) {
       merged.push(item);
       continue;
@@ -236,9 +247,7 @@ function assemble(merged, options) {
   for (const item of merged) {
     index += 1;
     if (item.directive) {
-      if (conversation.length) {
-        throw CatPawError.badRequest(`messages[${index}] 的 ${item.directive.role} 必须位于所有对话消息之前`);
-      }
+      // 位置不校验：上游无处安放对话中间的 system/developer，只能并入指令字段
       if (item.directive.role === "system") systemParts.push(item.directive.text);
       else developerParts.push(item.directive.text);
       continue;
@@ -289,6 +298,8 @@ function normalizeContinuationMessages(messages) {
   (Array.isArray(messages) ? messages : []).forEach((message, index) => {
     const item = normalizeMessage(message, index);
     if (item.directive) {
+      // 防御性：prepare() 已先把指令抽走，续接尾部实际只会剩 tool 消息。万一走到这里，
+      // 这条 turn 请求只提交 tool 结果，指令无处可发——保留报错，不做静默丢弃
       throw CatPawError.badRequest(`messages[${index}] 的 ${item.directive.role} 必须位于所有对话消息之前`);
     }
     normalized.push(item.message);

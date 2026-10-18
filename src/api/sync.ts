@@ -61,7 +61,10 @@ export const getRecords = (filter: {
 
 // ===== 同步 =====
 /** opts.mode="backup"：强制本机备份（未配置 WebDAV 时顶栏「立即读取」即此语义） */
-export const startSync = (opts?: { mode: "backup" }) => call<void>("start_sync", opts ? { mode: opts.mode } : undefined);
+// start_sync 正常返回 null（后台运行、进度另走 get_sync_progress 轮询），被主进程拒绝时返回
+// { ok:false, message }——渲染层必须读这个返回值才有提示可显（原先类型写成 void，等于宣布「无返回值」，
+// 于是主进程那句拒绝理由被静默丢弃）
+export const startSync = (opts?: { mode: "backup" }) => call<{ ok: false; message: string } | null>("start_sync", opts ? { mode: opts.mode } : undefined);
 export const cancelSync = () => call<void>("cancel_sync");
 export const getSyncProgress = () => call<SyncProgress>("get_sync_progress");
 export const getSyncLogs = (args: { limit: number; offset: number; kind?: string | null; level?: string | null }) =>

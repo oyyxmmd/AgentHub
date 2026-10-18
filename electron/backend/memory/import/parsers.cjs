@@ -276,7 +276,13 @@ function parseSqliteInner(db, source, cursor, opts, onItem) {
   if (!contentCol && looksLikeZcodeDb(db, columns)) {
     return parseZcodeParts(db, source, cursor, opts, onItem);
   }
-  const limit = Math.min(Number(opts.batchSize || 500), 2000);
+  // contentCol 为空且不是 ZCode 库：后续每行 row[undefined] 全被 continue 静默跳过，
+  // 导入显示 0 条且无任何原因——显式失败，让用户知道这张表没有可提取的正文列
+  if (!contentCol) {
+    return { items: 0, total: 0, nextCursor: cursor, note: `表 ${table} 没有可识别的正文列（content/message/text 之类），无法导入；如为 ZCode 库请检查结构` };
+  }
+  // 下限 1：负数 batchSize 会让 SQLite 的 LIMIT -N 变成「无限制」全表拉取（内存风险）
+  const limit = Math.max(1, Math.min(Number(opts.batchSize || 500), 2000));
   // 文本主键的水位是字符串：必须原样回传、原样绑定，不能经 Number 转换，
   // 否则比较永远不会成立，分页在第二轮就卡死
   const rawLast = cursor && cursor.lastId;
@@ -324,9 +330,12 @@ function parseSqliteInner(db, source, cursor, opts, onItem) {
     table,
     total,
     // 本轮用满配额说明后面还有数据，多轮解析要接着读；
-    // fullScan（无可用键）不能续读——游标推不动，重读同一批会死循环，靠内容哈希兜底去重
+    // fullScan（无可用键）不能续读——游标推不动，重读同一批会死循环，靠内容哈希兜底去重。
+    // 表超过首批配额时静默截断会让用户以为导全了，note 明示丢弃量
     more: !fullScan && rows.length >= limit,
-    note: fullScan ? "该表无可用的主键/rowid（全扫 + 内容哈希去重，重复运行不会重复写入）" : "",
+    note: fullScan
+      ? `该表无可用的主键/rowid，仅导入首批 ${emitted}/${total} 条（重复运行不会重复写入）；如需全量请先给表补主键或换用其他导出格式`
+      : "",
     nextCursor: { ...(cursor || {}), lastId: maxId, table, cursorColumn: idCol || "(full-scan)" },
   };
 }
@@ -352,7 +361,8 @@ function looksLikeZcodeDb(db, columns) {
  */
 function parseZcodeParts(db, source, cursor, opts, onItem) {
   const lastId = Number(cursor && cursor.lastId) || 0;
-  const limit = Math.min(Number(opts.batchSize || 500), 2000);
+  // 下限 1：负数 batchSize 会让 SQLite 的 LIMIT -N 变成「无限制」全表拉取（内存风险）
+  const limit = Math.max(1, Math.min(Number(opts.batchSize || 500), 2000));
   let rows = [];
   try {
     // SQL 层先把非正文的行滤掉：part 表十万行里只有一万多条是 text，其余是工具调用/推理/步骤标记。
@@ -614,7 +624,8 @@ function parseTrae(source, cursor, opts, onItem) {
   const dbs = discoverTraeDbs(source.path);
   if (!dbs.length) return { items: 0, nextCursor: cursor, note: "未找到 Trae 系会话库" };
   const files = { ...((cursor && cursor.files) || {}) };
-  const limit = Math.min(Number(opts.batchSize || 500), 2000);
+  // 下限 1：负数 batchSize 会让 SQLite 的 LIMIT -N 变成「无限制」全表拉取（内存风险）
+  const limit = Math.max(1, Math.min(Number(opts.batchSize || 500), 2000));
   let emitted = 0;
   let more = false;
   let note = "";

@@ -17,6 +17,7 @@ const TODAY = (() => {
 function defaultConfig(): AppConfig {
   return {
     theme: "dark",
+    modules: { skills: { enabled: true }, sync: { enabled: true }, proxy: { enabled: true }, memory: { enabled: true } },
     fx: true,
     fxParticles: false,
     fxPools: false,
@@ -43,7 +44,7 @@ function defaultConfig(): AppConfig {
       deviceId: "b3f2a1c8-77d2-4e5a-9b01-3f6c8d2e4a7b",
       deviceName: "DESK-01",
     },
-    schedule: { minimizeToTray: true, autoStart: true, hourly: false, daily: true, dailyTime: "09:00", notifyOnSuccess: false },
+    schedule: { minimizeToTray: true, shortcutToggle: "Alt+`", lightweightMode: false, autoStart: true, hourly: false, daily: true, dailyTime: "09:00", notifyOnSuccess: false },
     watch: { enabled: true, intervalSeconds: 15 },
     memory: { enabled: true, rootDir: "" },
     proxy: {
@@ -55,8 +56,11 @@ function defaultConfig(): AppConfig {
       routeOrder: "score",
       rateLimitPerMin: 120,
       concurrency: 8,
-      creditsRefreshMin: 30,
-      debugStatus: false,
+    creditsRefreshMin: 30,
+    usageRetentionDays: 90,
+    expiringSoonDays: 1,
+    poolsyncSchedule: { hourly: false, hourlyInterval: 6, daily: false, dailyTime: "04:00" },
+    debugStatus: false,
       modelOverrides: {},
       humanizeJitter: true,
       disabledModels: [],
@@ -259,9 +263,9 @@ const PROXY_POOL = [
     summary: { channel: "trae", totalCredits: 72480, accountCount: 2, onlineCount: 2, earliestExpire: NOW + 48 * 86400000, expiringSoon: false, todayReq: 412, todayTokens: 96400, lastCreditsAt: ago(25) },
     accounts: [
       // 今日已签到（行内按钮"已签到"态；点开看今日详情）
-      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: ago(25), expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(3), todayReq: 301, todayTokens: 70200, createdAt: NOW - 20 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 3600000, action: "checkin", ok: true, credit: 100, streakDays: 5, message: "签到成功" } },
+      { id: "a1", channel: "trae", uid: "88213476", name: "主账号 · 沐", status: "online", credits: 51230, creditsAt: ago(25), expiresAt: NOW + 48 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(3), todayReq: 301, todayTokens: 70200, createdAt: NOW - 20 * 86400000, hasToken: true, packages: [{ code: "trae-solo", name: "SOLO 基础包", total: 40000, used: 0, remaining: 40000, expiresAt: NOW + 48 * 86400000, expired: false, expiringSoon: false }, { code: "trae-boost", name: "SOLO 加油包", total: 20000, used: 8770, remaining: 11230, expiresAt: NOW + 12 * 86400000, expired: false, expiringSoon: false }], checkin: { day: TODAY, at: NOW - 3600000, action: "checkin", ok: true, credit: 100, streakDays: 5, message: "签到成功" } },
       // 今日签到失败（行内按钮"签到失败"态；点开看失败原因）
-      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: ago(25), expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(40), todayReq: 111, todayTokens: 26200, createdAt: NOW - 6 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 3000000, action: "checkin", ok: false, message: "上游 429：签到请求过于频繁，请稍后重试" } },
+      { id: "a2", channel: "trae", uid: "90247811", name: "备用号", status: "online", credits: 21250, creditsAt: ago(25), expiresAt: NOW + 21 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(40), todayReq: 111, todayTokens: 26200, createdAt: NOW - 6 * 86400000, hasToken: true, packages: [{ code: "trae-old", name: "去年双十一赠送包", total: 5000, used: 0, remaining: 5000, expiresAt: NOW - 3 * 86400000, expired: true, expiringSoon: false }, { code: "trae-solo2", name: "SOLO 基础包", total: 25000, used: 3750, remaining: 21250, expiresAt: NOW + 21 * 86400000, expired: false, expiringSoon: false }], checkin: { day: TODAY, at: NOW - 3000000, action: "checkin", ok: false, message: "上游 429：签到请求过于频繁，请稍后重试" } },
     ],
   },
   {
@@ -271,7 +275,7 @@ const PROXY_POOL = [
     summary: { channel: "workbuddy", totalCredits: 34120, accountCount: 2, onlineCount: 1, earliestExpire: NOW + 12 * 86400000, expiringSoon: false, todayReq: 203, todayTokens: 41200, lastCreditsAt: ago(40) },
     accounts: [
       // 该渠道今日已全部签完（工具栏按钮应显示"签到成功"完成态）
-      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: ago(40), expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: ago(8), todayReq: 203, todayTokens: 41200, createdAt: NOW - 15 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 4000000, action: "checkin", ok: true, already: true, streakDays: 12, message: "今日已签到" } },
+      { id: "a3", channel: "workbuddy", uid: "wb_7c21", name: "工作号", status: "online", credits: 34120, creditsAt: ago(40), expiresAt: NOW + 12 * 86400000, coolUntil: 0, coolReason: "", source: "scan", lastUsed: ago(8), todayReq: 203, todayTokens: 41200, createdAt: NOW - 15 * 86400000, hasToken: true, packages: [{ code: "wb-base", name: "CodeBuddy 个人版月度包", total: 30000, used: 0, remaining: 30000, expiresAt: NOW + 12 * 86400000, expired: false, expiringSoon: false }, { code: "wb-fission", name: "国内运营裂变包", total: 5000, used: 880, remaining: 4120, expiresAt: NOW + 6 * 86400000, expired: false, expiringSoon: false }], checkin: { day: TODAY, at: NOW - 4000000, action: "checkin", ok: true, already: true, streakDays: 12, message: "今日已签到" } },
       { id: "a4", channel: "workbuddy", uid: "wb_9e05", name: "历史快照", status: "cooling", credits: 0, creditsAt: ago(300), expiresAt: 0, coolUntil: NOW + 42000, coolReason: "上游限流", source: "scan", lastUsed: ago(55), todayReq: 0, todayTokens: 0, createdAt: NOW - 15 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 4000000, action: "checkin", ok: true, credit: 50, streakDays: 3, message: "签到成功" } },
     ],
   },
@@ -282,7 +286,7 @@ const PROXY_POOL = [
     summary: { channel: "workbuddy_ai", totalCredits: 8120, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 33 * 86400000, expiringSoon: false, todayReq: 66, todayTokens: 14800, lastCreditsAt: ago(70) },
     accounts: [
       // 一次性加油包已领（行内按钮应显示"已领取"）
-      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: ago(70), expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(30), todayReq: 66, todayTokens: 14800, createdAt: NOW - 4 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 5000000, action: "trial", ok: true, already: true, credit: 500, message: "加油包已领取" } },
+      { id: "a5", channel: "workbuddy_ai", uid: "wba_3d88", name: "Trial 加油包", status: "online", credits: 8120, creditsAt: ago(70), expiresAt: NOW + 33 * 86400000, coolUntil: 0, coolReason: "", source: "paste", lastUsed: ago(30), todayReq: 66, todayTokens: 14800, createdAt: NOW - 4 * 86400000, hasToken: true, packages: [{ code: "wba-bonus", name: "Bonus Pack", total: -1, used: 0, remaining: 8120, expiresAt: NOW + 33 * 86400000, expired: false, expiringSoon: false }], checkin: { day: TODAY, at: NOW - 5000000, action: "trial", ok: true, already: true, credit: 500, message: "加油包已领取" } },
     ],
   },
   {
@@ -343,6 +347,25 @@ const PROXY_POOL = [
     ],
   },
   {
+    // AutoClaw 双区（国内/国际）：积分口径，国内演示今日签到已领、国际演示昨日领取
+    id: "autoclaw", display: "AutoClaw 国内版", domain: "autoglm-acceleration-api.zhipuai.cn", costTier: "", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: true, time: "09:00", jitterMin: 0 },
+    summary: { channel: "autoclaw", totalCredits: 3200, accountCount: 1, onlineCount: 1, earliestExpire: 0, expiringSoon: false, todayReq: 12, todayTokens: 31800, lastCreditsAt: ago(3) },
+    accounts: [
+      { id: "a11", channel: "autoclaw", uid: "ac_10086", name: "手机 138****8000", status: "online", credits: 3200, creditsAt: ago(3), expiresAt: 0, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(1), todayReq: 12, todayTokens: 31800, createdAt: NOW - 4 * 86400000, hasToken: true, checkin: { day: TODAY, at: NOW - 3600000, action: "checkin", ok: true, already: true, credit: 20, message: "签到成功，获得 20 积分" } },
+    ],
+  },
+  {
+    id: "autoclaw_intl", display: "AutoClaw 国际版", domain: "autoglm-api.autoglm.ai", costTier: "", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "autoclaw_intl", totalCredits: 1450, accountCount: 1, onlineCount: 1, earliestExpire: 0, expiringSoon: false, todayReq: 3, todayTokens: 8600, lastCreditsAt: ago(26) },
+    accounts: [
+      { id: "a12", channel: "autoclaw_intl", uid: "ac_9001", name: "tester@example.com", status: "online", credits: 1450, creditsAt: ago(26), expiresAt: 0, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(5), todayReq: 3, todayTokens: 8600, createdAt: NOW - 6 * 86400000, hasToken: true },
+    ],
+  },
+  {
     // CatPaw（美团）：凭据取自桌面端登录态（meta.desktop），演示里给一条导入来源为 scan 的账号
     id: "catpaw", display: "CatPaw（美团）", domain: "ai.catpaw.meituan.com", costTier: "", poolStrategy: "expire_first",
     health: null as { until: number; reason: string; streak: number } | null,
@@ -352,7 +375,63 @@ const PROXY_POOL = [
       { id: "a10", channel: "catpaw", uid: "cp_57130", name: "猫爪主号", status: "online", credits: 8600, creditsAt: ago(8), expiresAt: 0, coolUntil: 0, coolReason: "", source: "scan", lastUsed: ago(2), todayReq: 24, todayTokens: 62400, createdAt: NOW - 3 * 86400000, hasToken: true },
     ],
   },
+  {
+    // Cline 双池：credit 是浮点计量（微 credit ÷1e6），演示免费池正常余量 / 订阅池订阅到期中；
+    // 无签到活动（checkinAuto 恒关，前端也不渲染入口）
+    id: "cline_free", display: "Cline Free", domain: "api.cline.bot", costTier: "free", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "cline_free", totalCredits: 12.5, accountCount: 1, onlineCount: 1, earliestExpire: 0, expiringSoon: false, todayReq: 9, todayTokens: 21400, lastCreditsAt: ago(4) },
+    accounts: [
+      { id: "a13", channel: "cline_free", uid: "usr-01M2VWEDWF", name: "demo@example.com", status: "online", credits: 12.5, creditsAt: ago(4), expiresAt: NOW + 3600000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(1), todayReq: 9, todayTokens: 21400, createdAt: NOW - 2 * 86400000, hasToken: true },
+    ],
+  },
+  {
+    id: "cline_pass", display: "Cline Pass", domain: "api.cline.bot", costTier: "", poolStrategy: "expire_first",
+    health: null as { until: number; reason: string; streak: number } | null,
+    checkinAuto: { enabled: false, time: "09:00", jitterMin: 0 },
+    summary: { channel: "cline_pass", totalCredits: 128.75, accountCount: 1, onlineCount: 1, earliestExpire: NOW + 30 * 86400000, expiringSoon: false, todayReq: 15, todayTokens: 46200, lastCreditsAt: ago(6) },
+    accounts: [
+      { id: "a14", channel: "cline_pass", uid: "usr-01M2VWEDWF", name: "demo@example.com", status: "online", credits: 128.75, creditsAt: ago(6), expiresAt: NOW + 30 * 86400000, coolUntil: 0, coolReason: "", source: "oauth", lastUsed: ago(3), todayReq: 15, todayTokens: 46200, createdAt: NOW - 5 * 86400000, hasToken: true },
+    ],
+  },
 ];
+
+// 自定义提供商：一启用一停用，列表两态 + Key 管理弹窗的 online/cooling 两态都能在预览里看到
+const MOCK_PROXY_PROVIDERS: {
+  id: string; display: string; domain: string; kind: string; enabled: boolean; baseUrl: string;
+  models: unknown[]; extraHeaders: Record<string, string>; extraBody: Record<string, unknown>;
+  updatedAt: number; keyCount: number; onlineCount: number;
+  keys: { id: string; name: string; status: string; hasToken: boolean; coolUntil: number; coolReason: string; todayReq: number; lastUsed: number }[];
+}[] = [
+  {
+    id: "myrelay", display: "我的中转站", domain: "relay.example.com", kind: "openai_compat", enabled: true,
+    baseUrl: "https://relay.example.com",
+    models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20", aliases: ["gpt-4o-turbo"], contextLength: 128000, reasoning: { supportedEfforts: ["low", "high"] } }, "deepseek-v3.2"],
+    extraHeaders: {}, extraBody: {}, updatedAt: NOW - 30 * 60000, keyCount: 2, onlineCount: 1,
+    keys: [
+      { id: "pk1", name: "主 Key", status: "online", hasToken: true, coolUntil: 0, coolReason: "", todayReq: 37, lastUsed: NOW - 3 * 60000 },
+      { id: "pk2", name: "Key 2", status: "cooling", hasToken: true, coolUntil: NOW + 9 * 60000, coolReason: "上游 429 限流", todayReq: 12, lastUsed: NOW - 18 * 60000 },
+    ],
+  },
+  {
+    id: "office", display: "公司自建网关", domain: "llm.corp.example", kind: "openai_compat", enabled: false,
+    baseUrl: "https://llm.corp.example/v1", models: ["qwen3-max"],
+    extraHeaders: { "X-Channel": "agenthub" }, extraBody: {}, updatedAt: NOW - 2 * 3600000, keyCount: 0, onlineCount: 0, keys: [],
+  },
+];
+
+// 预览态的 Key 内容判重表（真机 addKey 按 Key 内容的 SHA-256 判重，不看名称）。
+// 刻意不进 provider 对象：那是 hasToken 脱敏视图，塞明文进去会与真机形状分叉
+const MOCK_PROVIDER_SECRETS = new Map<string, Set<string>>();
+
+/** 真机的 create/update 只回渠道视图（keys / keyCount / onlineCount 是 list 才补的），这里保持同形 */
+function providerView(p: (typeof MOCK_PROXY_PROVIDERS)[number]) {
+  return {
+    id: p.id, display: p.display, domain: p.domain, kind: p.kind, enabled: p.enabled,
+    baseUrl: p.baseUrl, models: p.models, extraHeaders: p.extraHeaders, extraBody: p.extraBody, updatedAt: p.updatedAt,
+  };
+}
 
 const PROXY_USAGE = [
   { id: 5, ts: NOW - 60000, reqId: "r5", keyId: "k1", keyName: "本地主 Key", channel: "trae", accountId: "a1", accountName: "主账号 · 沐", model: "deepseek-v4-flash", promptTokens: 1204, completionTokens: 3841, ttftMs: 820, latencyMs: 1200, status: 200, error: "" },
@@ -367,6 +446,69 @@ const PROXY_TREND = Array.from({ length: 7 }, (_, i) => {
   return { day: d.toISOString().slice(0, 10), req: [186, 242, 210, 305, 268, 391, 681][i], tokens: [42, 55, 48, 71, 60, 88, 156][i] * 1000 };
 });
 
+// ===== 预览用：区间化统计总览（与真实后端契约一致，见《反代网关-用量统计增强方案.md》§4.2） =====
+/** 富字段排行行：由「请求数 + 总 Token」派生出输入/输出/缓存与成功率，形状与后端 statsTopRich 对齐 */
+function mockTopRow(name: string, req: number, tokens: number) {
+  const ok = Math.round(req * 0.99);
+  return {
+    name, req, ok, err: req - ok, successRate: req ? Math.round((ok / req) * 1000) / 10 : 0,
+    promptTokens: Math.round(tokens * 0.78), completionTokens: Math.round(tokens * 0.22),
+    cacheReadTokens: Math.round(tokens * 0.28), cacheCreationTokens: 0, tokens,
+    ttftAvg: 820, latencyAvg: 1900,
+  };
+}
+
+function mockProxyOverview(args?: { from?: number; to?: number; granularity?: string }) {
+  const to = Number(args?.to) || NOW;
+  const from = Number(args?.from) || NOW - 6 * 86400000;
+  const granularity = args?.granularity === "day" ? "day" : args?.granularity === "hour" ? "hour" : to - from <= 2 * 86400000 ? "hour" : "day";
+  const series = PROXY_TREND.map((d, i) => {
+    const ok = Math.round(d.req * 0.99);
+    return {
+      t: new Date(`${d.day}T00:00:00`).getTime(), label: d.day,
+      req: d.req, ok, err: d.req - ok,
+      promptTokens: Math.round(d.tokens * 0.78), completionTokens: Math.round(d.tokens * 0.22),
+      cacheReadTokens: Math.round(d.tokens * 0.28), cacheCreationTokens: 0, tokens: d.tokens,
+      ttftAvg: 800 + i * 12, latencyAvg: 1850, successRate: d.req ? Math.round((ok / d.req) * 1000) / 10 : 0,
+    };
+  });
+  const req = 1284;
+  const ok = 1276;
+  const totalTokens = 312400;
+  return {
+    range: { from, to, granularity },
+    summary: {
+      req, ok, err: req - ok, successRate: Math.round((ok / req) * 1000) / 10,
+      promptTokens: Math.round(totalTokens * 0.78), completionTokens: Math.round(totalTokens * 0.22),
+      cacheReadTokens: Math.round(totalTokens * 0.28), cacheCreationTokens: 0, totalTokens,
+      ttftAvg: 820, ttftP50: 690, latencyAvg: 1900,
+      channels: 3, models: 4, keys: 3, accounts: 3,
+    },
+    series,
+    tops: {
+      channel: [mockTopRow("trae", 745, 182000), mockTopRow("workbuddy", 421, 96000), mockTopRow("workbuddy_ai", 118, 34400)],
+      model: [mockTopRow("deepseek-v4-flash", 512, 120000), mockTopRow("glm-4.6", 233, 62000), mockTopRow("claude-sonnet-4.5", 301, 88000)],
+      key: [mockTopRow("本地主 Key", 612, 148200), mockTopRow("Trae 专用", 403, 96400), mockTopRow("WorkBuddy 专用", 269, 67800)],
+      account: [mockTopRow("主账号 · 沐", 560, 132000), mockTopRow("工作号", 421, 96000), mockTopRow("备用号", 185, 50000)],
+    },
+    keys: [
+      { keyId: "k1", lastTs: NOW - 60000, ...mockTopRow("本地主 Key", 612, 148200) },
+      { keyId: "k2", lastTs: NOW - 89000, ...mockTopRow("Trae 专用", 403, 96400) },
+      { keyId: "k3", lastTs: NOW - 140000, ...mockTopRow("WorkBuddy 专用", 269, 67800) },
+    ],
+    status: [
+      { name: "成功 2xx", key: "ok", value: 1276 },
+      { name: "客户端 4xx", key: "4xx", value: 6 },
+      { name: "服务端 5xx", key: "5xx", value: 2 },
+      { name: "无响应", key: "other", value: 0 },
+    ],
+    tokenMix: [
+      { name: "输入 Token", key: "prompt", value: Math.round(totalTokens * 0.78) },
+      { name: "输出 Token", key: "completion", value: Math.round(totalTokens * 0.22) },
+    ],
+  };
+}
+
 const PROXY_MODELS = [
   { id: "deepseek-v4-flash", object: "model", created: 0, owned_by: "trae", sources: ["trae"], name: "DeepSeek-V4-Flash", rate: null, capabilities: {}, contextLength: 131072, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
   { id: "glm-4.6", object: "model", created: 0, owned_by: "trae", sources: ["trae"], name: "GLM-4.6", rate: null, capabilities: {}, contextLength: 131072, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
@@ -377,6 +519,11 @@ const PROXY_MODELS = [
   { id: "raccoon-chat-ml-5-5", object: "model", created: 0, owned_by: "raccoon", sources: ["raccoon"], name: "Raccoon Chat ML 5.5", rate: null, capabilities: { reasoning: true, tools: true }, contextLength: 180000, maxOutputTokens: 80000, enabled: true, override: "", fallback: "" },
   { id: "glm-5.3-flash", object: "model", created: 0, owned_by: "catpaw", sources: ["catpaw"], name: "GLM-5.3-Flash", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1024000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
   { id: "kimi-k3", object: "model", created: 0, owned_by: "catpaw", sources: ["catpaw"], name: "Kimi-K3", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 0, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  // Cline 双池：模型 id 带池前缀（上游的计费通道选择器，原样转发）
+  { id: "cline-free/deepseek-v4.1-flash", object: "model", created: 0, owned_by: "cline_free", sources: ["cline_free"], name: "DeepSeek V4.1 Flash（免费）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  { id: "z-ai/glm-5.3-flash", object: "model", created: 0, owned_by: "cline_free", sources: ["cline_free"], name: "GLM-5.3-Flash（免费）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1310720, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  { id: "cline-pass/deepseek-v4.1-flash", object: "model", created: 0, owned_by: "cline_pass", sources: ["cline_pass"], name: "DeepSeek V4.1 Flash（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 1000000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
+  { id: "cline-pass/glm-5.3", object: "model", created: 0, owned_by: "cline_pass", sources: ["cline_pass"], name: "GLM-5.3（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
 ];
 
 const PROXY_RULES = [
@@ -1096,9 +1243,12 @@ export const mock = {
         return { id: "k-new", name: String(args?.name || "新 Key"), mask: "sk-demo···0000", route: args?.route || "auto", routeOrder: args?.routeOrder || "", dailyQuota: args?.dailyQuota || 0, rateLimit: 0, enabled: true, createdAt: NOW, todayReq: 0, todayTokens: 0, secret: "sk-demo0000000000000000000000000000000000000000000000" };
       case "proxy_key_update":
       case "proxy_key_delete":
+      case "proxy_keys_delete":
       case "proxy_pool_strategy":
       case "proxy_pool_tier":
       case "proxy_account_remove":
+      case "proxy_account_remove_batch":
+      case "proxy_account_note":
       case "proxy_account_toggle":
       case "proxy_oauth_cancel":
       case "proxy_oauth_submit_callback":
@@ -1222,6 +1372,10 @@ export const mock = {
       case "proxy_scan_import":
         return { ok: true, id: "a-imp", updated: false };
       case "proxy_oauth_begin":
+        // Cline 设备授权：演示用户码形态（前端会显示「用户码：XXXX」一行）
+        if (args?.channel === "cline_free" || args?.channel === "cline_pass") {
+          return { ok: true, url: "https://authkit.cline.bot/device?user_code=PXQF-MWRC（预览）", mode: "device", userCode: "PXQF-MWRC" };
+        }
         return { ok: true, url: "https://www.trae.cn/authorization?...（预览）", mode: args?.channel === "trae" ? "loopback" : "poll" };
       case "proxy_account_import_json":
         return { ok: true, added: 2, dup: 1, invalid: 0, message: "成功导入 2 个账号，1 个同 UID 已存在跳过" };
@@ -1231,6 +1385,85 @@ export const mock = {
         return JSON.parse(JSON.stringify(PROXY_MODELS));
       case "proxy_models_sync":
         return { ok: true, channel: args?.channel || "workbuddy", count: 6, withRate: 4 };
+      // ===== 自定义提供商（预览态不代打上游，但增删改与两态结果都要能演） =====
+      case "proxy_provider_list":
+        return { ok: true, providers: MOCK_PROXY_PROVIDERS.map((p) => ({ ...p, models: [...p.models], keys: p.keys.map((k) => ({ ...k })) })) };
+      case "proxy_provider_create": {
+        const id = String(args?.id || "");
+        if (MOCK_PROXY_PROVIDERS.some((p) => p.id === id)) return { ok: false, message: `标识 "${id}" 已存在` };
+        const keys = (args?.keys as { key?: string }[]) || [];
+        // 同名不同 Key 放行、同内容重复只收一把：与真机 addKey 的内容判重同一口径
+        const secrets = new Set<string>();
+        const keyRows: { id: string; name: string; status: string; hasToken: boolean; coolUntil: number; coolReason: string; todayReq: number; lastUsed: number }[] = [];
+        for (const k of keys) {
+          const s = String(k?.key || "").trim();
+          if (!s || secrets.has(s)) continue;
+          secrets.add(s);
+          keyRows.push({ id: `mk-${id}-${keyRows.length + 1}`, name: `Key ${keyRows.length + 1}`, status: "online", hasToken: true, coolUntil: 0, coolReason: "", todayReq: 0, lastUsed: 0 });
+        }
+        MOCK_PROVIDER_SECRETS.set(id, secrets);
+        const p = {
+          id, display: String(args?.display || id), domain: "", kind: "openai_compat", enabled: args?.enabled !== false,
+          baseUrl: String(args?.baseUrl || ""), models: (args?.models as unknown[]) || [],
+          extraHeaders: (args?.extraHeaders as Record<string, string>) || {}, extraBody: (args?.extraBody as Record<string, unknown>) || {},
+          updatedAt: Date.now(),
+          keys: keyRows, keyCount: keyRows.length, onlineCount: keyRows.length,
+        };
+        MOCK_PROXY_PROVIDERS.push(p);
+        // create/update 的 provider 视图与真机同形：只有 list 才补 keys/keyCount/onlineCount
+        return { ok: true, provider: providerView(p), keyIds: keyRows.map((k) => k.id) };
+      }
+      case "proxy_provider_update": {
+        const p = MOCK_PROXY_PROVIDERS.find((x) => x.id === args?.id);
+        if (!p) return { ok: false, message: "提供商不存在" };
+        Object.assign(p, args, { updatedAt: Date.now() });
+        return { ok: true, provider: providerView(p) };
+      }
+      case "proxy_provider_delete": {
+        const i = MOCK_PROXY_PROVIDERS.findIndex((x) => x.id === args?.id);
+        if (i < 0) return { ok: false, message: "提供商不存在" };
+        MOCK_PROVIDER_SECRETS.delete(String(args?.id || ""));
+        MOCK_PROXY_PROVIDERS.splice(i, 1);
+        return { ok: true };
+      }
+      case "proxy_provider_add_key": {
+        const p = MOCK_PROXY_PROVIDERS.find((x) => x.id === args?.id);
+        if (!p) return { ok: false, message: "提供商不存在" };
+        const secret = String(args?.key || "").trim();
+        if (!secret) return { ok: false, message: "Key 不能为空" };
+        const seen = MOCK_PROVIDER_SECRETS.get(p.id) || new Set<string>();
+        if (seen.has(secret)) return { ok: false, message: "这把 Key 已经在本提供商的号池里了" };
+        seen.add(secret);
+        MOCK_PROVIDER_SECRETS.set(p.id, seen);
+        const id = `mk-${p.id}-${p.keys.length + 1}`;
+        p.keys.push({ id, name: String(args?.name || "").trim() || `Key ${p.keys.length + 1}`, status: "online", hasToken: true, coolUntil: 0, coolReason: "", todayReq: 0, lastUsed: Date.now() });
+        p.keyCount = p.keys.length;
+        p.onlineCount = p.keys.length;
+        return { ok: true, id };
+      }
+      case "proxy_provider_remove_key": {
+        for (const p of MOCK_PROXY_PROVIDERS) {
+          const i = p.keys.findIndex((k) => k.id === args?.accountId);
+          if (i < 0) continue;
+          p.keys.splice(i, 1);
+          p.keyCount = p.keys.length;
+          p.onlineCount = p.keys.filter((k) => k.status === "online").length;
+          return { ok: true };
+        }
+        return { ok: false, message: "Key 不存在" };
+      }
+      case "proxy_provider_test": {
+        // 预览不代打上游，但要能演两种结果态：清单里有的模型算"可用"，其余回失败文案，
+        // 否则逐行测试这条 UI 在 dev:web 里永远只有一种样子
+        const m = String(args?.model || "");
+        const known = MOCK_PROXY_PROVIDERS.find((p) => p.id === args?.id);
+        const inList = (known?.models || []).some((x) => (typeof x === "string" ? x : (x as { model: string }).model) === m);
+        return inList
+          ? { ok: true, ms: 640 + m.length * 7, model: m, sample: "（预览态假响应）收到", finishReason: "stop", usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } }
+          : { ok: false, status: 404, ms: 880, message: "浏览器预览不代打上游，请在应用内测试" };
+      }
+      case "proxy_provider_fetch_models":
+        return { ok: true, models: ["gpt-4o", "gpt-4o-mini", "o3-pro"] };
       // 切号：首调只做预检（对应真实后端 —— 一律回 needConfirm + probe，由前端弹确认框），
       // confirmAck 重调才回执行结果，预览下两条路径都可走通
       case "proxy_ide_switch":
@@ -1258,39 +1491,50 @@ export const mock = {
         // （它在号池页高频调用，同步 tasklist 会堵主进程），运行态只在切号预检的 probe 里给
         return { workbuddyInstalled: true, workbuddyAiInstalled: true, traeInstalled: false, raccoonInstalled: true, zcodeInstalled: true, qoderInstalled: true, qoderIntlInstalled: false, currentUid: "wb_7c21" };
       case "proxy_stats_overview":
-        return {
-          today: { req: 1284, tokens: 312400, successRate: 99.4, ttftAvg: 820 },
-          trend: PROXY_TREND,
-          tops: {
-            channel: [
-              { name: "trae", req: 745, tokens: 182000 },
-              { name: "workbuddy", req: 421, tokens: 96000 },
-              { name: "workbuddy_ai", req: 118, tokens: 34400 },
-            ],
-            model: [
-              { name: "deepseek-v4-flash", req: 512, tokens: 120000 },
-              { name: "glm-4.6", req: 233, tokens: 62000 },
-              { name: "claude-sonnet-4.5", req: 301, tokens: 88000 },
-            ],
-            key: [
-              { name: "本地主 Key", req: 612, tokens: 148200 },
-              { name: "Trae 专用", req: 403, tokens: 96400 },
-              { name: "WorkBuddy 专用", req: 269, tokens: 67800 },
-            ],
-            account: [
-              { name: "主账号 · 沐", req: 560, tokens: 132000 },
-              { name: "工作号", req: 421, tokens: 96000 },
-              { name: "备用号", req: 185, tokens: 50000 },
-            ],
-          },
-        };
+        return mockProxyOverview(args as { from?: number; to?: number; granularity?: string });
       case "proxy_stats_top":
         return [
           { name: "trae", req: 745, tokens: 182000 },
           { name: "workbuddy", req: 421, tokens: 96000 },
         ];
-      case "proxy_stats_detail":
-        return { total: PROXY_USAGE.length, page: 1, pageSize: 20, rows: JSON.parse(JSON.stringify(PROXY_USAGE)) };
+      case "proxy_stats_detail": {
+        // 与后端同口径：Key / 模型模糊搜索 + 渠道 / 状态过滤，并回筛选命中的 token 汇总
+        const a = (args || {}) as { key?: string; model?: string; channel?: string; status?: string; page?: number; pageSize?: number };
+        const kw = String(a.key || "").toLowerCase();
+        const mw = String(a.model || "").toLowerCase();
+        let rows = PROXY_USAGE.filter((r) => {
+          if (kw && !(r.keyName || "").toLowerCase().includes(kw) && !(r.keyId || "").toLowerCase().includes(kw)) return false;
+          if (mw && !(r.model || "").toLowerCase().includes(mw)) return false;
+          if (a.channel && r.channel !== a.channel) return false;
+          if (a.status === "ok" && !(r.status >= 200 && r.status < 300)) return false;
+          if (a.status === "4xx" && !(r.status >= 400 && r.status < 500)) return false;
+          if (a.status === "5xx" && !(r.status >= 500)) return false;
+          if (a.status === "other" && !(r.status < 200 || (r.status >= 300 && r.status < 400))) return false;
+          return true;
+        });
+        const agg = rows.reduce(
+          (s, r) => ({ req: s.req + 1, promptTokens: s.promptTokens + (r.promptTokens || 0), completionTokens: s.completionTokens + (r.completionTokens || 0) }),
+          { req: 0, promptTokens: 0, completionTokens: 0 },
+        );
+        const pageSize = a.pageSize || 20;
+        const page = a.page || 1;
+        const total = rows.length;
+        rows = rows.slice((page - 1) * pageSize, page * pageSize);
+        return {
+          total, page, pageSize,
+          agg: { ...agg, cacheReadTokens: 0, cacheCreationTokens: 0, tokens: agg.promptTokens + agg.completionTokens },
+          rows: JSON.parse(JSON.stringify(rows)),
+        };
+      }
+      case "proxy_stats_cleanup": {
+        // 与后端同口径：all 清空整表，否则按 days（缺省 90）删保留线之前的流水
+        const days = Math.min(3650, Math.max(1, Math.round(Number(args?.days) || 90)));
+        const cutoff = Date.now() - days * 86400000;
+        const before = PROXY_USAGE.length;
+        if (args?.all) PROXY_USAGE.length = 0;
+        else for (let i = PROXY_USAGE.length - 1; i >= 0; i--) if (PROXY_USAGE[i].ts < cutoff) PROXY_USAGE.splice(i, 1);
+        return { deleted: before - PROXY_USAGE.length, cutoff: args?.all ? 0 : cutoff };
+      }
       case "proxy_recent":
         return JSON.parse(JSON.stringify(PROXY_USAGE));
       case "proxy_oplog_list": {
@@ -1324,13 +1568,20 @@ export const mock = {
         return { encrypted: true, driver: "node:sqlite", dataDir: "(浏览器预览)" };
       case "webdav_shared_get":
         return {
+          type: "webdav",
           endpoint: "https://dav.jianguoyun.com/dav",
           username: "demo@example.com",
           password: "••••••••",
-          roots: { skills: "/agent-skills", usage: "/dosage-sync", proxy: "/agenthub-proxy" },
+          encryptionPassphrase: "",
+          s3: { bucket: "", region: "", pathStyle: false },
+          roots: { skills: "/agent-skills", usage: "/dosage-sync", proxy: "/agenthub-proxy", memory: "/agenthub-memory" },
         };
       case "webdav_shared_save":
         return { ok: true, message: "已保存" };
+      case "webdav_shared_clear":
+        return { ok: true, message: "已清除统一服务器配置" };
+      case "module_toggle":
+        return { ok: true, message: args?.enabled ? "已启用" : "已停用" };
       case "webdav_shared_test":
         return { ok: true, message: "连接成功 · 218ms", latencyMs: 218 };
       case "proxy_poolsync_status":

@@ -85,8 +85,9 @@ const autoDedup = autoConfirmOf("dedup");
 async function resolveSupersede(item: SupersedeItem, action: "confirm" | "dismiss" | "merge") {
   busy.value = item.id;
   try {
-    await api.memoryReviewResolve(item.id, action);
-    ElMessage.success(action === "confirm" ? "已标记旧事实失效" : action === "merge" ? "已合并两条" : "已判定为并非矛盾");
+    const r = await api.memoryReviewResolve(item.id, action);
+    // stale：引用的旧记忆已不存在，后端已把该建议作废——如实展示原因，不能报"已标记失效"
+    ElMessage.success(r?.stale ? r.message || "该建议已自动作废" : action === "confirm" ? "已标记旧事实失效" : action === "merge" ? "已合并两条" : "已判定为并非矛盾");
     await refresh();
     await mem.loadStats();
     await mem.refreshPending(true);
@@ -100,8 +101,8 @@ async function resolveSupersede(item: SupersedeItem, action: "confirm" | "dismis
 async function resolveClassify(item: ClassifyItem, slug: string | null) {
   busy.value = item.id;
   try {
-    await api.memoryReviewResolve(item.id, slug ? "assign" : "dismiss", slug ? { slug } : undefined);
-    ElMessage.success(slug ? `已归入 ${slug}` : "已标记为独立记忆");
+    const r = await api.memoryReviewResolve(item.id, slug ? "assign" : "dismiss", slug ? { slug } : undefined);
+    ElMessage.success(r?.stale ? r.message || "该建议已自动作废" : slug ? `已归入 ${slug}` : "已标记为独立记忆");
     await refresh();
     await mem.loadStats();
     await mem.refreshPending(true);
@@ -341,8 +342,8 @@ async function resolveDedup(item: DedupItem, action: "adoptNew" | "keepOld" | "k
   }
   busy.value = item.id;
   try {
-    await api.memoryDedupReviewResolve(item.id, action, text ? { text } : undefined);
-    ElMessage.success("已处理");
+    const r = await api.memoryDedupReviewResolve(item.id, action, text ? { text } : undefined);
+    ElMessage.success(r?.stale ? r.message || "该建议已自动作废" : "已处理");
     await refresh();
     await mem.loadStats();
     await mem.refreshPending(true);

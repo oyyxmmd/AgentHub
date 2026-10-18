@@ -1,0 +1,44 @@
+# 反代网关 Docker 构建上下文（build context = 仓库根，故只有本文件生效）
+#
+# 无本文件时上下文约 2.5GB / 3.2 万文件（node_modules 644MB、release 1.2GB、tmp 633MB），
+# 每次构建都要打包发给 daemon。
+#
+# 边界约定：electron/ 下不做任何排除——镜像靠 COPY electron/backend 整目录换取
+# 「新增渠道/模块时 Docker 零改动」，排除任一文件都会把这个保证打破。只排除与
+# 网关运行无关的前端、文档、工具与构建产物。
+
+# 依赖与构建产物
+node_modules
+**/node_modules
+dist
+release
+
+# VCS 与 CI
+.git
+.github
+
+# 运行时数据与临时目录（可能含凭据与号池数据，绝不进上下文）
+tmp
+gateway/data
+gateway-data
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# 敏感文件（防误 COPY；如需私有 registry 请在 Dockerfile 显式配置，勿带入宿主 .npmrc）
+.env
+.env.*
+**/*.pem
+**/*.key
+.npmrc
+
+# 文档与开发辅助
+docs
+*.md
+.vscode
+.idea
+.box-agent
+
+# 工具与脚本
+tools
+scripts

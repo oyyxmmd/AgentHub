@@ -10,7 +10,7 @@ let _db = null;
 
 // 当前 schema 版本。旧库（user_version=0）首次打开时迁移到该版本；
 // 未来变更表结构时：SCHEMA_VERSION+1，并在 init() 的迁移块中追加对应 ALTER/重建步骤
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 /** 合法时间戳窗口下限（2020-01-01）：早于它的 startedAt 视为源端垃圾数据 */
 const MIN_VALID_TS = 1577836800000;
@@ -65,10 +65,13 @@ function close() {
 /** 记录成本视图：按「记录发生时刻生效的最优匹配价」动态计费（价格修改后历史自动重算）
  *  口径：净输入×输入价 + 缓存命中×缓存读价 + 缓存写入×缓存写价 + (输出+推理)×输出价
  *  适配器口径锚点：input_tokens 含 cache_read_tokens（README 已实测），故净输入需相减
- *  匹配优先级：来源（manual 手动 > remote 远程 > builtin 种子）→ 供应商精确 → 生效时间最新
+ *  匹配优先级：来源（manual 手动 > remote 远程 > builtin 种子）→ 供应商（精确匹配 > 通配 > 错配兜底）→ 生效时间最新
  *  模型名先经 model_alias 解析归并（无别名时用原名），归并/取消后历史费用即时重算
  *  归并记录放开生效下限：归并语义是「该模型全部记录按目标价格计费，生效日期不适用」，
- *  目标价格生效日晚于别名记录时仍按目标现行价计（否则老记录漏计、模型滞留未配置列表） */
+ *  目标价格生效日晚于别名记录时仍按目标现行价计（否则老记录漏计、模型滞留未配置列表）
+ *  归并记录放开供应商限制：归并是用户显式声明「就是同一个模型」，目标只有其它供应商精确价时
+ *  也回落套用（给出估算），否则该供应商记录永远无价、模型滞留未配置列表（issue #96 残留场景）；
+ *  有通配价时仍优先通配价，精确价只在无可匹配行时兜底 */
 const RECORD_COST_VIEW_SQL = `
     CREATE VIEW IF NOT EXISTS v_record_cost AS
     SELECT r.*,
@@ -81,15 +84,21 @@ const RECORD_COST_VIEW_SQL = `
       mp.id AS price_id
     FROM usage_record r
     LEFT JOIN model_price mp ON mp.id = (
-      SELECT p.id FROM model_price p
-      WHERE p.model_id = COALESCE((SELECT target_model_id FROM model_alias WHERE alias = r.model_id), r.model_id)
-        AND (p.provider_id IS NULL OR p.provider_id = r.provider_id)
-        AND (EXISTS (SELECT 1 FROM model_alias WHERE alias = r.model_id) OR p.effective_from <= r.started_at)
-        AND (p.effective_to IS NULL OR p.effective_to > r.started_at)
-      ORDER BY CASE COALESCE(p.source, 'manual') WHEN 'manual' THEN 0 WHEN 'remote' THEN 1 ELSE 2 END,
-               (p.provider_id IS NOT NULL) DESC,
-               p.effective_from DESC
-      LIMIT 1
+      -- SQLite 子查询的 ORDER BY 不允许引用外层别名（WHERE 可以），供应商可匹配优先级
+      -- 先在内层 SELECT 算成排序键（sr=来源、pm=供应商可匹配、ef=生效时间），外层只排派生列
+      SELECT id FROM (
+        SELECT p.id AS id,
+               CASE COALESCE(p.source, 'manual') WHEN 'manual' THEN 0 WHEN 'remote' THEN 1 ELSE 2 END AS sr,
+               CASE WHEN p.provider_id IS NOT NULL AND p.provider_id = r.provider_id THEN 2
+                    WHEN p.provider_id IS NULL THEN 1 ELSE 0 END AS pm,
+               p.effective_from AS ef
+        FROM model_price p
+        WHERE p.model_id = COALESCE((SELECT target_model_id FROM model_alias WHERE alias = r.model_id), r.model_id)
+          AND (p.provider_id IS NULL OR p.provider_id = r.provider_id
+               OR EXISTS (SELECT 1 FROM model_alias WHERE alias = r.model_id))
+          AND (EXISTS (SELECT 1 FROM model_alias WHERE alias = r.model_id) OR p.effective_from <= r.started_at)
+          AND (p.effective_to IS NULL OR p.effective_to > r.started_at)
+      ) ORDER BY sr, pm DESC, ef DESC LIMIT 1
     );
   `;
 
@@ -123,12 +132,7 @@ function init(db) {
     CREATE INDEX IF NOT EXISTS idx_record_model ON usage_record(model_id);
     CREATE INDEX IF NOT EXISTS idx_record_source ON usage_record(source);
     CREATE INDEX IF NOT EXISTS idx_record_source_started ON usage_record(source, started_at);
-    -- 覆盖索引：汇总查询（总量 / 分项 / 按模型·供应商·设备·来源分组）引用的列全部在内，
-    -- 让全表聚合走索引扫描（约 7MB）而不是 38MB 表扫描。过滤列在前、范围列居中、度量列在后。
-    CREATE INDEX IF NOT EXISTS idx_record_cover ON usage_record(
-        device_id, source, started_at, model_id, provider_id,
-        input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, credits
-    );
+    -- 覆盖索引 idx_record_cover 引用 credits 列，统一起见挪到迁移块之后创建（旧库迁移路径可能缺该列）
 
     CREATE TABLE IF NOT EXISTS checkpoint (
         source TEXT PRIMARY KEY,
@@ -182,8 +186,6 @@ function init(db) {
         target_model_id TEXT NOT NULL           -- 归并目标：按目标模型的现行价格版本计费
     );
   `);
-  // 视图单独建：SQL 提成常量，迁移 4→5（视图定义变更）DROP 后用同一份重建
-  db.exec(RECORD_COST_VIEW_SQL);
 
   // schema 版本迁移：按版本逐级执行，PRAGMA user_version 不可参数化故用常量拼接
   const row = db.prepare("PRAGMA user_version").get();
@@ -225,8 +227,26 @@ function init(db) {
       db.exec("DROP VIEW IF EXISTS v_record_cost");
       db.exec(RECORD_COST_VIEW_SQL);
     }
+    // 6 → 7：归并计费供应商放宽。别名记录不再要求供应商精确匹配（归并即声明同名模型），
+    // 通配价优先、其它供应商精确价兜底，否则记录永远无价、模型滞留未配置列表（issue #96）。
+    // 视图定义变更必须 DROP 重建
+    if (current < 7) {
+      db.exec("DROP VIEW IF EXISTS v_record_cost");
+      db.exec(RECORD_COST_VIEW_SQL);
+    }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }
+
+  // 覆盖索引与计费视图建在迁移之后：迁移自旧版库（如 DosageSync 目录迁移）时
+  // credits / model_price / model_alias 可能刚由迁移补出，建在之前会「no such column/table」
+  // 崩掉首次打开。视图 SQL 提成常量，迁移 4→5/5→6/6→7（视图定义变更）DROP 后用同一份重建。
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_record_cover ON usage_record(
+        device_id, source, started_at, model_id, provider_id,
+        input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, credits
+    );
+  `);
+  db.exec(RECORD_COST_VIEW_SQL);
 }
 
 // ===== 内置默认价格 =====
@@ -524,17 +544,29 @@ function listAliases() {
   return get().prepare("SELECT alias, target_model_id AS targetModelId FROM model_alias ORDER BY alias").all();
 }
 
-/** 增/改绑别名（同别名覆盖旧目标）；目标模型是否存在不强制（无价格时等于未配置，无害） */
+/** 增/改绑别名（同别名覆盖旧目标）；目标模型是否存在不强制（无价格时等于未配置，无害）。
+ *  返回归并效果摘要：affected=该模型有 token 消耗的记录数，unresolved=归并后仍无价可套的记录数
+ *  （口径同 listUnpricedModels）——目标缺少可匹配价格行时前端据此提示补价，
+ *  避免「确认归并」后模型滞留未配置列表却无任何解释（issue #96） */
 function addAlias(alias, targetModelId) {
   const a = String(alias || "").trim();
   const t = String(targetModelId || "").trim();
   if (!a || !t) throw new Error("别名与归并目标都不能为空");
   if (a === t) throw new Error("归并目标不能是模型自身");
-  get().prepare(
+  const db = get();
+  db.prepare(
     "INSERT INTO model_alias (alias, target_model_id) VALUES (?, ?) ON CONFLICT(alias) DO UPDATE SET target_model_id = excluded.target_model_id"
   ).run(a, t);
   // 归并影响全部历史费用，与改价同一条 LWW 时钟：多设备同步时后改的一方生效
   setMeta("prices_local_updated", String(Date.now()));
+  const billable = `(${QUOTA_SOURCES_SQL})`;
+  const affected = db.prepare(
+    `SELECT COUNT(*) AS c FROM usage_record WHERE model_id = ? AND (input_tokens + output_tokens + reasoning_tokens) > 0 AND ${billable}`
+  ).get(a).c;
+  const unresolved = db.prepare(
+    `SELECT COUNT(*) AS c FROM v_record_cost WHERE model_id = ? AND price_id IS NULL AND (input_tokens + output_tokens + reasoning_tokens) > 0 AND ${billable}`
+  ).get(a).c;
+  return { affected, unresolved };
 }
 
 /** 取消归并 */
@@ -613,7 +645,8 @@ function listUnpricedModels(source = null) {
 }
 
 /** 价格表整体替换（WebDAV 同步远端更新时用）；clockMs 为远端时钟，保留它防止下载后再回传的乒乓。
- *  aliases 为随表的归并别名（旧版远端无该字段视为空，整表 LWW 让远端获胜，本机改动会随后续上传带回）。 */
+ *  aliases 为随表的归并别名：远端携带该字段（含空数组）→ 按整表 LWW 替换；旧版远端无该字段
+ *  （undefined）→ 保留本机别名——旧客户端上传一次 prices.json 不至于把刚归并好的映射抹掉 */
 function replacePrices(prices, clockMs, aliases) {
   const db = get();
   db.exec("BEGIN");
@@ -642,16 +675,19 @@ function replacePrices(prices, clockMs, aliases) {
         source
       );
     }
-    // 别名整表替换（与价格同一 LWW 生命周期）；畸形行（缺字段 / 自归并 / 重复别名）跳过
-    db.prepare("DELETE FROM model_alias").run();
-    const astmt = db.prepare("INSERT INTO model_alias (alias, target_model_id) VALUES (?, ?)");
-    const seenAlias = new Set();
-    for (const a of Array.isArray(aliases) ? aliases : []) {
-      if (!a || typeof a.alias !== "string" || !a.alias) continue;
-      const t = typeof a.targetModelId === "string" ? a.targetModelId.trim() : "";
-      if (!t || t === a.alias || seenAlias.has(a.alias)) continue;
-      seenAlias.add(a.alias);
-      astmt.run(a.alias, t);
+    // 别名整表替换（与价格同一 LWW 生命周期）；畸形行（缺字段 / 自归并 / 重复别名）跳过。
+    // 远端 payload 未携带 aliases（旧版客户端格式）时不删除，保住本机归并映射
+    if (aliases !== undefined) {
+      db.prepare("DELETE FROM model_alias").run();
+      const astmt = db.prepare("INSERT INTO model_alias (alias, target_model_id) VALUES (?, ?)");
+      const seenAlias = new Set();
+      for (const a of Array.isArray(aliases) ? aliases : []) {
+        if (!a || typeof a.alias !== "string" || !a.alias) continue;
+        const t = typeof a.targetModelId === "string" ? a.targetModelId.trim() : "";
+        if (!t || t === a.alias || seenAlias.has(a.alias)) continue;
+        seenAlias.add(a.alias);
+        astmt.run(a.alias, t);
+      }
     }
     setMeta("prices_local_updated", String(Math.floor(Number(clockMs) || Date.now())));
     db.exec("COMMIT");

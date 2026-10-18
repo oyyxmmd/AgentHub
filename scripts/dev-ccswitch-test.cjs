@@ -1,5 +1,6 @@
 // 生态接入 · CC Switch 假库自测：造临时库（对齐真实 schema：BOOLEAN 标志列 + 复合主键 (id, app_type)），
-// 用 CCSWITCH_DB_PATH 把模块指到它上面，验证 status / register 幂等 / 备份与轮换 / 条目内容 / 校验报错 / 版本不兼容。
+// 用 CCSWITCH_DB_PATH 把模块指到它上面，验证 status / register 幂等 / 备份与轮换 / 条目内容 / 校验报错 / 版本不兼容 /
+// live 链路探测（USERPROFILE+HOME 指到 fixture 家目录，并当场验证隔离真的生效）。
 // 用法：node scripts/dev-ccswitch-test.cjs
 "use strict";
 const fs = require("node:fs");
@@ -274,6 +275,80 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   const rNoDb = ccswitch.register({ appType: "claude", apiKey: "k", model: "m" });
   assert.strictEqual(rNoDb.ok, false, "无库时 register 应失败");
   console.log("✓ 缺库状态与报错");
+
+  // 13) live 链路探测：读的是 os.homedir() 下的客户端配置文件。
+  //     先把 USERPROFILE / HOME 指到 fixture 家目录（Windows 取 USERPROFILE、类 Unix 取 HOME，
+  //     两个都设才跨平台），并**当场验证隔离真的生效**——不验证的话，这段会在本机读到
+  //     用户真实的 ~/.claude/settings.json，断言可能因为用户恰好指向 9527 而假通过。
+  const fakeHome = path.join(tmp, "home");
+  fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+  fs.mkdirSync(path.join(fakeHome, ".codex"), { recursive: true });
+  const prevUserProfile = process.env.USERPROFILE;
+  const prevHome = process.env.HOME;
+  process.env.USERPROFILE = fakeHome;
+  process.env.HOME = fakeHome;
+  try {
+    // 前置闸：先确认被测面真的在，再往下断言。缺字段时后面每一条都会以
+    // 「Cannot read properties of undefined」崩掉，只报第一条、且看不出断的是什么
+    assert.ok(typeof ccswitch.classifyLiveTarget === "function",
+      "ccswitch 必须导出 classifyLiveTarget（分类边界的断言靠它）");
+    assert.strictEqual(path.resolve(os.homedir()), path.resolve(fakeHome),
+      "os.homedir() 必须跟着 USERPROFILE/HOME 走，否则本闸正在读用户真实配置（判据无意义）");
+
+    fs.writeFileSync(path.join(fakeHome, ".claude", "settings.json"),
+      JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:9527" } }));
+    // Codex 故意写两段 provider，且**把指向网关的那段放在前面**：当前生效的 custom 指向
+    // CC Switch 本地代理。整份文件抓第一个 base_url 的实现会答「直连网关」，只有按
+    // model_provider 选段才答得对——顺序反过来就变成两边都对的摆设判据。
+    fs.writeFileSync(path.join(fakeHome, ".codex", "config.toml"),
+      'model_provider = "custom"\n\n[model_providers.dormant]\nbase_url = "http://127.0.0.1:9527"\n\n[model_providers.custom]\nbase_url = "http://127.0.0.1:15721/v1"\n');
+    process.env.CCSWITCH_DB_PATH = dbFile; // 第 12 段把它指去了不存在的路径，这里指回假库
+    const sLive = ccswitch.status({ port: 9527 });
+    assert.ok(sLive.live && sLive.live.claude && sLive.live.codex,
+      "status({ port }) 必须回传 live.claude / live.codex（缺字段时下面的断言会崩成 TypeError）");
+    assert.strictEqual(sLive.live.claude.target, "gateway", "claude live 指向 9527 应分类为直连网关");
+    assert.strictEqual(sLive.live.claude.url, "http://127.0.0.1:9527", "claude live 应回传原始地址");
+    assert.strictEqual(sLive.live.codex.target, "ccswitch", "codex live 指向 15721 应分类为经 CC Switch");
+    assert.strictEqual(sLive.live.codex.url, "http://127.0.0.1:15721/v1",
+      "codex 应按 model_provider 选段取 base_url，不能被另一段（指向网关的 dormant）带偏");
+    // model_provider 指向的段根本不存在（用户删了一半）：必须按未配置处理，
+    // 不能退回去读别段的地址——那会把一个没在用的 provider 地址报成当前链路
+    fs.writeFileSync(path.join(fakeHome, ".codex", "config.toml"),
+      'model_provider = "gone"\n\n[model_providers.custom]\nbase_url = "http://127.0.0.1:9527"\n');
+    assert.strictEqual(ccswitch.status({ port: 9527 }).live.codex.target, "unset",
+      "model_provider 指向缺失的段时应按未配置处理，不得回落到别段的 base_url");
+    console.log("✓ live 链路探测：claude=直连网关 / codex=经 CC Switch（且按 model_provider 选段）");
+
+    // 「未安装 CC Switch」那条分支也必须带 live：两处 return 只补一处，页面在最常见的
+    // 「用户还没装 CC Switch」状态下就会显示成空值
+    process.env.CCSWITCH_DB_PATH = path.join(tmp, "missing", "cc-switch.db");
+    const sNoDb = ccswitch.status({ port: 9527 });
+    assert.strictEqual(sNoDb.installed, false, "缺库分支仍应 installed=false");
+    assert.strictEqual(sNoDb.live && sNoDb.live.claude.target, "gateway",
+      "缺库分支同样要回传 live（fixture 的 settings.json 仍指向 9527）");
+    process.env.CCSWITCH_DB_PATH = dbFile;
+
+    // 读不到配置文件 → unset；分类纯函数边界
+    fs.unlinkSync(path.join(fakeHome, ".claude", "settings.json"));
+    const sUnset = ccswitch.status({ port: 9527 });
+    assert.strictEqual(sUnset.live.claude.target, "unset", "读不到 settings.json 应按未配置处理");
+    const cls = ccswitch.classifyLiveTarget;
+    assert.strictEqual(cls("", 9527).target, "unset", "空地址应为 unset");
+    assert.strictEqual(cls("https://api.example.com/v1", 9527).target, "other", "非本地地址应为 other");
+    assert.strictEqual(cls("http://localhost:9527", 9527).target, "gateway", "localhost 同样算直连");
+    assert.strictEqual(cls("not a url", 9527).target, "other", "解析失败应为 other");
+    // 端口差一档必须不是「直连」：按 host 前缀或字符串包含来判的实现会在这里露出来
+    assert.strictEqual(cls("http://127.0.0.1:9528", 9527).target, "other", "同机不同端口不是直连网关");
+    assert.strictEqual(cls("http://127.0.0.1:9527/", 9527).target, "gateway", "尾斜杠应被剥掉");
+    assert.strictEqual(cls("http://127.0.0.1:9527/v1", 9527).target, "gateway", "带路径前缀仍应认出网关");
+    // URL.hostname 对 IPv6 回的是带方括号的形态，只认 "::1" 的实现会在这里露出来
+    assert.strictEqual(cls("http://[::1]:9527", 9527).target, "gateway", "IPv6 回环同样算直连");
+    assert.strictEqual(cls("http://[::1]:15721", 9527).target, "ccswitch", "IPv6 指向 CC Switch 端口应分类为经 CC Switch");
+    console.log("✓ live 分类边界：unset / other / localhost / IPv6 / 坏地址 / 端口差档 / 尾斜杠与路径");
+  } finally {
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevUserProfile;
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+  }
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log("\n全部通过 ✓");

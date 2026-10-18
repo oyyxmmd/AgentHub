@@ -153,6 +153,12 @@ function registerSync(ctx) {
     const p = sync.progress();
     if (p && p.running) return { ok: false, message: "同步正在进行中" };
     if (p && p.restoring) return { ok: false, message: "正在恢复备份，请稍候" };
+    // 上面两条读的是 progress()，而本地统计（runLocal）刻意不进那台状态机（它的头注释就是
+    // 「静默执行：不走进度状态机、不发系统通知」），所以 localBusy 期间这两条都放行。
+    // 放行之后 sync.run() 自己的同名守卫抛的错只会落进下面那条 fire-and-forget 的
+    // console.error，渲染层既没反应也没提示。这里用本文件已有的 syncBusy() 兜住第三态
+    // （删除设备/改目录/清空三处早就用它拒绝了，唯独 start_sync 漏了）。
+    if (syncBusy()) return { ok: false, message: "本地统计进行中，请稍后再同步" };
     const cfg = config.loadConfig();
     const opts = args && args.mode === "backup" ? { mode: "backup" } : {};
     sync.run(cfg, opts).catch((e) => console.error("[sync]", e));
@@ -362,8 +368,12 @@ function registerSync(ctx) {
   // 模型别名（归并计费）：用量里的变体模型名按目标模型的价格计费，历史费用随视图即时重算
   ipcMain.handle("add_alias", (_e, args) => {
     try {
-      db.addAlias(args.alias, args.targetModelId);
-      return { ok: true, message: `已将 ${args.alias} 归并到 ${args.targetModelId}，历史费用已重算` };
+      const r = db.addAlias(args.alias, args.targetModelId);
+      // 归并生效但目标无可匹配价格行时明说（模型会滞留未配置列表），别让用户以为「点了没反应」
+      let message = `已将 ${args.alias} 归并到 ${args.targetModelId}，历史费用已重算`;
+      if (r.affected === 0) message = `已将 ${args.alias} 归并到 ${args.targetModelId}（该模型暂无用量记录）`;
+      else if (r.unresolved > 0) message = `归并已生效，但仍有 ${r.unresolved} 条记录无价格可套用：目标模型缺少可匹配的价格行，请拉取价格或手动填价`;
+      return { ok: true, message };
     } catch (e) {
       return { ok: false, message: e.message };
     }

@@ -7,13 +7,47 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";
 import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyPoolStrategy, ProxyCostTier, ProxyScanCandidate, ProxyCheckinRow, ProxyGrowthLogEntry, ZcodeDeviceRow } from "../../types";
 import { useAppStore } from "../../stores/app";
-import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, balanceUnit, isQoderChannel, costTierName, checkinLabels, todayStr } from "./format";
+import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, fmtPkgTotal, fmtPkgUsed, pkgFallbackName, balanceUnit, isQoderChannel, isClineChannel, costTierName, checkinLabels, todayStr } from "./format";
 import { coalesceAsync } from "../../utils/timing";
+import { solveCaptcha, cancelCaptcha, CaptchaCancelledError } from "../../utils/aliyunCaptcha";
 
 const app = useAppStore();
 const pool = ref<ProxyChannelView[]>([]);
 const refreshingChannel = ref(false);
 const refreshingId = ref("");
+
+// ===== 积分包明细展开 =====
+const expandedIds = ref<Set<string>>(new Set());
+function togglePkg(id: string) {
+  const next = new Set(expandedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  expandedIds.value = next;
+}
+/** 已用占比（进度条宽度 %）：total<=0 或「不限」时不画条（模板那端已用 v-if 拦住） */
+function pkgUsedPct(pkg: { used: number; total: number }): number {
+  if (!pkg.total || pkg.total <= 0) return 0;
+  const used = pkg.used === -1 ? 0 : Math.max(0, pkg.used);
+  return Math.min(100, Math.round((used / pkg.total) * 100));
+}
+/** 剩余天数文案：expiresAt=0→长期；已过期→已过期；否则「剩 N 天」（不足一天按 1 天） */
+function pkgDaysText(pkg: { expiresAt: number; expired?: boolean }): string {
+  if (!pkg.expiresAt) return "长期";
+  if (pkg.expired) return "已过期";
+  return `剩 ${Math.max(1, Math.ceil((pkg.expiresAt - Date.now()) / 86400000))} 天`;
+}
+/** 状态徽标：已过期(红) / 即将到期(琥珀) / 生效中(灰)。两态由主进程按 expiringSoonDays 现算附在包上，
+ *  这里只读不回算——阈值只有一个来源，两处各算就会「卡片说没到期、明细一排红」。 */
+function pkgStatusCls(pkg: { expired?: boolean; expiringSoon?: boolean }): string {
+  if (pkg.expired) return "tag-err";
+  if (pkg.expiringSoon) return "tag-warn";
+  return "tag-dim";
+}
+function pkgStatusText(pkg: { expired?: boolean; expiringSoon?: boolean }): string {
+  if (pkg.expired) return "已过期";
+  if (pkg.expiringSoon) return "即将到期";
+  return "生效中";
+}
 
 // ===== Toast 悬浮提示（右上角、自动消失）：替代常驻页面的提示卡片 =====
 const toasts = ref<{ id: number; text: string; kind: "info" | "err" }[]>([]);
@@ -56,8 +90,8 @@ function putCheckin(channel: ProxyChannelId, rows: ProxyCheckinRow[]) {
   checkinByChannel.value = { ...checkinByChannel.value, [channel]: rows };
 }
 
-// 添加账号弹窗（四方式：oauth 官方登录 / local 从本机软件导入 / file 从 JSON-ZIP 文件 / paste 粘贴 JSON）
-type AddMethod = "oauth" | "local" | "file" | "paste";
+// 添加账号弹窗（五方式：oauth 官方登录 / sms 手机验证码（仅 AutoClaw 国内版）/ local 从本机软件导入 / file 从 JSON-ZIP 文件 / paste 粘贴 JSON）
+type AddMethod = "oauth" | "sms" | "local" | "file" | "paste";
 const addOpen = ref(false);
 const addChannel = ref<ProxyChannelId>("trae");
 const addMethod = ref<AddMethod>("oauth");
@@ -71,6 +105,8 @@ const fileBusy = ref(false);
 const oauthWaiting = ref(false);
 const oauthMsg = ref("");
 const oauthMode = ref("");
+// Cline 设备授权返回的用户码（浏览器授权页已预填；显示出来供用户改用普通授权页时手动输码）
+const oauthUserCode = ref("");
 // 浏览器没跳回回环地址时的兜底：把地址栏整段粘回来
 const callbackInput = ref("");
 const callbackBusy = ref(false);
@@ -85,6 +121,15 @@ const scanImporting = ref("");
 // 账号重命名（点击名称进入编辑）：renamingId 当前编辑行，renameText 输入内容
 const renamingId = ref("");
 const renameText = ref("");
+// AutoClaw 国内版手机验证码：deviceId 由发码返回、登录必须沿用（服务端按它识别设备）
+const smsPhone = ref("");
+const smsCode = ref("");
+const smsDeviceId = ref("");
+const smsBusy = ref(false);
+const smsMsg = ref("");
+const smsErr = ref(false);
+const smsCountdown = ref(0);
+let smsTimer: ReturnType<typeof setTimeout> | undefined;
 
 // 添加方式可用性：四种方式全开放。
 // Qoder 现已支持「OAuth 登录」（PKCE 设备码轮询：弹官方登录页 → 轮询直接拿到 dt-/drt- 凭据对，
@@ -93,12 +138,18 @@ const renameText = ref("");
 // CatPaw（美团）：上游没有开放授权页流程，凭据是**桌面端会话 Cookie 值**——
 // 只能「从本机客户端导入登录态」或「粘贴 JSON」，故屏蔽 OAuth 页签。
 const NO_OAUTH_CHANNELS: ProxyChannelId[] = ["catpaw"];
+// 仅手机验证码登录的渠道：AutoClaw 国内版（官方主登录是短信；上游无网页 OAuth，
+// 后端 beginOAuth 已显式挡住，前端把 OAuth 页签换成「手机验证码」页签）
+const SMS_ONLY_CHANNELS: ProxyChannelId[] = ["autoclaw"];
 // 无签到 / 奖励活动的渠道：适配器如实回报「不适用」（checkinStatus → unavailable），
 // 前端不渲染签到与自动签到入口——点了一次「一键签到」只得到一条无意义结果，徒增困惑。
 // 与 NO_OAUTH_CHANNELS 同一分工：渠道能力的展示层开关，判定口径在各自适配器
-const NO_CHECKIN_CHANNELS: ProxyChannelId[] = ["catpaw"];
+const NO_CHECKIN_CHANNELS: ProxyChannelId[] = ["catpaw", "cline_free", "cline_pass"];
 function addTabAllowed(key: AddMethod, channel: ProxyChannelId = activeChannel.value): boolean {
   if (key === "oauth" && NO_OAUTH_CHANNELS.includes(channel)) return false;
+  // 手机验证码页签只给 AutoClaw 国内版；它自身也没有 OAuth 页签可放
+  if (key === "sms") return SMS_ONLY_CHANNELS.includes(channel);
+  if (key === "oauth" && SMS_ONLY_CHANNELS.includes(channel)) return false;
   // ModelScope（魔搭）凭据形态特殊：不是 JSON 快照，而是 ms- 访问令牌。
   // 故它的「粘贴」页签改为专用令牌输入（见 tokenPane），并隐藏不适用的两种 JSON 方式。
   if (channel === "modelscope" && (key === "file" || key === "local")) return false;
@@ -107,7 +158,7 @@ function addTabAllowed(key: AddMethod, channel: ProxyChannelId = activeChannel.v
 
 /** 渠道允许的添加方式（分段控件与「打开弹窗时的默认页签」共用这一份口径） */
 function allowedMethods(channel: ProxyChannelId): AddMethod[] {
-  return (["oauth", "local", "file", "paste"] as AddMethod[]).filter((key) => addTabAllowed(key, channel));
+  return (["oauth", "sms", "local", "file", "paste"] as AddMethod[]).filter((key) => addTabAllowed(key, channel));
 }
 
 // 渠道允许的添加方式（分段控件按渠道过滤）
@@ -115,6 +166,7 @@ const METHOD_TABS = computed(
   () =>
     [
       { key: "oauth" as const, label: "OAuth 登录", icon: "ph-key" },
+      { key: "sms" as const, label: "手机验证码", icon: "ph-device-mobile" },
       { key: "local" as const, label: "从本机软件导入", icon: "ph-desktop-tower" },
       { key: "file" as const, label: "从 JSON/ZIP 文件", icon: "ph-file-arrow-up" },
       { key: "paste" as const, label: "粘贴 JSON", icon: "ph-clipboard-text" },
@@ -162,6 +214,18 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
     title: "用 Qoder 国际版官方登录页登录",
     desc: "跳转 Qoder 国际版登录页（qoder.com），登录完成后本机自动轮询取回设备凭据。<br />注意：国际版免费额度不含 DeepSeek / GLM Flash 系列，需充值才有可用模型。",
   },
+  autoclaw_intl: {
+    title: "用 Z.ai / Google 账号登录 AutoClaw 国际版",
+    desc: "点「打开登录页」后<b>先弹出官方风控滑块</b>（阿里云验证，拖一次即可），验证通过自动打开官方登录页（默认 Z.ai），登录完成自动入池。<br />每账号独立执行一次，可反复添加多账号；3 分钟无响应即超时。<br />若浏览器停在回调页没自动跳回，可把地址栏内容整段粘到下方。",
+  },
+  cline_free: {
+    title: "用 Cline 官方设备授权登录（免费额度池）",
+    desc: "点「打开登录页」会跳转 WorkOS 设备授权页（已带用户码，直接确认即可）——<b>无需安装 Cline 客户端</b>，也不占用本地回调端口。<br />确认后本机自动轮询完成入池；每账号独立执行一次，可反复添加多账号；5 分钟无响应即超时。<br />同一份 Cline 登录态可分别在 Free / Pass 两个渠道各导入一次（两个池的账号互不相通）。",
+  },
+  cline_pass: {
+    title: "用 Cline 官方设备授权登录（ClinePass 订阅池）",
+    desc: "点「打开登录页」会跳转 WorkOS 设备授权页（已带用户码，直接确认即可）——<b>无需安装 Cline 客户端</b>。<br />确认后本机自动轮询完成入池；每账号独立执行一次，可反复添加多账号；5 分钟无响应即超时。<br />注意：订阅池只对已开通 ClinePass 的账号开放模型（免费账号请求会得到 403 无权限提示）。",
+  },
 };
 
 // 粘贴 JSON 的字段示例（placeholder 用，随渠道切换 token 字段名提示）
@@ -173,14 +237,94 @@ const pastePlaceholder = computed(() => {
     // CatPaw 的凭据是桌面端会话 Cookie 里的 X-Passport-Token 值 + 独立 user-uid（不在 token 里）
     return `{\n  "name": "主账号（选填）",\n  "accessToken": "X-Passport-Token 值（必填，取自 CatPaw 客户端登录态）",\n  "uid": "user-uid（建议填：它不在 token 里，缺省时按账号名解析）"\n}\n也可整段粘贴 Cookie 串（X-Passport-Token=…; …），会自动取出该字段`;
   }
+  if (isClineChannel(addChannel.value)) {
+    return `{\n  "name": "主账号（选填）",\n  "accessToken": "workos: 开头的凭据（必填；不带 workos: 前缀会自动补上）",\n  "refreshToken": "选填（建议填：access token 只有 1 小时有效期）",\n  "uid": "选填，缺省从 token 的 external_id 声明解析"\n}\n也可直接从 ~/.cline/data/settings/providers.json 的 providers.cline.settings.auth 整段粘贴`;
+  }
   const tokenKey = addChannel.value === "trae" ? "jwt" : "accessToken";
   const extra = addChannel.value === "raccoon" ? `\n  "officeIdentity": "选填，团队版组织标识",` : "";
   return `单个对象或数组均可，字段容忍别名：\n{\n  "name": "主账号（选填）",\n  "${tokenKey}": "渠道原生 token（必填）",\n  "refreshToken": "选填",${extra}\n  "uid": "选填，缺省从 token 解析"\n}`;
 });
 
-// 移出确认
+// 删除确认
 const delOpen = ref(false);
 const delRow = ref<ProxyAccount | null>(null);
+
+// ===== 多选 / 全选 + 导出 / 批量删除（选择只对当前渠道有意义，切渠道即清空） =====
+const selectedIds = ref<Set<string>>(new Set());
+const batchDelOpen = ref(false);
+const batchDelBusy = ref(false);
+const activeChannelAccounts = computed(() => pool.value.find((c) => c.id === activeChannel.value)?.accounts || []);
+const selectedCount = computed(() => activeChannelAccounts.value.filter((a) => selectedIds.value.has(a.id)).length);
+const allSelected = computed(
+  () => activeChannelAccounts.value.length > 0 && activeChannelAccounts.value.every((a) => selectedIds.value.has(a.id))
+);
+function toggleSelect(accId: string) {
+  const next = new Set(selectedIds.value);
+  if (next.has(accId)) next.delete(accId);
+  else next.add(accId);
+  selectedIds.value = next;
+}
+function toggleSelectAll() {
+  selectedIds.value = allSelected.value ? new Set() : new Set(activeChannelAccounts.value.map((a) => a.id));
+}
+watch(activeChannel, () => {
+  selectedIds.value = new Set();
+});
+
+/** 导出选中账号为 JSON 文件：仅元数据，不含凭据（凭据仅本机 DPAPI 加密保管，不外发） */
+function exportSelected() {
+  const rows = activeChannelAccounts.value.filter((a) => selectedIds.value.has(a.id));
+  if (!rows.length) return;
+  const payload = {
+    format: "agenthub-accounts",
+    exportedAt: new Date().toISOString(),
+    channel: activeChannel.value,
+    accounts: rows.map((a) => ({
+      id: a.id,
+      channel: a.channel,
+      uid: a.uid,
+      name: a.name,
+      note: a.note || "",
+      source: a.source,
+      status: a.status,
+      credits: a.credits,
+      creditsAt: a.creditsAt,
+      expiresAt: a.expiresAt,
+      createdAt: a.createdAt,
+    })),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `agenthub-accounts-${activeChannel.value}-${todayStr()}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+  toast(`已导出 ${rows.length} 个账号（仅元数据，不含凭据）`);
+}
+
+/** 批量删除：主进程逐个走单删链路（墓碑先行，经 WebDAV 传播到其他设备） */
+async function doBatchDelete() {
+  if (batchDelBusy.value) return;
+  const ids = activeChannelAccounts.value.filter((a) => selectedIds.value.has(a.id)).map((a) => a.id);
+  if (!ids.length) {
+    batchDelOpen.value = false;
+    return;
+  }
+  batchDelBusy.value = true;
+  try {
+    const r = await api.proxyAccountRemoveBatch(ids);
+    const okDone = r.ok !== false;
+    toast(okDone ? `已删除 ${r.removed ?? ids.length} 个账号` : r.message || "批量删除失败", okDone ? "info" : "err");
+    batchDelOpen.value = false;
+    selectedIds.value = new Set();
+    await refresh();
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    batchDelBusy.value = false;
+  }
+}
 
 const STRATEGIES: { value: ProxyPoolStrategy; label: string }[] = [
   { value: "expire_first", label: "到期优先" },
@@ -194,6 +338,16 @@ const COST_TIERS: { value: ProxyCostTier; label: string }[] = [
   { value: "low", label: "低成本" },
   { value: "normal", label: "普通" },
 ];
+
+// ===== 调度策略小弹窗：策略 / 成本档两个下拉收进弹窗（工具栏只留入口按钮），改动即时生效 =====
+const strategyOpen = ref(false);
+const strategyChannel = ref<ProxyChannelId>("trae");
+const shownStrategyChannel = computed(() => pool.value.find((c) => c.id === strategyChannel.value) || null);
+
+function openStrategy(ch: ProxyChannelView) {
+  strategyChannel.value = ch.id;
+  strategyOpen.value = true;
+}
 
 const loading = ref(false);
 const zcodeHasReward = ref(false);
@@ -831,6 +985,39 @@ async function commitRename(acc: ProxyAccount) {
   }
 }
 
+// ===== 账号备注弹窗（一个输入框，保存落 meta.note；随 WebDAV 快照导出 + 备注新者胜传播） =====
+const noteOpen = ref(false);
+const noteRow = ref<ProxyAccount | null>(null);
+const noteText = ref("");
+const noteBusy = ref(false);
+
+function openNote(acc: ProxyAccount) {
+  noteRow.value = acc;
+  noteText.value = acc.note || "";
+  noteOpen.value = true;
+}
+
+async function saveNote() {
+  const acc = noteRow.value;
+  if (!acc || noteBusy.value) return;
+  const text = noteText.value.trim();
+  noteBusy.value = true;
+  try {
+    const r = await api.proxyAccountNote(acc.id, text);
+    if (r.ok === false) {
+      toast(r.message || "保存失败", "err");
+      return;
+    }
+    noteOpen.value = false;
+    toast(text ? "备注已保存（将随 WebDAV 同步）" : "备注已清除");
+  } catch (e) {
+    toast(String((e as Error).message || e), "err");
+  } finally {
+    noteBusy.value = false;
+    await refresh();
+  }
+}
+
 async function releaseCool(acc: ProxyAccount) {
   if (coolOffId.value) return;
   coolOffId.value = acc.id;
@@ -864,8 +1051,8 @@ async function doDelete() {
 
 function openAdd(ch: ProxyChannelView) {
   addChannel.value = ch.id;
-  // 默认落该渠道**第一个可用**方式：无 OAuth 的渠道（CatPaw）落「从本机软件导入」。
-  // 写死 "oauth" 会让弹窗停在一个已被隐藏的页签上——渲染 OAuth 面板却没有页签可切回
+  // 默认落该渠道**第一个可用**方式：无 OAuth 的渠道（CatPaw）落「从本机软件导入」，
+  // AutoClaw 国内版落「手机验证码」。写死 "oauth" 会让弹窗停在一个已被隐藏的页签上
   addMethod.value = allowedMethods(ch.id)[0] || "oauth";
   pasteJson.value = "";
   pasteMsg.value = "";
@@ -874,8 +1061,14 @@ function openAdd(ch: ProxyChannelView) {
   fileErr.value = false;
   oauthMsg.value = "";
   oauthMode.value = "";
+  oauthUserCode.value = "";
   callbackInput.value = "";
   callbackMsg.value = "";
+  smsPhone.value = "";
+  smsCode.value = "";
+  smsDeviceId.value = "";
+  smsMsg.value = "";
+  smsErr.value = false;
   scanMsg.value = "";
   scanErr.value = false;
   addOpen.value = true;
@@ -886,6 +1079,9 @@ function openAdd(ch: ProxyChannelView) {
 function closeAdd() {
   addOpen.value = false;
   if (oauthWaiting.value) cancelOauth();
+  // AutoClaw 国际版滑块可能在等用户拖动（oauthWaiting 全程为 true 已被上面覆盖；
+  // 这里兜底取消滑块等待，不留面板悬挂）
+  cancelCaptcha();
 }
 
 function switchMethod(m: AddMethod) {
@@ -896,11 +1092,16 @@ function switchMethod(m: AddMethod) {
 
 async function beginOauth() {
   if (oauthWaiting.value) return;
+  // AutoClaw 国际版链路是倒的：先在前端跑完阿里云风控滑块拿到验证串，再换授权地址
+  if (addChannel.value === "autoclaw_intl") return beginAutoclawOauth();
   oauthWaiting.value = true;
   oauthMsg.value =
     addChannel.value === "raccoon"
       ? "已弹出应用内授权窗，完成登录后自动截获授权码加入号池（3 分钟超时）…"
-      : "已在浏览器打开官方登录页，完成授权后自动加入号池（3 分钟超时）…";
+      : isClineChannel(addChannel.value)
+        ? "已在浏览器打开 Cline 授权页（已带用户码，确认即可），确认后自动加入号池（5 分钟超时）…"
+        : "已在浏览器打开官方登录页，完成授权后自动加入号池（3 分钟超时）…";
+  oauthUserCode.value = "";
   callbackMsg.value = "";
   try {
     const r = await api.proxyOauthBegin(addChannel.value);
@@ -910,9 +1111,107 @@ async function beginOauth() {
       return;
     }
     oauthMode.value = r.mode || "";
+    oauthUserCode.value = r.userCode || "";
   } catch (e) {
     oauthMsg.value = String((e as Error).message || e);
     oauthWaiting.value = false;
+  }
+}
+
+/**
+ * AutoClaw 国际版 OAuth：滑块 → 换授权地址 → 开浏览器等回环回调。
+ * 120 秒的验证码超时只包「拖滑块 + 换地址」——等登录回调发生在 solveCaptcha
+ * 返回之后（长流程塞进 request 回调会被验证码超时误杀，三方状态错乱）。
+ */
+async function beginAutoclawOauth() {
+  oauthWaiting.value = true;
+  oauthMsg.value = "正在获取风控配置…";
+  callbackMsg.value = "";
+  try {
+    const cfg = await api.proxyAutoclawCaptchaConfig("autoclaw_intl");
+    if (!cfg.ok || !cfg.enabled) throw new Error("上游未启用网页登录（或风控配置不可用），请改用「从本机软件导入」");
+    if (!cfg.prefix || !cfg.sceneId) throw new Error("风控验证配置不完整，请稍后重试");
+    oauthMsg.value = "请在弹出的滑块中完成验证（官方要求的风控步骤）…";
+    const answer = (await solveCaptcha(
+      { region: cfg.region || "ga", prefix: cfg.prefix, sceneId: cfg.sceneId },
+      async (verifyParam) => {
+        const r = await api.proxyOauthBeginWithCaptcha("autoclaw_intl", verifyParam, "zai");
+        if (r.ok === false) throw new Error(r.message || "无法启动登录");
+        return { url: r.url, mode: r.mode };
+      },
+    )) as { url?: string; mode?: string };
+    oauthMode.value = answer.mode || "";
+    oauthMsg.value = "已在浏览器打开官方登录页，完成授权后自动加入号池（3 分钟超时）…";
+  } catch (e) {
+    if (e instanceof CaptchaCancelledError) {
+      oauthWaiting.value = false;
+      oauthMsg.value = "";
+      return;
+    }
+    oauthMsg.value = String((e as Error).message || e);
+    oauthWaiting.value = false;
+  }
+}
+
+// ===== AutoClaw 国内版：手机验证码两跳 =====
+
+function startSmsCountdown() {
+  smsCountdown.value = 60;
+  if (smsTimer) clearTimeout(smsTimer);
+  smsTimer = setTimeout(function tick() {
+    smsCountdown.value -= 1;
+    if (smsCountdown.value > 0) smsTimer = setTimeout(tick, 1000);
+  }, 1000);
+}
+
+async function sendSms() {
+  if (smsBusy.value || smsCountdown.value > 0) return;
+  const phone = smsPhone.value.trim();
+  if (!/^1[2-9]\d{9}$/.test(phone.replace(/[\s-]/g, ""))) {
+    smsMsg.value = "请输入 11 位国内手机号";
+    smsErr.value = true;
+    return;
+  }
+  smsBusy.value = true;
+  smsMsg.value = "";
+  smsErr.value = false;
+  try {
+    const r = await api.proxyAutoclawSmsSend("autoclaw", phone);
+    if (!r.ok) throw new Error(r.message || "验证码发送失败");
+    smsDeviceId.value = r.deviceId || "";
+    smsMsg.value = "验证码已发送，请查收短信（约 1 分钟内到达）";
+    startSmsCountdown();
+  } catch (e) {
+    smsMsg.value = String((e as Error).message || e);
+    smsErr.value = true;
+  } finally {
+    smsBusy.value = false;
+  }
+}
+
+async function submitSms() {
+  if (smsBusy.value) return;
+  const code = smsCode.value.trim();
+  if (!/^\d{4,8}$/.test(code)) {
+    smsMsg.value = "请输入短信验证码（数字）";
+    smsErr.value = true;
+    return;
+  }
+  smsBusy.value = true;
+  smsMsg.value = "";
+  smsErr.value = false;
+  try {
+    const r = await api.proxyAutoclawSmsLogin("autoclaw", smsPhone.value.trim(), code, smsDeviceId.value);
+    if (!r.ok) throw new Error(r.message || "登录失败");
+    smsMsg.value = "";
+    toast("AutoClaw 登录成功，账号已加入号池");
+    closeAdd();
+    await refresh();
+  } catch (e) {
+    smsMsg.value = String((e as Error).message || e);
+    smsErr.value = true;
+  } finally {
+    smsBusy.value = false;
   }
 }
 
@@ -921,6 +1220,7 @@ async function cancelOauth() {
   oauthWaiting.value = false;
   oauthMsg.value = "";
   oauthMode.value = "";
+  oauthUserCode.value = "";
 }
 
 function reauthAccount(acc: ProxyAccount) {
@@ -935,8 +1235,10 @@ function reauthAccount(acc: ProxyAccount) {
     loadScan();
     return;
   }
-  addMethod.value = "oauth";
-  beginOauth();
+  // 默认落该渠道第一个可用方式：AutoClaw 国内版落「手机验证码」（短信登录需用户填手机号，
+  // 不适合自动发起），其余渠道落 OAuth 并直接发起
+  addMethod.value = allowedMethods(acc.channel)[0] || "oauth";
+  if (addMethod.value === "oauth") beginOauth();
 }
 
 /** 兜底：把浏览器地址栏内容整段粘回来完成登录（仅回环模式用得上） */
@@ -1138,13 +1440,9 @@ function fmtClock(ts: number): string {
   return new Date(ts).toLocaleTimeString("zh-CN", { hour12: false });
 }
 
-// ===== UID 查看（列表副行只显示缩略，点击弹小窗看全文 + 复制） =====
+// ===== UID 查看（列表副行只显示「UID」小按钮，点击弹小窗看全文 + 复制） =====
 const uidRow = ref<ProxyAccount | null>(null);
 const uidCopied = ref(false);
-/** 列表副行的 UID 缩略：过长截断，全文在弹窗里看 */
-function uidBrief(uid: string): string {
-  return uid.length > 14 ? `${uid.slice(0, 14)}…` : uid;
-}
 async function copyUid() {
   if (!uidRow.value?.uid) return;
   try {
@@ -1185,7 +1483,11 @@ onMounted(() => {
     if (p.type === "oauth-done") {
       oauthWaiting.value = false;
       oauthMode.value = "";
-      oauthMsg.value = p.ok ? "登录成功，已加入号池（已自动签到）" : `登录失败：${p.message || ""}`;
+      oauthUserCode.value = "";
+      // 无签到活动的渠道（Cline 双池 / CatPaw）登录成功后不该提示「已自动签到」：
+      // 优先用事件回传的 channel（异步回流期间用户可能已切换渠道），缺失时退回当前弹窗渠道
+      const noCheckin = NO_CHECKIN_CHANNELS.includes((p.channel || addChannel.value) as ProxyChannelId);
+      oauthMsg.value = p.ok ? `登录成功，已加入号池${noCheckin ? "" : "（已自动签到）"}` : `登录失败：${p.message || ""}`;
       if (p.ok) {
         addOpen.value = false;
         refresh();
@@ -1199,6 +1501,8 @@ onUnmounted(() => {
   if (offEvent) offEvent();
   scheduleRefresh.cancel();
   if (nowTimer) clearInterval(nowTimer);
+  if (smsTimer) clearTimeout(smsTimer);
+  cancelCaptcha(); // 弹窗外销毁时滑块等待也不该悬挂
 });
 </script>
 
@@ -1235,35 +1539,22 @@ onUnmounted(() => {
           </span>
           <span v-if="ch.summary.expiringSoon" class="tag tag-warn">24h 内有到期</span>
           <span v-if="costTierName(ch.costTier) !== '普通'" class="tag" :class="ch.costTier === 'free' ? 'tag-ok' : 'tag-dim'">{{ costTierName(ch.costTier) }}</span>
-          <!-- 工具栏：只属于当前渠道（策略 / 成本档 / 添加 / 签到或加油包 / 刷新），与其他渠道互不关联 -->
+          <!-- 工具栏：只属于当前渠道（调度策略 / 添加 / 签到或加油包 / 刷新），与其他渠道互不关联；
+               策略与成本档两个下拉已收进「调度策略」小弹窗 -->
           <span class="panel-tools">
-            <el-tooltip content="渠道账号调度策略" placement="top">
-              <span>
-                <el-select
-                  class="f-el-select strategy-select"
-                  popper-class="glass-popper"
-                  :model-value="ch.poolStrategy"
-                  style="width: 140px"
-                  @update:model-value="(v: string) => setStrategy(ch, v as ProxyPoolStrategy)"
-                >
-                  <el-option v-for="s in STRATEGIES" :key="s.value" :value="s.value" :label="s.label" />
-                </el-select>
-              </span>
-            </el-tooltip>
-            <el-tooltip content="成本档位：全局开启「免费 / 低成本优先」排序时，免费渠道的额度先消耗（配置 → 反代网关）" placement="top">
-              <span>
-                <el-select
-                  class="f-el-select strategy-select"
-                  popper-class="glass-popper"
-                  :model-value="ch.costTier || 'normal'"
-                  style="width: 108px"
-                  @update:model-value="(v: string) => setCostTier(ch, v as ProxyCostTier)"
-                >
-                  <el-option v-for="t in COST_TIERS" :key="t.value" :value="t.value" :label="t.label" />
-                </el-select>
-              </span>
+            <el-tooltip content="渠道账号调度策略与成本档位" placement="top">
+              <button class="btn btn-sm" @click="openStrategy(ch)">调度策略</button>
             </el-tooltip>
             <button class="btn btn-sm" @click="openAdd(ch)">添加账号</button>
+            <!-- 多选后出现的批量操作：导出（仅元数据）与批量删除（二次确认） -->
+            <template v-if="selectedCount">
+              <el-tooltip content="把选中账号导出为 JSON 文件（仅元数据，不含凭据）" placement="top">
+                <button class="btn btn-sm" @click="exportSelected">导出</button>
+              </el-tooltip>
+              <el-tooltip content="删除选中的账号（本地加密凭据一并删除，删除会经 WebDAV 同步传播到其他设备）" placement="top">
+                <button class="btn btn-sm danger" :disabled="batchDelBusy" @click="batchDelOpen = true">批量删除</button>
+              </el-tooltip>
+            </template>
             <el-tooltip v-if="ch.id === 'workbuddy_ai'" :content="checkinToolbarTitle(ch)" placement="top">
               <button
                 class="btn btn-sm"
@@ -1377,6 +1668,9 @@ onUnmounted(() => {
           <table class="table table-bare pool-tbl">
             <thead>
               <tr>
+                <th class="sel-col">
+                  <input type="checkbox" :checked="allSelected" :disabled="!ch.accounts.length" @change="toggleSelectAll" />
+                </th>
                 <th>账号</th><th>状态</th><th>{{ ch.id === 'zcode' ? 'Token 余额' : '余额' }}</th><th>到期</th><th>今日</th><th>操作</th>
               </tr>
             </thead>
@@ -1384,6 +1678,7 @@ onUnmounted(() => {
               <!-- 骨架屏加载 -->
               <template v-if="loading && !ch.accounts.length">
                 <tr v-for="n in 4" :key="'sk-' + n">
+                  <td class="sel-col"><div class="skeleton" style="height: 14px; width: 14px; margin: 0 auto"></div></td>
                   <td><div class="skeleton" style="height: 20px; width: 120px"></div></td>
                   <td><div class="skeleton" style="height: 18px; width: 50px"></div></td>
                   <td><div class="skeleton" style="height: 18px; width: 70px"></div></td>
@@ -1393,13 +1688,26 @@ onUnmounted(() => {
                 </tr>
               </template>
               <tr v-else-if="!ch.accounts.length">
-                <td colspan="6" style="text-align: center; color: var(--text-3); padding: 24px 0">
+                <td colspan="7" style="text-align: center; color: var(--text-3); padding: 24px 0">
                   号池为空 —— 点「添加账号」：OAuth 登录 / 从本机软件导入 / 文件导入 / 手动粘贴
                 </td>
               </tr>
               <template v-else>
-                <tr v-for="(acc, i) in ch.accounts" :key="acc.id" :style="{ '--i': i }">
+                <template v-for="(acc, i) in ch.accounts" :key="acc.id">
+                <tr :style="{ '--i': i }">
+                  <td class="sel-col">
+                    <input type="checkbox" :checked="selectedIds.has(acc.id)" @change="toggleSelect(acc.id)" />
+                  </td>
                   <td class="acc-cell">
+                    <el-tooltip
+                      v-if="acc.packages && acc.packages.length"
+                      :content="(expandedIds.has(acc.id) ? '收起' : '展开') + pkgFallbackName(acc.channel) + '明细'"
+                      placement="top"
+                    >
+                      <button class="pkg-caret" :class="{ open: expandedIds.has(acc.id) }" @click="togglePkg(acc.id)">
+                        <i class="ph ph-caret-right" />
+                      </button>
+                    </el-tooltip>
                     <el-tooltip v-if="renamingId !== acc.id" :content="acc.name + '（点击重命名）'" placement="top">
                       <span class="acc-name" @click="startRename(acc)">{{ acc.name || "（未命名账号）" }}</span>
                     </el-tooltip>
@@ -1412,14 +1720,20 @@ onUnmounted(() => {
                       @keydown.enter="commitRename(acc)"
                       @keydown.esc="renamingId = ''"
                     />
-                    <span class="acc-sub">
+                      <span class="acc-sub">
                       <span class="acc-src">{{ SOURCE_NAMES[acc.source] || acc.source }}</span>
                       <i>·</i>
                       <el-tooltip :content="acc.uid ? '点击查看完整 UID' : ''" :disabled="!acc.uid" placement="top">
                         <button class="acc-uid mono" :disabled="!acc.uid" @click="uidRow = acc">
-                          {{ acc.uid ? uidBrief(acc.uid) : "无 UID" }}
+                          {{ acc.uid ? "UID" : "无 UID" }}
                         </button>
                       </el-tooltip>
+                      <template v-if="acc.note">
+                        <i>·</i>
+                        <el-tooltip :content="`${acc.note}（点击编辑备注）`" placement="top">
+                          <span class="acc-note" @click="openNote(acc)">{{ acc.note }}</span>
+                        </el-tooltip>
+                      </template>
                       <template v-if="acc.liveHere">
                         <i>·</i>
                         <el-tooltip :content="`${ch.display} 客户端在本机当前登录的就是这个账号`" placement="top">
@@ -1510,7 +1824,7 @@ onUnmounted(() => {
                         :disabled="ideSwitching === acc.id || !ideSupported(acc)"
                         @click="ideSwitch(acc)"
                       >
-                        {{ ideSwitching === acc.id ? "切换中…" : "切到 IDE" }}
+                        {{ ideSwitching === acc.id ? "切换中…" : "切换" }}
                       </button>
                     </el-tooltip>
                     <el-tooltip
@@ -1542,9 +1856,46 @@ onUnmounted(() => {
                       </button>
                     </el-tooltip>
                     <button class="btn-link btn-sm" @click="toggleAccount(acc)">{{ acc.status === "disabled" ? "启用" : "停用" }}</button>
-                    <button class="btn-link btn-sm danger" @click="delRow = acc; delOpen = true">移出</button>
+                    <el-tooltip content="添加 / 编辑备注（随 WebDAV 同步到其他设备）" placement="top">
+                      <button class="btn-link btn-sm" @click="openNote(acc)">备注</button>
+                    </el-tooltip>
+                    <button class="btn-link btn-sm danger" @click="delRow = acc; delOpen = true">删除</button>
                   </td>
                 </tr>
+                <!-- 展开态：该账号逐包明细。两个 -1 的念法走 fmtPkgTotal/fmtPkgUsed，
+                     与积分日历那张表同口径——同一批钱在两个页面不能一个念「不限」一个念「—」 -->
+                <tr v-if="expandedIds.has(acc.id) && acc.packages && acc.packages.length" class="pkg-row">
+                  <td colspan="7" class="pkg-cell">
+                    <table class="pkg-tbl">
+                      <tbody>
+                        <tr>
+                          <th>{{ pkgFallbackName(acc.channel) }}</th><th class="num">已用</th><th class="num">总额</th><th class="num">剩余</th><th>到期</th><th class="num">剩余天数</th><th>状态</th>
+                        </tr>
+                        <tr v-for="(pkg, pi) in acc.packages" :key="pkg.code || pi">
+                          <td class="pkg-name">
+                            <!-- 名称与进度条各挂一个浮层，且都**不**挂在 td 上：td 是二者的共同祖先，
+                                 包上去会一次 hover 叠出两个浮层 -->
+                            <el-tooltip :content="pkg.name" :disabled="!pkg.name" placement="top">
+                              <span>{{ pkg.name || pkgFallbackName(acc.channel) }}</span>
+                            </el-tooltip>
+                            <el-tooltip v-if="pkg.total > 0" :content="`已用 ${fmtPkgUsed(pkg.used, pkg.total, acc.channel)} / 总额 ${fmtPkgTotal(pkg.total, pkg.remaining, acc.channel)}`" placement="top">
+                              <div class="pkg-bar">
+                                <span class="pkg-bar-used" :style="{ width: pkgUsedPct(pkg) + '%' }" />
+                              </div>
+                            </el-tooltip>
+                          </td>
+                          <td class="mono num">{{ fmtPkgUsed(pkg.used, pkg.total, acc.channel) }}</td>
+                          <td class="mono num">{{ fmtPkgTotal(pkg.total, pkg.remaining, acc.channel) }}</td>
+                          <td class="mono num">{{ fmtBalance(pkg.remaining, acc.channel) }}</td>
+                          <td class="mono">{{ pkg.expiresAt ? fmtDate(pkg.expiresAt) : "长期" }}</td>
+                          <td class="mono num">{{ pkgDaysText(pkg) }}</td>
+                          <td><span class="tag" :class="pkgStatusCls(pkg)">{{ pkgStatusText(pkg) }}</span></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                </tr>
+                </template>
               </template>
             </tbody>
           </table>
@@ -1605,7 +1956,43 @@ onUnmounted(() => {
                 </button>
               </div>
               <div v-if="callbackMsg" class="add-msg">{{ callbackMsg }}</div>
+              <!-- Cline 设备授权：用户码（授权页已预填；换设备/手动输码时需要这串） -->
+              <div v-if="oauthWaiting && oauthUserCode" class="add-msg">
+                用户码：<b class="mono">{{ oauthUserCode }}</b>（授权页已预填，直接确认即可）
+              </div>
               <div v-if="oauthMsg" class="add-msg" :class="{ err: !oauthWaiting && oauthMsg.includes('失败') }">{{ oauthMsg }}</div>
+            </div>
+
+            <!-- 手机验证码登录（AutoClaw 国内版专用）：发码 → 输码 → 两跳直调入池 -->
+            <div v-else-if="addMethod === 'sms'" class="add-pane sms-pane">
+              <div class="paste-label">手机号</div>
+              <div class="cb-row">
+                <input
+                  v-model="smsPhone"
+                  class="input"
+                  style="flex: 1"
+                  placeholder="11 位国内手机号"
+                  maxlength="13"
+                  :disabled="smsBusy"
+                />
+                <button class="btn btn-sm" :disabled="smsBusy || smsCountdown > 0 || !smsPhone.trim()" @click="sendSms">
+                  {{ smsBusy ? "发送中…" : smsCountdown > 0 ? `${smsCountdown}s 后重发` : "发送验证码" }}
+                </button>
+              </div>
+              <div class="paste-label" style="margin-top: 12px">短信验证码</div>
+              <input
+                v-model="smsCode"
+                class="input"
+                placeholder="6 位数字验证码"
+                maxlength="8"
+                :disabled="smsBusy || !smsDeviceId"
+                @keyup.enter="submitSms"
+              />
+              <div class="add-pane-desc" style="margin-top: 10px">
+                验证码登录使用官方短信通道（不改绑、不代收）；同一手机号可反复登录添加多个会话。<br />
+                发送验证码后若 60 秒未收到，请确认手机号后重发。
+              </div>
+              <div v-if="smsMsg" class="add-msg" :class="{ err: smsErr }">{{ smsMsg }}</div>
             </div>
 
             <!-- 从本机软件导入：读本机已登录客户端的凭据，零请求入池 -->
@@ -1636,7 +2023,7 @@ onUnmounted(() => {
                   </el-tooltip>
                 </div>
                 <div v-if="!scanRows.length" class="scan-empty">
-                  未在本机发现可导入的登录态 —— 请先在本机登录对应客户端，或改用「{{ NO_OAUTH_CHANNELS.includes(activeChannel) ? "粘贴 JSON" : "OAuth 登录" }}」
+                  未在本机发现可导入的登录态 —— 请先在本机登录对应客户端，或改用「{{ SMS_ONLY_CHANNELS.includes(activeChannel) ? "手机验证码" : NO_OAUTH_CHANNELS.includes(activeChannel) ? "粘贴 JSON" : "OAuth 登录" }}」
                 </div>
               </div>
               <div v-if="scanMsg" class="add-msg" :class="{ err: scanErr }">{{ scanMsg }}</div>
@@ -1690,8 +2077,9 @@ onUnmounted(() => {
               <template v-if="addMethod === 'oauth' && oauthWaiting">
                 <i class="ph ph-circle-notch"></i>{{ addChannel === "raccoon" ? "已弹出应用内授权窗，完成后会自动入池（不经过本机小浣熊客户端）" : "已在浏览器打开登录页，完成后会自动入池" }}
               </template>
-              <template v-else-if="addMethod === 'local'">导入后仍可刷新余额、切到 IDE 或停用</template>
-              <template v-else>入池后可在下方列表里刷新余额、切到 IDE 或停用</template>
+              <template v-else-if="addMethod === 'sms'">验证通过后自动入池，余额与签到随后自动刷新</template>
+              <template v-else-if="addMethod === 'local'">导入后仍可刷新余额、切换本机登录或停用</template>
+              <template v-else>入池后可在下方列表里刷新余额、切换本机登录或停用</template>
             </span>
             <button class="btn" @click="closeAdd()">{{ addMethod === "oauth" && oauthWaiting ? "取消登录" : "取消" }}</button>
 
@@ -1701,6 +2089,12 @@ onUnmounted(() => {
               :disabled="oauthWaiting"
               @click="beginOauth"
             >{{ oauthWaiting ? "等待授权…" : "打开登录页" }}</button>
+            <button
+              v-else-if="addMethod === 'sms'"
+              class="btn btn-cta"
+              :disabled="smsBusy || !smsDeviceId || !smsCode.trim()"
+              @click="submitSms"
+            >{{ smsBusy ? "登录中…" : "验证并加入号池" }}</button>
             <button
               v-else-if="addMethod === 'file'"
               class="btn btn-cta"
@@ -1723,16 +2117,32 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 移出确认 -->
+      <!-- 删除确认 -->
       <div v-if="delOpen" class="p-mask" @click.self="delOpen = false">
         <div class="p-dlg glass">
-          <div class="p-title">移出号池</div>
+          <div class="p-title">删除账号</div>
           <div class="set-desc">
-            确定把「{{ delRow?.name }}」移出号池？本地加密保管的凭据会一并删除，该账号不再参与调度。
+            确定把「{{ delRow?.name }}」从号池删除？本地加密保管的凭据会一并删除，该账号不再参与调度。
           </div>
           <div class="p-actions">
             <button class="btn" @click="delOpen = false">取消</button>
-            <button class="btn btn-primary danger-solid" @click="doDelete">移出</button>
+            <button class="btn btn-primary danger-solid" @click="doDelete">删除</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 批量删除确认（号池列表多选后出现） -->
+      <div v-if="batchDelOpen" class="p-mask" @click.self="batchDelOpen = false">
+        <div class="p-dlg glass">
+          <div class="p-title">批量删除账号</div>
+          <div class="set-desc">
+            确定把选中的 {{ selectedCount }} 个账号从号池删除？本地加密保管的凭据会一并删除，这些账号不再参与调度（删除会经 WebDAV 同步传播到其他设备）。
+          </div>
+          <div class="p-actions">
+            <button class="btn" @click="batchDelOpen = false">取消</button>
+            <button class="btn btn-primary danger-solid" :disabled="batchDelBusy" @click="doBatchDelete">
+              {{ batchDelBusy ? "删除中…" : "删除" }}
+            </button>
           </div>
         </div>
       </div>
@@ -1880,6 +2290,49 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- 调度策略小弹窗：策略 / 成本档两个下拉收进弹窗（工具栏只留入口按钮），改动即时生效（后端返回 ok 后 refresh） -->
+      <div v-if="strategyOpen" class="p-mask" @click.self="strategyOpen = false">
+        <div class="p-dlg glass strategy-dlg">
+          <div class="p-title checkin-head">
+            <i class="ph ph-sliders-horizontal"></i>
+            调度策略
+            <span class="add-chip">{{ shownStrategyChannel?.display || strategyChannel }}</span>
+          </div>
+          <div class="set-desc">
+            新请求按「渠道账号调度策略」挑选号池账号；成本档位在配置里全局开启「免费 / 低成本优先」排序时才参与排序（配置 → 反代网关）。
+          </div>
+          <div class="auto-rows">
+            <div class="auto-row">
+              <span class="auto-label">渠道账号调度策略</span>
+              <el-select
+                class="f-el-select strategy-select"
+                popper-class="glass-popper"
+                :model-value="shownStrategyChannel?.poolStrategy"
+                style="width: 140px"
+                @update:model-value="(v: string) => shownStrategyChannel && setStrategy(shownStrategyChannel, v as ProxyPoolStrategy)"
+              >
+                <el-option v-for="s in STRATEGIES" :key="s.value" :value="s.value" :label="s.label" />
+              </el-select>
+            </div>
+            <div class="auto-row">
+              <span class="auto-label">成本档位</span>
+              <el-select
+                class="f-el-select strategy-select"
+                popper-class="glass-popper"
+                :model-value="shownStrategyChannel?.costTier || 'normal'"
+                style="width: 140px"
+                @update:model-value="(v: string) => shownStrategyChannel && setCostTier(shownStrategyChannel, v as ProxyCostTier)"
+              >
+                <el-option v-for="t in COST_TIERS" :key="t.value" :value="t.value" :label="t.label" />
+              </el-select>
+            </div>
+          </div>
+          <div class="p-actions">
+            <button class="btn btn-primary" @click="strategyOpen = false">完成</button>
+          </div>
+        </div>
+      </div>
+
       <!-- 自动签到设置（按渠道）：每天几点自动执行 + 抖动分钟；保存即生效（后端 60s tick 热读配置） -->
       <div v-if="autoDlg" class="p-mask" @click.self="autoDlg = null">
         <div class="p-dlg glass auto-dlg">
@@ -1968,6 +2421,26 @@ onUnmounted(() => {
           <div class="p-actions">
             <button class="btn" @click="uidRow = null">关闭</button>
             <button class="btn btn-primary" :disabled="!uidRow.uid" @click="copyUid">{{ uidCopied ? "已复制" : "复制 UID" }}</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 备注弹窗：一个输入框，保存落 meta.note（清空即清除），随 WebDAV 同步 -->
+      <div v-if="noteOpen" class="p-mask" @click.self="noteOpen = false">
+        <div class="p-dlg glass note-dlg">
+          <div class="p-title">账号备注</div>
+          <div class="set-desc">{{ noteRow?.name }}（{{ noteRow ? channelName(noteRow.channel) : "" }}）</div>
+          <input
+            v-model="noteText"
+            class="input note-input"
+            placeholder="输入备注（留空保存即清除）"
+            maxlength="200"
+            @keydown.enter="saveNote"
+            @keydown.esc="noteOpen = false"
+          />
+          <div class="p-actions">
+            <button class="btn" @click="noteOpen = false">取消</button>
+            <button class="btn btn-primary" :disabled="noteBusy" @click="saveNote">{{ noteBusy ? "保存中…" : "保存" }}</button>
           </div>
         </div>
       </div>
@@ -2252,9 +2725,8 @@ onUnmounted(() => {
   padding: 0 12px;
   font-size: 12px;
 }
+/* 调度策略下拉（在「调度策略」小弹窗内，宽度由模板内联给定） */
 .strategy-select {
-  width: 108px;
-  margin-right: 8px;
   vertical-align: middle;
   height: 34px;
   font-size: 11px;
@@ -2785,6 +3257,10 @@ onUnmounted(() => {
 .auto-dlg {
   width: 440px;
 }
+/* 调度策略小弹窗：两行 label + 下拉，版式复用 auto-rows */
+.strategy-dlg {
+  width: 440px;
+}
 .auto-rows {
   margin-top: 10px;
   display: flex;
@@ -2825,6 +3301,14 @@ onUnmounted(() => {
 .uid-dlg {
   width: 400px;
 }
+/* ===== 备注弹窗 ===== */
+.note-dlg {
+  width: 420px;
+}
+.note-input {
+  margin-top: 10px;
+  width: 100%;
+}
 .uid-text {
   margin-top: 10px;
   padding: 11px 12px;
@@ -2839,6 +3323,67 @@ onUnmounted(() => {
 /* ===== 列表布局：账号两行式 + 数字列右对齐 ===== */
 .pool-tbl td.num {
   text-align: right;
+}
+/* 积分包展开：账号行下的只读明细表（数据来自 poolView 附的 packages） */
+.pkg-caret {
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-3);
+  padding: 0 4px 0 0;
+  font-size: 12px;
+  transition: transform 0.15s;
+  display: inline-block;
+}
+.pkg-caret.open {
+  transform: rotate(90deg);
+  color: var(--text-1);
+}
+.pkg-row > .pkg-cell {
+  padding: 0 0 8px 26px;
+  background: var(--bg-2, rgba(127, 127, 127, 0.05));
+}
+.pkg-tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.pkg-tbl th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-3);
+  padding: 4px 8px;
+}
+.pkg-tbl td {
+  padding: 4px 8px;
+  border-top: 1px solid var(--border, rgba(127, 127, 127, 0.15));
+}
+.pkg-name {
+  min-width: 140px;
+  max-width: 240px;
+}
+.pkg-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border, rgba(127, 127, 127, 0.25));
+  margin-top: 3px;
+  overflow: hidden;
+}
+.pkg-bar-used {
+  display: block;
+  height: 100%;
+  background: var(--accent, #4c8bf5);
+  border-radius: 2px;
+}
+/* 选择列：全选与行选 checkbox 居中 */
+.sel-col {
+  width: 34px;
+  text-align: center;
+}
+.sel-col input[type="checkbox"] {
+  vertical-align: middle;
+  cursor: pointer;
+  accent-color: var(--accent);
 }
 .acc-cell {
   line-height: 1.3;
@@ -2862,12 +3407,20 @@ onUnmounted(() => {
   align-items: center;
   gap: 5px;
   margin-top: 2px;
+  /* 副行限宽锚定 .acc-name 的 220px：账号列宽度由名称行决定，备注再长也不撑列 */
+  max-width: 220px;
+  min-width: 0;
   font-size: 10.5px;
   color: var(--text-3);
 }
 .acc-sub i {
   font-style: normal;
   opacity: 0.6;
+  flex-shrink: 0;
+}
+.acc-src {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 /* 「本机登录」徽标：本机 agent 客户端当前登录的就是这个账号（与全局 tag 同构，自带小图标） */
 .acc-live {
@@ -2875,24 +3428,42 @@ onUnmounted(() => {
   align-items: center;
   gap: 3px;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 .acc-live .ph {
   font-size: 11px;
 }
+/* UID 小按钮：只显示「UID」二字，全文点击弹窗看 */
 .acc-uid {
-  border: none;
+  flex-shrink: 0;
+  border: 1px solid var(--line-strong);
   background: none;
-  padding: 0;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
   color: var(--text-3);
-  font-size: 10.5px;
+  font-size: 10px;
+  line-height: 16px;
   cursor: pointer;
-  max-width: 130px;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+}
+.acc-uid:hover:not(:disabled) {
+  color: var(--accent-strong);
+  border-color: var(--accent-line);
+}
+/* 备注缩略（有则显示）：副行剩余空间内收缩出省略号，全文由 tooltip 与备注弹窗展示 */
+.acc-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+  color: var(--text-2);
   transition: color 0.15s;
 }
-.acc-uid:hover:not(:disabled) {
+.acc-note:hover {
   color: var(--accent-strong);
 }
 /* ===== 状态列：冷却剩余 + 点击弹最近错误小窗 ===== */

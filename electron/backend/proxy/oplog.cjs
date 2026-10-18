@@ -8,7 +8,7 @@ const store = require("./store.cjs");
 const { redact } = require("./redact.cjs");
 
 /** 记一条操作日志。extra: { channel, target, detail }（可省）。
- *  message/detail 落库前过脱敏（上游报错常回显 Bearer/JWT，原样落库等于凭据进磁盘与导出 Excel） */
+ *  message/detail/target 落库前过脱敏（上游报错常回显 Bearer/JWT，原样落库等于凭据进磁盘与导出 Excel） */
 function log(level, op, message, extra) {
   try {
     store.insertOpLog({
@@ -16,7 +16,7 @@ function log(level, op, message, extra) {
       op,
       message: redact(message),
       channel: (extra && extra.channel) || "",
-      target: (extra && extra.target) || "",
+      target: redact((extra && extra.target) || ""),
       detail: redact((extra && extra.detail) || ""),
     });
   } catch { /* 日志失败不影响业务 */ }

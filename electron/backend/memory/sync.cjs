@@ -70,6 +70,9 @@ function tryMergeDailyFiles(localPath, remotePath) {
 }
 
 const PACK_NAME = "memory-latest.tar.gz";
+// 同步包绝对体积兜底（MB）：sync.packSizeLimitMB 未配置时生效。上传整包 readFileSync +
+// 下载 webdav.get 都是整体入内存，无上限的大包会把主进程 OOM（远端侧同样无大小回调）
+const HARD_LIMIT_MB = 512;
 const STAGE_LABEL = {
   idle: "空闲",
   connect: "连接服务器",
@@ -386,6 +389,8 @@ class MemorySync {
     if (!c || !c.endpoint) return { ok: false, message: "未配置统一 WebDAV 服务器（设置 · 数据存储）" };
     const cfg = this.getConfig();
     if (cfg["sync.enabled"] === false) return { ok: false, message: "记忆中枢同步已关闭" };
+    // 远端同步跨模块互斥（issue #92）：技能/用量/号池同步进行中时跳过本轮（自动同步下轮补跑）
+    if (!webdav.tryBeginSync("memory")) return { ok: false, message: "其他模块的远端同步正在进行，本轮已跳过" };
 
     this.running = true;
     this.cancelFlag = false;
@@ -472,10 +477,13 @@ class MemorySync {
       await packMemoryTree(this.rootDir, packFile, { includeIndex: cfg["sync.excludeIndex"] === false, localOnly });
       const localManifest = await buildManifest(this.rootDir, { localOnly });
       const packBytes = fs.statSync(packFile).size;
-      // sync.packSizeLimitMB：schema 里挂了很久的"假旋钮"，这里真正落地
-      const limitMB = Number(cfg["sync.packSizeLimitMB"] || 0);
-      if (limitMB > 0 && packBytes > limitMB * 1048576) {
-        throw new Error(`同步包 ${(packBytes / 1048576).toFixed(1)}MB 超过上限 ${limitMB}MB：请清理仓库或调大「单包体积上限」`);
+      // sync.packSizeLimitMB：schema 里挂了很久的"假旋钮"，这里真正落地。
+      // 0/未配 = 用绝对兜底上限（HARD_LIMIT_MB）：无限制的大包会让 fs.readFileSync 整体
+      // 入内存 + arrayBuffer 上传把主进程 OOM（远端 get 同理无大小回调，这是两端共同底线）
+      const limitMB = Number(cfg["sync.packSizeLimitMB"] || 0) || HARD_LIMIT_MB;
+      if (packBytes > limitMB * 1048576) {
+        const isHard = !Number(cfg["sync.packSizeLimitMB"] || 0);
+        throw new Error(`同步包 ${(packBytes / 1048576).toFixed(1)}MB 超过${isHard ? "绝对上限" : "上限"} ${limitMB}MB${isHard ? "（可在设置调大「单包体积上限」）" : "：请清理仓库或调大「单包体积上限」"}`);
       }
 
       this._log("push", `上传 ${PACK_NAME}（${(packBytes / 1048576).toFixed(1)}MB）`);
@@ -518,6 +526,7 @@ class MemorySync {
       this._log("error", String(e.message || e));
       return { ok: false, message: String(e.message || e), ...result };
     } finally {
+      webdav.endSync();
       this.running = false;
       webdav.setActiveSignal(null);
       this._abort = null;
@@ -748,7 +757,18 @@ class MemorySync {
       try { await flushApply(); } catch { /* 收尾失败不掩盖原始异常 */ }
       if (applySession) { try { applySession.close(); } catch { /* 已退出 */ } applySession = null; }
     }
-    this.state.conflicts = conflictList.slice(-200);
+    // 冲突队列上限 200：超出部分不能静默丢弃（第 201+ 条会永久消失、用户永远看不到），
+    // 保留最近 200 条 + 溢出计数，前端展示「另有 N 条未显示」
+    const MAX_CONFLICTS = 200;
+    if (conflictList.length > MAX_CONFLICTS) {
+      const overflow = conflictList.length - MAX_CONFLICTS;
+      this._log("merge", `冲突达 ${conflictList.length} 条，仅保留最近 ${MAX_CONFLICTS} 条（另有 ${overflow} 条未入队）`);
+      this.state.conflicts = conflictList.slice(-MAX_CONFLICTS);
+      this.state.conflictOverflow = overflow;
+    } else {
+      this.state.conflicts = conflictList;
+      this.state.conflictOverflow = 0;
+    }
     this._saveConflicts();
     if (conflicts) this.emit({ type: "conflict", count: conflicts });
     if (failedDetail.length) this.emit({ type: "sync", stage: this.state.stage || "merge", detail: `本轮有 ${failedDetail.length} 个文件落地/索引更新失败（${failedDetail.slice(0, 3).map((f) => f.rel).join("、")}${failedDetail.length > 3 ? " 等" : ""}），将随下次同步重试`, running: false, percent: this.state.percent });
@@ -828,7 +848,11 @@ class MemorySync {
         }
       } else if (decision === "keepBoth") {
         if (c.remote) {
-          const alt = c.path.replace(/\.md$/, `.remote-${Date.now()}.md`);
+          // 非 .md 路径 replace(/\.md$/) 不匹配 → alt 等于原路径 → 覆盖本地原文件。
+          // 导入的 .jsonl/.txt 等冲突文件同样要保留远端版本，统一追加后缀
+          const alt = c.path.endsWith(".md")
+            ? c.path.replace(/\.md$/, `.remote-${Date.now()}.md`)
+            : `${c.path}.remote-${Date.now()}`;
           const remoteText = typeof c.remoteText === "string" ? c.remoteText : "";
           if (!remoteText && c.remote && Number(c.remote.size) > 0) {
             return { ok: false, message: "远端内容缺失，无法保留远端版本；请重新同步后再裁决" };
@@ -849,17 +873,22 @@ class MemorySync {
     } catch (e) {
       return { ok: false, message: String(e.message || e) };
     }
-    this.state.conflicts = list.filter((_, i) => i !== index);
-    this._saveConflicts();
-    // 裁决后基线记「远端当前版本」，而不是「本地当前版本」。
-    // 裁决表达的是本地意图，此刻远端还没收到；把基线推成本地版本会让下次 merge 得到
-    // localChanged=false + remoteChanged=true（远端仍是旧版）→ 走「仅远端改」把本地覆盖回旧版，
-    // 裁决被静默撤销（实测：keepLocal 后再次同步本地改动丢失；merge / keepBoth 的结果同理被覆盖）。
-    // 记远端版本则本地改动读作「仅本地改」→ 保留本地，并在随后的 push 上传，语义正确。
-    // 例外：keepRemote 已把本地写成远端内容，基线保持「本地当前版本」即可（两者内容一致）；
-    // 若远端文本因超限被截断，旧口径还能让下次 merge 用远端完整版自愈。
-    this.state.baseline[c.path] = decision === "keepRemote" ? statEntry(localFile) : pickEntry(c.remote);
-    this._saveState();
+    // 状态写回过写锁：resolve（IPC 手动）与 _mergeRemote（同步进行中）若并发，
+    // 双方各自基于快照改写 conflicts/baseline，后写的覆盖前写的 = 丢更新
+    // （merge 的 flushApply 同样过 withWrite，天然串行）
+    await this.service.withWrite(() => {
+      this.state.conflicts = list.filter((_, i) => i !== index);
+      this._saveConflicts();
+      // 裁决后基线记「远端当前版本」，而不是「本地当前版本」。
+      // 裁决表达的是本地意图，此刻远端还没收到；把基线推成本地版本会让下次 merge 得到
+      // localChanged=false + remoteChanged=true（远端仍是旧版）→ 走「仅远端改」把本地覆盖回旧版，
+      // 裁决被静默撤销（实测：keepLocal 后再次同步本地改动丢失；merge / keepBoth 的结果同理被覆盖）。
+      // 记远端版本则本地改动读作「仅本地改」→ 保留本地，并在随后的 push 上传，语义正确。
+      // 例外：keepRemote 已把本地写成远端内容，基线保持「本地当前版本」即可（两者内容一致）；
+      // 若远端文本因超限被截断，旧口径还能让下次 merge 用远端完整版自愈。
+      this.state.baseline[c.path] = decision === "keepRemote" ? statEntry(localFile) : pickEntry(c.remote);
+      this._saveState();
+    });
     this.emit({ type: "sync", stage: this.state.stage || "idle", detail: `冲突已裁决：${c.path}`, running: false, percent: this.state.percent });
     return { ok: true };
   }
