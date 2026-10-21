@@ -1,4 +1,4 @@
-<!-- 反代网关 · 总览：服务开关 / 地址 / 今日核心指标 / 渠道一览 / 实时请求流（方案 §7 index.html） -->
+<!-- 反代网关 · 总览：服务开关 / 地址 / 今日核心指标 / 渠道一览 / 实时请求流（index.html） -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import * as api from "../../api/ipc";

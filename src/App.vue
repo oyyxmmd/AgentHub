@@ -41,6 +41,7 @@ import ProxyStatsView from "./views/proxy/ProxyStatsView.vue";
 import ProxyPoolSyncView from "./views/proxy/ProxyPoolSyncView.vue";
 import ProxyCcSwitchView from "./views/proxy/ProxyCcSwitchView.vue";
 import ProxyLogView from "./views/proxy/ProxyLogView.vue";
+import ProxyNetworkView from "./views/proxy/ProxyNetworkView.vue";
 // 记忆中枢模块：9 个页面 + 隐藏配置页（模块级 .memory-scope 样式作用域，可整体剥离）
 // 「待确认」收件箱不再是独立页签，已并入记忆浏览的第三个视图（components/memory/MemReviewPanel）
 import MemoryDashboardView from "./views/memory/DashboardView.vue";
@@ -681,6 +682,7 @@ const seen = (mod: string, page: string) => !!visited.value[`${mod}/${page}`];
         <ProxyPoolSyncView v-if="seen('proxy', 'poolsync')" v-show="on('proxy', 'poolsync')" :class="{ 'page-anim': on('proxy', 'poolsync') }" />
         <ProxyCcSwitchView v-if="seen('proxy', 'ccswitch')" v-show="on('proxy', 'ccswitch')" :class="{ 'page-anim': on('proxy', 'ccswitch') }" />
         <ProxyLogView v-if="seen('proxy', 'proxylog')" v-show="on('proxy', 'proxylog')" :class="{ 'page-anim': on('proxy', 'proxylog') }" />
+        <ProxyNetworkView v-if="seen('proxy', 'netproxy')" v-show="on('proxy', 'netproxy')" :class="{ 'page-anim': on('proxy', 'netproxy') }" />
         <!-- 记忆中枢九页：各页自带 .memory-scope 容器（样式作用域见 styles/memory.css）；
              模型与网关已并入配置页子板块，调用统计并入仪表盘；待确认并入记忆浏览 -->
         <MemoryDashboardView v-if="seen('memory', 'dashboard')" v-show="on('memory', 'dashboard')" class="page" :class="{ 'page-anim': on('memory', 'dashboard') }" />

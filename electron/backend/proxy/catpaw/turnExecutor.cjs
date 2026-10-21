@@ -1,4 +1,4 @@
-// CatPaw 轮次执行层：SSE 消费到底 + 轮次收尾与注册表写回（移植来源：参照实现 catpaw/turn_executor.rs）。
+// CatPaw 轮次执行层：SSE 消费到底 + 轮次收尾与注册表写回（协议依据：官方客户端实测）。
 //
 // 与 conversation.js 的分工：那边管决策与请求体，本文件管执行与收尾。
 //
@@ -169,7 +169,7 @@ async function finishStream(ctx, guard, history, outcome, emit) {
     const result = outcome.result;
     writeBack(ctx, guard, history, result);
     // 先把本轮的 tail 帧交给上层（emit 即写客户端）：终态上报是**网络请求**（最长 30s 超时），
-    // 排在它后面会让客户端迟迟拿不到 finish_reason / usage——参照实现同样是「先 flush 帧再收尾」。
+    // 排在它后面会让客户端迟迟拿不到 finish_reason / usage——上游同样是「先 flush 帧再收尾」。
     // 服务端据此立刻记住 finishReason/lastUsage，[DONE] 与末 chunk 仍按原时序下发
     if (result.usage) emit({ type: "usage", usage: result.usage });
     emit({ type: "finish", reason: result.finishReason });

@@ -1,7 +1,7 @@
-// CatPaw 凭证来源（移植来源：参照实现 catpaw/credentials.rs，其上游是 catpaw-local-auth.mjs
-// 与 account-store.mjs）。
+// CatPaw 凭证来源（协议依据：官方客户端登录态读取逻辑，
+// 与账号存储模块）。
 //
-// 三处来源（优先级照抄参照实现 resolveCredentials）：
+// 三处来源（优先级对齐 resolveCredentials）：
 //   1. 账号记录（手动粘贴 / 本机导入）→ record.token + record.uid|loginName；
 //   2. 桌面端实时登录态：~/.meituan-catpaw/auth.json → auth.accessToken + account.uid|loginName；
 //   3. 环境变量旁路：CATPAW_COOKIE（+ CATPAW_USER_UID）。
@@ -12,7 +12,7 @@
 // 没有刷新机制：没有 refreshToken 概念，token 过期只能在桌面端重新登录
 // （桌面端账号的凭证每次实时读 auth.json，所以「重新登录」立即恢复）。
 //
-// 与参照实现的一处差异：本机导入的账号**同时把 token 落库**（而非只读 auth.json）。
+// 与上游的一处差异：本机导入的账号**同时把 token 落库**（而非只读 auth.json）。
 // 原因在 AgentHub 的号池模型：号池按 hasToken 判定账号可用性，只记「读文件」的账号会被判不可用、
 // 永远选不中。落库后：桌面端文件读得到就用实时值（客户端换号/续期自动跟着走），
 // 读不到就回落库里那份（客户端未安装 / 文件临时不可读时仍可用）。
@@ -23,9 +23,9 @@ const path = require("node:path");
 const CatPawError = require("./errors.cjs");
 const log = require("./log.cjs");
 
-/** 桌面端登录态文件大小上限（参照实现 MAX_AUTH_FILE_SIZE） */
+/** 桌面端登录态文件大小上限（MAX_AUTH_FILE_SIZE） */
 const MAX_AUTH_FILE_SIZE = 64 * 1024;
-/** 凭证字段长度上限（参照实现 MAX_TOKEN_LENGTH / MAX_USER_UID_LENGTH） */
+/** 凭证字段长度上限（MAX_TOKEN_LENGTH / MAX_USER_UID_LENGTH） */
 const MAX_TOKEN_LENGTH = 8192;
 const MAX_USER_UID_LENGTH = 256;
 
@@ -64,7 +64,7 @@ function safeField(value, field, maxLength) {
   return trimmed;
 }
 
-/** 读一个「CatPaw 登录态」文件。防御项照抄原实现 readAuthJson：
+/** 读一个「CatPaw 登录态」文件。防御项对齐 readAuthJson：
  *  普通文件（符号链接拒绝）、大小在 (0, 64KB]、可解析且根是 JSON 对象 */
 function readDesktopLogin() {
   const file = desktopAuthFile();

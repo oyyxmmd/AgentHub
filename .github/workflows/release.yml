@@ -1,3 +1,4 @@
+# 发布流水线：推送 v* tag 或手动触发。桌面端同时构建 macOS arm64 与 Windows x64。
 name: Release
 
 on:
@@ -10,7 +11,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14 # Apple Silicon (arm64)
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 

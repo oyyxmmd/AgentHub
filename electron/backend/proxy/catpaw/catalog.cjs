@@ -1,5 +1,5 @@
 // CatPaw 模型目录：静态表 + 远程目录（POST /api/agent/maas/model-types）的合成视图
-// （移植来源：参照实现 catpaw/catalog.rs）。
+// （协议依据：官方客户端实测）。
 //
 // 为什么远程目录接口一度被认为不存在：桌面端 `modelTypesService` 里那句
 // `('/api/agent/maas/model-types', {tenant, scene, env})` 看着像 GET 的 query 参数，
@@ -16,7 +16,7 @@
 const rules = require("../rules.cjs");
 const { MODELS, normalizeModelName } = require("./models.cjs");
 
-/** 目录路径（桌面端路径常量，逐字照搬） */
+/** 目录路径（桌面端路径常量，逐字对齐） */
 const MODEL_TYPES_PATH = "/api/agent/maas/model-types";
 /** 请求体：tenant/scene/env 是**客户端身份**的一部分（客户端发错拿不到目录，单独改一个也没有语义） */
 const MODEL_TYPES_BODY = { tenant: "CatDesk", scene: "CATX_APP", env: "EXTERNAL" };

@@ -309,7 +309,7 @@ function buildEntry(appType, { base, apiKey, model }, tiers) {
       config: toml,
       // 模型目录：CC Switch 接管后会投影成 ~/.codex/cc-switch-model-catalog.json，
       // Codex 的 /model 才能列出网关模型；缺这项时只能用内置模型名。
-      // 字段形态对照本机已跑通的 Buddy 条目（codex_config.rs 的 codex_catalog_model_specs）：
+      // 字段形态对照本机已跑通的 Buddy 条目（官方 Codex 配置结构 codex_catalog_model_specs）：
       // reasoningLevels 决定可选档位，defaultReasoningLevel 只在同时给了 reasoningLevels 时生效，
       // 否则回落「模板默认档仍在列表里则用模板默认，否则取最高档」。
       modelCatalog: {
@@ -329,7 +329,7 @@ function buildEntry(appType, { base, apiKey, model }, tiers) {
       commonConfigEnabled: true,
       // 思考能力：Codex 客户端经 CC Switch 转 Chat 时，声明上游网关支持思考模式与思考深度档位。
       // supportsThinking / supportsEffort 即 CC Switch「支持思考模式 / 支持思考等级」开关
-      // （effort 开启会自动带起 thinking，见 transform_codex_chat.rs 的 supports_thinking 推断）；
+      // （effort 开启会自动带起 thinking，见官方 Codex 的 supports_thinking 推断）；
       // 网关为通用 Chat 层，effort 档位按 passthrough 原样透传（modelCatalog.reasoningLevels 已背书 low/high/max），
       // thinking/effort 参数名取上游默认值（thinking / reasoning_effort，顶层 OpenAI 风格字段，
       // 与本机跑通的「赔钱国模」等 Chat 上游条目一致）。

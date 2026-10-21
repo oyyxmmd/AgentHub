@@ -1,6 +1,6 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
@@ -98,7 +98,7 @@ async function setUiTabs(page, sleep, wanted) {
 }
 
 const ALL_TAB_NAMES = ["仪表盘", "记忆浏览", "项目归档", "深层画像", "Agent 接入", "检索与索引", "自动化", "导入与去重", "WebDAV同步"];
-const DEFAULT_TAB_NAMES = ["仪表盘", "记忆浏览", "项目归档", "自动化", "WebDAV同步"];
+const DEFAULT_TAB_NAMES = ["仪表盘", "记忆浏览", "项目归档", "深层画像", "Agent 接入", "自动化", "导入与去重", "WebDAV同步"];
 
 function check(name, cond, extra) {
   if (cond) { pass++; console.log(`  ✓ ${name}`); return true; }
@@ -111,8 +111,8 @@ function check(name, cond, extra) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 记忆中枢默认页签（PageTabs 的按钮不挂 data-page，按文字前缀定位）。
-// v1.26.0 起页签显隐（ui.tabs 白名单）回归：默认只开 5 个核心页（仪表盘/记忆浏览/项目归档/自动化/WebDAV同步），
-// 深层画像 / Agent 接入 / 检索与索引 / 导入与去重属「装一次 / 排障才来」，在配置页「界面 · 显示的页签」勾回；
+// 2026-10-20 起页签默认开 8 个核心页（仪表盘/记忆浏览/项目归档/深层画像/Agent 接入/自动化/导入与去重/WebDAV同步），
+// 仅「检索与索引」属「排障才来」，在配置页「界面 · 显示的页签」勾回；
 // 被隐藏的页不做 tab，但深链（KPI 跳转 / goto）仍可到达。
 // 「待确认」收件箱自 v1.25.0 起并入「记忆浏览」的第三个视图，不再是独立页签 —— 见 BROWSE_VIEWS。
 const PAGES = [
@@ -168,15 +168,17 @@ async function main() {
   const pageTabs = await page(() => [...document.querySelectorAll(".tabs button.tab")].map((b) => b.textContent.trim()).filter((t) => t && t !== "配置"));
   check("页签条不再含「模型与网关」", Array.isArray(pageTabs) && !pageTabs.some((t) => t.includes("模型与网关")), JSON.stringify(pageTabs));
   check(
-    "页签条默认含五个核心页（低频四页收进配置·界面，可勾选找回）",
-    Array.isArray(pageTabs) && pageTabs.length === 5
+    "页签条默认含八个核心页（仅检索与索引收进配置·界面，可勾选找回）",
+    Array.isArray(pageTabs) && pageTabs.length === 8
       && pageTabs.some((t) => t.includes("仪表盘"))
       && pageTabs.some((t) => t.includes("记忆浏览"))
       && pageTabs.some((t) => t.includes("项目归档"))
+      && pageTabs.some((t) => t.includes("深层画像"))
+      && pageTabs.some((t) => t.includes("Agent 接入"))
       && pageTabs.some((t) => t.includes("自动化"))
+      && pageTabs.some((t) => t.includes("导入与去重"))
       && pageTabs.some((t) => t.includes("WebDAV同步"))
       && !pageTabs.some((t) => t.trim().startsWith("待确认"))
-      && !pageTabs.some((t) => t.includes("深层画像"))
       && !pageTabs.some((t) => t.includes("检索与索引")),
     JSON.stringify(pageTabs),
   );
@@ -250,7 +252,7 @@ async function main() {
   check("Trae 卡片标明「加密会话库 + 自动解密」", /加密会话库/.test(importCards.trae || "") && /SQLCipher/.test(importCards.trae || ""), (importCards.trae || "").slice(0, 200));
   check("导入页渲染出 Antigravity 来源卡片（格式为会话日志）", /Antigravity 会话日志/.test(importCards.antigravity || ""), (importCards.antigravity || "").slice(0, 200));
 
-  // 逐页检查完毕，把页签显隐恢复成默认 5 个核心页（不污染探针环境以外的配置）
+  // 逐页检查完毕，把页签显隐恢复成默认 8 个核心页（不污染探针环境以外的配置）
   await setUiTabs(page, sleep, DEFAULT_TAB_NAMES);
   // 收件箱并入记忆浏览后的三分段控件，由 [5b] 那一节专门验（要先切到浏览页的待确认视图）
 

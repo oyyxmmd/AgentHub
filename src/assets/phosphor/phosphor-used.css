@@ -70,6 +70,9 @@
 .ph.ph-chart-bar:before {
   content: "\e150";
 }
+.ph.ph-chat-circle-dots:before {
+  content: "\e16c";
+}
 .ph.ph-chats:before {
   content: "\e17c";
 }

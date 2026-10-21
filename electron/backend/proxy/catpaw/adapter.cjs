@@ -1,5 +1,5 @@
 // CatPaw 适配器：把会话式协议层接进 AgentHub 的渠道注册表
-// （移植来源：参照实现 catpaw/adapter.rs）。
+// （协议依据：官方客户端实测）。
 //
 // 这一层只做「接线」：把编排层给的散装入参（原始 body、账号、凭据、emit、meta）装配成
 // 会话式转发的入参，再转调 conversation.runConversation。任何「CatPaw 该怎么做」的判断

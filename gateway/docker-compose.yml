@@ -20,6 +20,11 @@ services:
     build:
       context: ..
       dockerfile: gateway/Dockerfile
+      args:
+        # 国内直连官方源易超时：export NPM_REGISTRY=https://registry.npmmirror.com 后再 up --build
+        # 注意 deps 层的 gateway/package-lock.json resolved 已全指向 npmmirror，此参数只影响 root lock 里
+        # 仍直连官方源的 25 个包（vite 构建链）
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
     image: agenthub-gateway:local
     container_name: agenthub-gateway
     restart: unless-stopped

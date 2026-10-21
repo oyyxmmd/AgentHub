@@ -1,13 +1,13 @@
 // 反代网关 · Cline 模型目录（recommended-models 解析 + 按分组归池 + 友好名归一）
 //
-// 协议事实（2026-09 参考实现 agent2api 实测）：
+// 协议事实（2026-09 实测）：
 // ① GET {apiBase}/ai/cline/recommended-models 无需鉴权（实测无 Authorization 头也 200），
 //    一次返回四组：recommended（4 条，与两池有重叠）/ free（5 条）/ clinePass（14 条）/
 //    clineCloud（3 条，实测 403 未开通——广告一个必然 403 的模型只会让客户端选中后失败）。
 // ② **归池一律以响应里的分组为准，不按 id 前缀猜**：free 组里有 2 条是别家的裸 id
 //    （z-ai/glm-5.3-flash、poolside/laguna-s-2.1:free），它们同样是免费池成员
 //    （实测免费账号打返回 200）。按前缀猜会把它们错判进订阅池——订阅池没有账号时
-//    整家不广告，模型在界面上彻底消失（参考实现踩过的真实 bug）。
+//    整家不广告，模型在界面上彻底消失（上游踩过的真实 bug）。
 // ③ **前缀必须原样发给上游**：cline-free/ / cline-pass/ 是计费通道选择器，
 //    剥掉转发会被上游 404（实测 model not found）。对下游的友好名（剥前缀）由
 //    resolveBodyModel 的目录内匹配给出：客户端用短名请求、网关补上本池前缀再转发。

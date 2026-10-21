@@ -1,5 +1,5 @@
 // 反代网关 · 存储层：SQLite（WAL）+ DPAPI 加密凭据
-// 表结构对齐方案 §5.1：keys / agents / accounts / credits_history / usage_requests
+// 表结构：keys / agents / accounts / credits_history / usage_requests
 // 驱动优先 better-sqlite3（方案选型），ABI 不匹配等加载失败时回退 Node 22 内置 node:sqlite（接口对齐）
 // 凭据（token/refreshToken）不落明文：复用 config.cjs 的 safeStorage(DPAPI) enc:v1: 信封，等效方案 vault.bin
 "use strict";
@@ -162,7 +162,7 @@ const CHANNELS = [
   // 鉴权 Authorization: Bearer workos:<JWT>，无签名、无会话、无桌面端依赖——登录走 WorkOS
   // 设备授权（RFC 8628，四步：authorize/device → 浏览器确认 → authenticate 轮询 → /auth/register
   // 换 Cline 会话令牌）。两个独立 channel id 不做成「一家的一个选项」：界面混池、模型启停键冲突、
-  // 同名模型短名归属漂移都是混池建模的真实缺陷（参考实现 agent2api 同款拆分）。
+  // 同名模型短名归属漂移都是混池建模的真实缺陷（同款拆分）。
   // 池是身份不是账号属性，cline_free 标 costTier "free"（免费额度池，cost-first 路由正确优先），
   // cline_pass 不标（付费订阅，错标 free 会让 cost-first 烧钱）。
   { id: "cline_free", display: "Cline Free", domain: "api.cline.bot", costTier: "free" },
@@ -281,7 +281,7 @@ function open() {
     db.exec("ALTER TABLE agents ADD COLUMN cost_tier TEXT NOT NULL DEFAULT ''");
   } catch { /* 已存在 */ }
   // 在线迁移：keys.allowed_channels / keys.allowed_models（Key 级渠道/模型白名单，空 = 不限制）
-  // 参考 agent2api apiKeys 的 allowedProviders/allowedModels（R9，对齐 OmniProxy）：
+  // Key 级渠道/模型白名单（allowedProviders/allowedModels，对齐 R9）：
   // 存量行空串 = 不限制（升级绝不能让已有 Key 失效），JSON 数组形态存储
   try {
     db.exec("ALTER TABLE keys ADD COLUMN allowed_channels TEXT NOT NULL DEFAULT ''");
@@ -373,7 +373,7 @@ function routeOrderOk(order) {
   return order === "" || order === "score" || order === "cost-first";
 }
 
-/** Key 参数整单校验（参考 agent2api retry_api 语义：任一字段非法整体拒绝，不落半套配置）。
+/** Key 参数整单校验（retry_api 语义：任一字段非法整体拒绝，不落半套配置）。
  *  isPatch=true 时只校验出现的字段（updateKey 的部分更新）；返回非法原因（空串 = 通过） */
 function validateKeyParams(p, isPatch) {
   if (!isPatch || p.name != null) {
@@ -415,7 +415,7 @@ function createKey({ name, route, routeOrder, dailyQuota, rateLimit }) {
   return { id, secret };
 }
 
-/** Key 白名单字段解析：空串/非数组 → 不限制（与 agent2api 空数组 = 不限制等价）；脏数据容错剔除 */
+/** Key 白名单字段解析：空串/非数组 → 不限制（空数组 = 不限制等价）；脏数据容错剔除 */
 function parseKeyAllowList(raw) {
   if (!raw || typeof raw !== "string") return [];
   try {
@@ -556,8 +556,10 @@ function updateKey(id, patch) {
   if (patch.allowedModels != null && !Array.isArray(patch.allowedModels)) throw new Error("allowedModels 必须是字符串数组");
   const enabled = patch.enabled != null ? (patch.enabled ? 1 : 0) : cur.enabled;
   // updated_at 推进：号池同步按它做 LWW，把改名/改配额/启停传播到其他设备（issue #92）
+  // 同一毫秒内连续编辑也要严格推进，否则两端相同时刻会被误判为未变化而丢同步。
+  const nextUpdatedAt = Math.max(Date.now(), Number(cur.updated_at || 0) + 1);
   db.prepare("UPDATE keys SET name=?, route=?, route_order=?, daily_quota=?, rate_limit=?, allowed_channels=?, allowed_models=?, enabled=?, updated_at=? WHERE id=?")
-    .run(name, route, routeOrder, quota, rate, allowedChannels, allowedModels, enabled, Date.now(), cur.id);
+    .run(name, route, routeOrder, quota, rate, allowedChannels, allowedModels, enabled, nextUpdatedAt, cur.id);
   return true;
 }
 
@@ -1423,30 +1425,53 @@ function statsSeries(from, to, granularity) {
   return out;
 }
 
-const TOP_COLS = { channel: "channel", model: "model", key: "key_name", account: "account_name" };
+/** TOP 排行的分组列：channel / model 本身就是身份，按值分组；
+ *  key / account 的名字可改（改名前后的流水若按名分组会分裂成两行），按 id 分组、
+ *  名字透出时映射当前名（Key/账号已删则回退「最后一次请求时」的快照名——
+ *  裸列随唯一聚合 MAX(ts) 所在行取值，是 SQLite 的文档化行为） */
+const TOP_GROUP = {
+  channel: {col: "channel"},
+  model: {col: "model"},
+  key: {col: "key_id", nameCol: "key_name"},
+  account: {col: "account_id", nameCol: "account_name"},
+};
 
 /** TOP 排行（富字段）：按 dim 分组，请求数倒序取前 N（前端本地切排序口径再截前 10） */
 function statsTopRich(dim, from, to, limit) {
   open();
-  const col = TOP_COLS[dim] || "channel";
+  const g = TOP_GROUP[dim] || TOP_GROUP.channel;
   const n = Math.min(200, Math.max(1, Number(limit) || 50));
   const rows = db.prepare(
-    `SELECT ${col} AS name, ${AGG_COLS}
-     FROM usage_requests WHERE ts >= ? AND ts <= ? AND ${col} != ''
-     GROUP BY ${col} ORDER BY req DESC LIMIT ?`
+    `SELECT ${g.col} AS gid, MAX(ts) AS last_ts, ${g.nameCol || g.col} AS name, ${AGG_COLS}
+     FROM usage_requests
+     WHERE ts >= ?
+       AND ts <= ?
+       AND ${g.col} != ''
+     GROUP BY ${g.col}
+     ORDER BY req DESC LIMIT ?`
   ).all(from, to, n);
-  return rows.map((r) => ({ name: r.name, ...shapeAgg(r) }));
+  // 名字映射只在 key/account 维度需要（channel/model 的 name 即分组值本身）
+  const names = g.nameCol === "key_name" ? currentKeyNames()
+    : g.nameCol === "account_name" ? currentAccountNames() : null;
+  return rows.map((r) => ({id: r.gid, name: (names && names.get(r.gid)) || r.name || "", ...shapeAgg(r)}));
 }
 
-/** 各 Key 用量：按 key_id 分组（Key 名可改，id 才是身份），带最近使用时间 */
+/** 各 Key 用量：按 key_id 分组（Key 名可改，id 才是身份），带最近使用时间。
+ *  Key 名透出以当前名优先（Key 已删/未命名回退最后一次请求时的快照名） */
 function statsKeys(from, to) {
   open();
   const rows = db.prepare(
-    `SELECT key_id, MAX(key_name) AS name, MAX(ts) AS last_ts, ${AGG_COLS}
+    `SELECT key_id, MAX(ts) AS last_ts, key_name AS name, ${AGG_COLS}
      FROM usage_requests WHERE ts >= ? AND ts <= ? AND key_id != ''
      GROUP BY key_id ORDER BY req DESC LIMIT 100`
   ).all(from, to);
-  return rows.map((r) => ({ keyId: r.key_id, name: r.name || "", lastTs: Number(r.last_ts) || 0, ...shapeAgg(r) }));
+  const keyNames = currentKeyNames();
+  return rows.map((r) => ({
+    keyId: r.key_id,
+    id: r.key_id,
+    name: keyNames.get(r.key_id) || r.name || "",
+    lastTs: Number(r.last_ts) || 0, ...shapeAgg(r)
+  }));
 }
 
 /** 状态码分桶：2xx / 4xx / 5xx / 无响应（status=0 或 3xx 等归「无响应」桶） */
@@ -1544,13 +1569,15 @@ function statsDetail(opts) {
   const rows = db.prepare(
     `SELECT * FROM usage_requests ${w} ORDER BY ts DESC LIMIT ? OFFSET ?`
   ).all(...vals, size, (p - 1) * size);
+  const accNames = currentAccountNames();
+  const keyNames = currentKeyNames();
   return {
     total, page: p, pageSize: size,
     agg: {
       req: agg.req, promptTokens: agg.promptTokens, completionTokens: agg.completionTokens,
       cacheReadTokens: agg.cacheReadTokens, cacheCreationTokens: agg.cacheCreationTokens, tokens: agg.tokens,
     },
-    rows: rows.map(usageView),
+    rows: rows.map((r) => usageView(r, accNames, keyNames)),
   };
 }
 
@@ -1575,17 +1602,42 @@ function cleanupUsage(days, all) {
 function recentRequests(limit) {
   open();
   const rows = db.prepare("SELECT * FROM usage_requests ORDER BY ts DESC LIMIT ?").all(Math.min(50, limit || 10));
-  return rows.map(usageView);
+  const accNames = currentAccountNames();
+  const keyNames = currentKeyNames();
+  return rows.map((r) => usageView(r, accNames, keyNames));
 }
 
-function usageView(r) {
+function usageView(r, accNames, keyNames) {
   return {
-    id: r.id, ts: r.ts, reqId: r.req_id, keyId: r.key_id, keyName: r.key_name,
-    channel: r.channel, accountId: r.account_id, accountName: r.account_name, model: r.model,
+    id: r.id, ts: r.ts, reqId: r.req_id, keyId: r.key_id,
+    // key_name 同 account_name：流水快照，Key 重命名后旧流水仍是老名字，
+    // 透出时当前名优先（Key 已删/未命名回退快照）——与各 Key 用量表的展示口径一致
+    keyName: (keyNames && keyNames.get(r.key_id)) || r.key_name,
+    channel: r.channel, accountId: r.account_id,
+    // 流水里的 account_name 是落库快照：号池重命名后旧流水仍存着老名字。
+    // 透出时以当前账号名优先（账号已删/未命名则回退快照），明细与最近请求口径一致
+    accountName: (accNames && accNames.get(r.account_id)) || r.account_name,
+    model: r.model,
     promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens,
     cacheReadTokens: r.cache_read_tokens || 0, cacheCreationTokens: r.cache_creation_tokens || 0,
     ttftMs: r.ttft_ms, latencyMs: r.latency_ms, status: r.status, error: r.error,
   };
+}
+
+/** 账号 id → 当前名 的一次性映射（每页构建一次，账号量级几十，代价可忽略）。
+ *  刻意不回填流水表：历史流水保留「请求发生时」的原始记录。 */
+function currentAccountNames() {
+  const m = new Map();
+  for (const r of db.prepare("SELECT id, name FROM accounts").all()) m.set(r.id, r.name);
+  return m;
+}
+
+/** Key id → 当前名 的一次性映射：直接查 keys 表两列（不走 listKeys——那会做当日用量
+ *  聚合还解密 secret，建名字映射用不着）。与账号映射同一套「当前名优先、快照兜底」口径 */
+function currentKeyNames() {
+  const m = new Map();
+  for (const r of db.prepare("SELECT id, name FROM keys").all()) m.set(r.id, r.name);
+  return m;
 }
 
 /** 关闭数据库句柄（应用退出/热重启时调用；重复调用安全） */

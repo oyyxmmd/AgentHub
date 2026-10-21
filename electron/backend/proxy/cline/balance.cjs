@@ -1,6 +1,6 @@
 // 反代网关 · Cline 余额与订阅（credit 余额 + 当前套餐）
 //
-// 协议事实（2026-09 参考实现 agent2api 实测）：
+// 协议事实（2026-09 实测）：
 // ① GET {apiBase}/users/{userId}/balance → {"data":{"userId":"usr-...","balance":-17704},"success":true}
 //    **balance 是微 credit，要 ÷1e6**：实测 -17704 对应官方界面 -0.0177，官方前端格式化
 //    就是 format(e / 1e6)。负值表示已欠费，如实保留符号（换算不改变符号）。
@@ -31,7 +31,7 @@ async function resolveUserId(env, token) {
 
 function authHeaders(cfg, token) {
   // 伪装头走唯一实现（headers.json upstreamHeaders 覆盖层；空串=不发；协议必需头拒绝覆盖），
-  // 与对话/登录/续期同一口径——不再硬编码 x-client-type（方案 §3 单一来源契约）
+  // 与对话/登录/续期同一口径——不再硬编码 x-client-type（单一来源契约）
   return { ...headersMod.buildUpstreamHeaders(cfg, { accept: "application/json" }), authorization: `Bearer ${token}` };
 }
 
@@ -94,7 +94,7 @@ async function queryBalance(env) {
   const data = (balancePayload && balancePayload.data) || balancePayload || {};
   const rawBalance = Number(data.balance);
   // 上游 200 但缺 balance（字段改名/结构变化）：**如实报错**，不返回 0——0 会落库后被
-  // routeUsable 当成「余额已耗尽」把可用渠道静默踢出（且污染账号余额），违背方案 §7「如实展示」
+  // routeUsable 当成「余额已耗尽」把可用渠道静默踢出（且污染账号余额），违背「如实展示」
   if (!Number.isFinite(rawBalance)) throw new Error("Cline 余额响应缺少 balance 字段（上游结构可能已变）");
   const credits = rawBalance / CREDITS_PER_MICRO;
   const wallets = [

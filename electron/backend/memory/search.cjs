@@ -1,12 +1,12 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
 
 // 记忆中枢 · 检索层：FTS5 双索引 + ORDER BY rank + 应用层混合评分 + 同义词扩展 + 图扩散。
-// 纪律（专项方案）：不用 bm25() 排序函数、不用子查询过滤、混合评分不在 SQL 里。
+// 纪律（实测结论）：不用 bm25() 排序函数、不用子查询过滤、混合评分不在 SQL 里。
 "use strict";
 
 const fs = require("fs");

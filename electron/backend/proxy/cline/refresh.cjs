@@ -1,6 +1,6 @@
 // 反代网关 · Cline 续期（POST {apiBase}/auth/refresh）
 //
-// 协议事实（2026-09 参考实现 agent2api 实测，三处口径别按直觉改）：
+// 协议事实（2026-09 实测，三处口径别按直觉改）：
 // ① **grantType 是 camelCase**（不是 OAuth 标准的 grant_type），源实现 @cline/core
 //    的 gB() 发的就是这个键名；
 // ② 返回的 accessToken 是**裸 JWT 不带 workos: 前缀**（登录返回的带），而发请求
@@ -11,7 +11,7 @@
 // refreshToken 协议允许轮换（实测本次返回同一个值）：响应给新值就用新值，旧值作废
 // 是正常语义。并发互斥（single-flight）由 adapters.refreshTokenLocked 统一提供，
 // 这里只做单次刷新。刷新结果**要落库**：AgentHub 的账号记录是自己的库（DPAPI 加密），
-// 不是 Cline 客户端文件——providers.json 绝不回写（方案 §9）。
+// 不是 Cline 客户端文件——providers.json 绝不回写。
 "use strict";
 const credentials = require("./credentials.cjs");
 const headersMod = require("./headers.cjs");
@@ -44,7 +44,7 @@ async function refreshToken(p) {
   const r = await httpJson(`${base}${cfg.refreshPath || "/auth/refresh"}`, {
     method: "POST",
     headers,
-    // 键名照抄源实现：camelCase 的 grantType（不是 grant_type）
+    // 键名对齐上游：camelCase 的 grantType（不是 grant_type）
     body: JSON.stringify({ refreshToken, grantType: "refresh_token" }),
   }).catch((e) => ({ status: 0, ok: false, data: null, text: String((e && e.message) || e) }));
   const d = r.data;

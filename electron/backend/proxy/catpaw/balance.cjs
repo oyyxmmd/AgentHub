@@ -1,4 +1,4 @@
-// CatPaw 余额 / 积分查询（移植来源：参照实现 catpaw/balance.rs）。
+// CatPaw 余额 / 积分查询（协议依据：官方客户端实测）。
 //
 // 上游形态（客户端自己的网关 API，实测坐实）：
 //   GET https://catx.nocode.cn/api/gateway/credit/balance
@@ -6,7 +6,7 @@
 //   响应 {code, message, data:{availableCredits, userPlan{…}}, errorCode}
 // `availableCredits` 是**数字字符串**（如 "0.00"）。
 //
-// 为什么不用 credit.catpaw.meituan.com：参照实现的本地实测（2026-09，逐条复现）表明
+// 为什么不用 credit.catpaw.meituan.com：本地实测（2026-09，逐条复现）表明
 // 网页积分中心那套「另配 token2 网页会话凭证」的归因是错的——真正生效的 cookie 是 mt_c_token，
 // 而它的值就是转发用的同一个 accessToken；catx.nocode.cn 这个网关 API 只认 X-Auth-Token 头，
 // 凭证同样是那个 accessToken。于是本模块**不需要任何额外配置**，凭证直接复用转发那条链。

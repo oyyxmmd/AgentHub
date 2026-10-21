@@ -1,46 +1,35 @@
-# v1.44.9 更新说明
+# v1.45.3 更新说明
 
-本版合并上游 v1.61.0 → v1.74.0（247 个提交），并修复 Qoder 在 macOS 上无法领取 Credits、WorkBuddy AI 加油包幂等误判两个问题。
+本版合并上游 `v1.75.0` 至 `v1.81.0`，保留本 Fork 的 WorkBuddy 积分任务、Trae SOLO CN OAuth、托盘面板、直连模式和 macOS 打包能力。
 
-## 本 Fork 修复
+## 反代网关与风控
 
-- **Qoder 风控身份支持 macOS**（此前在 macOS 上一律报「需安装 Qoder 客户端」）：客户端定位只实现了 Windows 路径（`%LOCALAPPDATA%\Programs` + 注册表 + launcher 的 `state.ini`），macOS 上必然失明。已按实测形态分别支持——
-  - 国际版 `/Applications/Qoder.app/Contents/Resources/umid/runtime-info`（无 `.exe` 后缀，`--account-stdin` + stdin 传 uid）
-  - 国内版 `/Applications/Qoder CN IDE.app/Contents/Resources/app/resources/bin/<arch>_darwin/QoderCN machine-info`（无 `--account-stdin`，账号走 `-u`；输出前带 INFO 日志行，JSON 在最后一行）。国内版既无 `umid/` 也无 `app.asar.unpacked`，沿用国际版判据会永远定位不到
-- **WorkBuddy AI 加油包幂等误判**：上游 trial 端点除错误码 `14051` 与中文「已领取」外，还会回英文 `has applied trial` / `already applied`；原判定匹配不到就落到失败分支，UI 显示红色「领取失败」。已补齐幂等识别，命中即按「已完成（幂等）」处理
+- **同 body 请求去重排队**：客户端快速重试同一请求时串行发送，避免同账号、同内容在极短时间内并发打到上游，降低被识别为反代及触发 WorkBuddy 11128 拦截续期的概率。
+- **慢请求不再误罚账号**：流中空闲超时单独归类为 `slow`，不再计入服务端连续失败和账号熔断。
+- **429 重试抖动**：同账号重试延迟可配置，并加入 ±15% 抖动，避免多个账号同时重试形成请求尖峰。
+- **WorkBuddy 6004 修正**：支持中英文重置时间和 `Retry-After`，按上游真实重置时刻冷却；国际版对话优先走 `/v2/chat/completions`，流内 `6004` 正确映射为 429。
+- **WorkBuddy 国际版每日活跃**：补活跃上报、免费模型最小对话和网页会话三条保活链路。
+- **Trae 错误分类修正**：`4001` 改为 404，超长输入改为 413 且不罚号，避免客户端反复重试或沿换号链误伤整池账号。
+- **CodeBuddy / TraeCode 身份句改写**：补充 AutoClaw 上游逐字指纹拦截对应的 system 身份句清洗，避免 406 空响应。
+- **网络代理出口池**：新增 HTTP/HTTPS 与 SOCKS5 出口，支持直连、固定出口和轮询策略。
 
-## 新增能力（来自上游）
+## 其他上游能力
 
-- **Key 级渠道 / 模型白名单**：每把 API Key 可分别限制「允许使用的渠道」与「允许调用的模型」，留空即不限制；白名单外的请求返回 403 并说明原因，Key 泄露时影响面可控。存量 Key 默认不限制，升级不失效
-- **瞬时错误原地重发**：上游 5xx / 网络抖动 / 超时等瞬时失败，先在当前账号按配置次数重发吸收抖动，用尽后才换号，减少不必要的账号切换（默认重发 1 次、间隔 1 秒，可配置）
-- **超时与重试参数可配置**：首字节超时（基础值/上限）、流式空闲超时、JSON 请求超时以及瞬时重发参数均可在配置中调整，无需改代码
-- **协议层重构**：新增 Anthropic Messages 出入口、Responses 出入口、OpenAI 出口的独立协议模块，为多渠道协议翻译打底
-- **Web 控制台 + 远程管理**：网关支持浏览器管理界面、SSE 实时事件流、桌面连接远程 Docker 实例（含只读令牌）
-- **模型目录批量启停**：模型列表支持一键全部开启 / 全部关闭 / 反选，并新增状态筛选
-- **记忆中枢增强**：检索热度动态强化（命中计数参与排序）、检索审计留痕、记忆体检报告（僵尸/趋势/分布/演化链/回收站）
-- 新渠道：autoclaw / Cline
-- 用量统计整体重做：区间化聚合 + 多指标图表 + 各 Key 用量与明细筛选
+- 新增 AutoClaw 用量数据源，用量统计支持更多日期区间与精确筛选。
+- 号池支持逐包积分明细、明文凭据导出和整行展开。
+- AutoClaw 积分无到期误锁、ModelScope 魔粒到账确认、Qoder 中文计算机名请求头等问题修复。
+- 新增反馈与需求入口、README 英文版和 GitHub Issue 表单。
 
-## 修复（来自上游）
+## 本 Fork 保留能力
 
-- **记忆中枢深度审查修复三批**（高危 3 + 中危 19 + 低危 6），以及「老库升级后记忆读写全崩」的紧急修复
-- **账号状态落库不一致**：消除选号过程中重复写入路径，冷却到期/限流复活等状态只按实际变化落库，避免状态在库中来回抖动；同时省掉每轮选号的全池 UPDATE，号多时更快
-- **号池同步加速**：跨机同步合并快照时消除逐账号查询（几百个账号每轮少几百次数据库查询）
-- **设备指纹强化**：改用强随机算法生成，避免因随机性不足被上游误判为「同设备多账号」而触发风控
-- 反代网关白名单 403 错误类型对齐 OpenAI 同构；缺列库 / 表不存在等兼容性报错更准确
-
-## 本 Fork 保留特性
-
-- WorkBuddy CN 积分任务自动化（猫猫旅行 / 夜猫子 / 活跃地图 / 开学季）+ 全局总闸与兜底时刻
-- Trae SOLO CN OAuth 修复（icube 设备身份 / 四变体换令牌 / 完整诊断日志）
-- Trae 模型目录完整拉取（按 function 键逐键拉取合并）
-- 托盘 iStat 信息面板：今日用量 / 任务状态 / 网关账号一键切换（点击账号行即切换调度，渠道行常显「调度 →」）
-- 生态接入 Claude 四档模型独立配置（Sonnet / Opus / Haiku / 子代理，Desktop 四档角色路由同档映射）
-- macOS（Apple Silicon）打包支持（dmg + zip，跳过签名；首次打开需右键「打开」绕过 Gatekeeper 或 `xattr -cr /Applications/AgentHub.app`）
+- WorkBuddy CN 积分任务自动化（猫猫旅行 / 夜猫子 / 活跃地图 / 开学季）及定时任务。
+- Trae SOLO CN OAuth 修复：官方 icube 设备身份、四变体换令牌、完整诊断日志。
+- Trae 模型目录按 function 全量拉取，并合并上游非模型条目过滤。
+- 托盘 iStat 信息面板、网关账号一键切换和 Claude 四档模型独立配置。
+- macOS Apple Silicon dmg/zip 打包与 Windows 安装包发布。
 
 ## 说明
 
-- 本次合并需要重新安装依赖（上游新增 `unplugin-vue-components` 等包）
-- 账号 token 经系统级加密（macOS Keychain / Windows DPAPI）落盘，只在主进程流转；网关 API Key 只存 SHA-256 哈希
-- 所有请求只发往对应服务的官方接口与你自己的 WebDAV 服务器
-- 自测：签到调度 58 项 / 适配器契约 14 渠道 / failover / 空号池路由 31 项 / 成本路由 30 项 / CC Switch（含 live 链路）/ oauth-sim / proxy-smoke 全过
+- 本次合并新增 `undici` 等依赖，更新后需要重新执行 `npm install`。
+- 账号 token 经系统级加密后落盘，只在主进程流转；网关 API Key 只保存 SHA-256 哈希。
+- 工作区合并完成后仍需执行前端构建与反代网关自测，确认本地定制和上游改动兼容。

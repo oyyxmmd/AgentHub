@@ -2,7 +2,7 @@
   "name": "agenthub",
   "version": "1.45.3",
   "description": "AgentHub —— Agent中控台：技能仓库 / 用量同步 / 反代网关 / 记忆中枢",
-  "author": "沐辉",
+  "author": "沐晖",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -22,7 +22,8 @@
     "electron-updater": "^6.8.9",
     "express": "^4.21.2",
     "koffi": "^3.2.1",
-    "motion-v": "^2.4.2"
+    "motion-v": "^2.4.2",
+    "undici": "^8.12.3"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^4.6.2",
@@ -66,6 +67,10 @@
       "dist/**/*",
       "electron/**/*",
       "package.json"
+    ],
+    "asarUnpack": [
+      "**/*.node",
+      "node_modules/@koromix/**"
     ],
     "extraResources": [
       {
@@ -115,12 +120,6 @@
           "arch": [
             "x64"
           ]
-        },
-        {
-          "target": "portable",
-          "arch": [
-            "x64"
-          ]
         }
       ],
       "icon": "build/icon.ico"
@@ -132,9 +131,6 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "AgentHub"
-    },
-    "portable": {
-      "artifactName": "AgentHub-${version}-portable.exe"
     }
   }
 }

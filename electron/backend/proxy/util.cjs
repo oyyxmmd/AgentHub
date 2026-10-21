@@ -27,7 +27,7 @@ function jwtDecode(token) {
   }
 }
 
-/** 宽容解析（参考项目 dig 思路）：递归在响应 JSON 里按键名正则找第一个匹配值 */
+/** 宽容解析（dig 思路）：递归在响应 JSON 里按键名正则找第一个匹配值 */
 function dig(node, re, depth) {
   if (node == null || (depth != null && depth < 0)) return undefined;
   if (Array.isArray(node)) {
@@ -80,14 +80,14 @@ function normalizeExpiryMs(raw, farYears) {
   return ms;
 }
 
-/** 判定字符串是否为完整 JSON（SSE 紧凑流兼容的判据，参考项目 wb_sse 实证） */
+/** 判定字符串是否为完整 JSON（SSE 紧凑流兼容的判据，wb_sse 实证） */
 function isCompleteJson(s) {
   if (!s || s === "[DONE]") return false;
   try { JSON.parse(s); return true; } catch { return false; }
 }
 
 /**
- * 限流响应头解析（参考项目 P1-2：Retry-After 秒 / Retry-After-Ms 毫秒 / X-Ratelimit-Reset epoch）。
+ * 限流响应头解析（P1-2：Retry-After 秒 / Retry-After-Ms 毫秒 / X-Ratelimit-Reset epoch）。
  * 纯数字才认（HTTP-Date 不解析，宁缺毋滥），上限 2h（超过视为上游异常值丢弃）。
  * 传 web fetch 的 Headers 对象；取不到返回 0。
  */
@@ -123,7 +123,7 @@ function stableConvId(messages) {
   }
 }
 
-/** 上游 prompt_cache_key（参考项目 cache_key.go 实证：带上后 credit≈0.02 vs 0.34，约 17× 费用差）。
+/** 上游 prompt_cache_key（实证：带上后 credit≈0.02 vs 0.34，约 17× 费用差）。
  *  uid 是跨账号硬隔离段——跨账号绝不复用同一键，防止命中错账号的前缀缓存 */
 function promptCacheKey(uid, conversation) {
   const u = String(uid || "-");
@@ -132,7 +132,7 @@ function promptCacheKey(uid, conversation) {
   return `agenthub-${uid8}-${conv}`;
 }
 
-// ===== deepseek 思维链（参考项目 thinking.go：开思考必须显式 thinking:enabled + effort，否则无思维链） =====
+// ===== deepseek 思维链（开思考必须显式 thinking:enabled + effort，否则无思维链） =====
 
 function isDeepSeekModel(model) {
   return /^deepseek/i.test(String(model || "").trim());
@@ -168,7 +168,7 @@ const EFFORT_RANK = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, 
 // 再抄一个字面量数组——抄第二份的结果是「界面能填、请求期被判非法」这类静默分叉。
 const EFFORT_LEVELS = Object.keys(EFFORT_RANK);
 
-/** reasoning_effort 档位降级（参考项目 normalizeReasoningEffort）：模型目录声明 supportedEfforts
+/** reasoning_effort 档位降级（normalizeReasoningEffort）：模型目录声明 supportedEfforts
  *  时按其收敛——请求档不在支持集则降到 ≤ 请求档的最高支持档；支持档全高于请求档取最低档。 */
 function normalizeReasoningEffort(obj, reasoningMeta) {
   const supported = (reasoningMeta && Array.isArray(reasoningMeta.supportedEfforts))
@@ -189,7 +189,7 @@ function normalizeReasoningEffort(obj, reasoningMeta) {
   obj.reasoning_effort = lower.length ? lower[lower.length - 1] : sorted[0];
 }
 
-/** deepseek 多轮回填（参考项目 backfillReasoningContent）：会话含 reasoning 痕迹时，
+/** deepseek 多轮回填（backfillReasoningContent）：会话含 reasoning 痕迹时，
  *  所有 assistant 消息必须带 reasoning_content 字段（可为空串），否则上游 400 */
 function backfillReasoningContent(obj) {
   if (!obj || !isDeepSeekModel(obj.model)) return;
@@ -208,7 +208,7 @@ function backfillReasoningContent(obj) {
 
 // ===== SSE =====
 
-/** SSE 行扫描器：累积 event:/data: 到空行触发一次事件（对齐参考项目 scan_line） */
+/** SSE 行扫描器：累积 event:/data: 到空行触发一次事件（对齐 scan_line） */
 class SseScanner {
   constructor(onEvent) {
     this.buf = "";
@@ -245,7 +245,7 @@ class SseScanner {
     }
     if (line.startsWith("data:")) {
       this.data.push(line.slice(5).replace(/^ /, ""));
-      // 紧凑流兼容（参考项目 wb_sse 实证：上游存在无空行分隔的连续 data: 流）——
+      // 紧凑流兼容（wb_sse 实证：上游存在无空行分隔的连续 data: 流）——
       // data 已拼出完整 JSON 或 [DONE] 时立即产出，不等空行；不完整则继续等
       const joined = this.data.join("\n");
       if (joined === "[DONE]" || isCompleteJson(joined)) {
@@ -311,6 +311,34 @@ function hasConsumableDelta(d) {
     || !!d.content
     || (Array.isArray(d.tool_calls) && d.tool_calls.length > 0)
     || hasLegacyFn; // legacy 兼容通道的真实调用仍算出线，防流中换号重发拼接
+}
+
+/** 「输入过大」的文案词表（大小写不敏感；中文原样匹配）。
+ *  来源：trae 的 INPUT_TOO_LARGE_MARKERS（12 条，逐字对应）。
+ *  这条判定的意义不是文案好看，而是**别冷却健康账号**：同一份超大 body 换任何账号都会被
+ *  上游拒，把它算成账号错误会顺着换号链把整池账号逐个罚掉（Trae 流内 4001 配
+ *  "prompt is too long" 就是这种形态：码写着模型不可用、真实原因是输入超限）。
+ *  ⚠ 词表只许加实测出现过的串：宽泛词（如单独的 "length"）会把参数错误一起吞进来。 */
+const INPUT_TOO_LARGE_MARKERS = [
+  "too long",
+  "too many tokens",
+  "context length",
+  "maximum context",
+  "context window",
+  "request entity too large",
+  "input too large",
+  "输入过长",
+  "内容过长",
+  "上下文过长",
+  "上下文长度",
+  "超出模型上限",
+];
+
+/** 文案是否属于「输入过大」族（唯一实现：server 分类器与各适配器的流内错误都用它） */
+function isInputTooLargeMsg(message) {
+  const lower = String(message || "").toLowerCase();
+  if (!lower) return false;
+  return INPUT_TOO_LARGE_MARKERS.some((m) => lower.includes(m.toLowerCase()));
 }
 
 /** OpenAI 流式 chunk 组装 */
@@ -461,9 +489,35 @@ function estimateTokens(text) {
   return Math.max(1, Math.ceil(String(text || "").length / 4));
 }
 
+/**
+ * HTTP header 值必须是 ByteString（每字符 ≤ 0xFF），否则 undici 在发请求前直接抛
+ * TypeError（issue #148：中文计算机名写进 Cosy-MachineHostname）。非 Latin-1 值按
+ * UTF-8 字节映射到 Latin-1：线上传出的字节仍是原 UTF-8，与原生 HTTP 栈一致；
+ * ASCII 值逐字节不变。
+ */
+function byteSafeHeaderValue(value) {
+  const s = String(value ?? "");
+  return /[^\x00-\xff]/.test(s) ? Buffer.from(s, "utf8").toString("latin1") : s;
+}
+
+/** 批量清洗 header 值；没有非 Latin-1 项时原样返回同一个对象（零分配、零行为变更） */
+function byteSafeHeaders(headers) {
+  if (!headers || typeof headers !== "object") return headers;
+  let out = null;
+  for (const [key, value] of Object.entries(headers)) {
+    const s = String(value ?? "");
+    if (!/[^\x00-\xff]/.test(s)) continue;
+    if (!out) out = { ...headers };
+    out[key] = Buffer.from(s, "utf8").toString("latin1");
+  }
+  return out || headers;
+}
+
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs, normalizeExpiryMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
   isDeepSeekModel, injectThinking, normalizeReasoningEffort, backfillReasoningContent, EFFORT_RANK, EFFORT_LEVELS,
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, normalizeRoles, estimateTokens,
+  isInputTooLargeMsg, INPUT_TOO_LARGE_MARKERS,
+  byteSafeHeaderValue, byteSafeHeaders,
 };

@@ -21,6 +21,8 @@ const ALLOWED_COMMANDS = new Set([
   "install_update",
   "open_release_page",
   "open_repo_page",
+  // 设置 · 反馈与需求：系统浏览器打开本仓库的 issue 表单
+  "open_external_url",
   // ===== 技能仓库：WebDAV =====
   "webdav_test",
   "webdav_sync",
@@ -127,6 +129,7 @@ const ALLOWED_COMMANDS = new Set([
   "proxy_account_add",
   "proxy_account_remove",
   "proxy_account_remove_batch",
+  "proxy_account_export_plain",
   "proxy_account_toggle",
   "proxy_account_rename",
   "proxy_account_note",
@@ -179,6 +182,13 @@ const ALLOWED_COMMANDS = new Set([
   "proxy_oplog_list",
   "proxy_oplog_ops",
   "proxy_oplog_export",
+  // ===== 反代网关：网络代理（出口池） =====
+  "proxy_netproxy_list",
+  "proxy_netproxy_save",
+  "proxy_netproxy_remove",
+  "proxy_netproxy_toggle",
+  "proxy_netproxy_test",
+  "proxy_netproxy_settings",
   "proxy_rules_list",
   "proxy_open_rules_dir",
   "proxy_open_data_dir",

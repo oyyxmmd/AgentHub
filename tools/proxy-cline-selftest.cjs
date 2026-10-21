@@ -122,7 +122,7 @@ function offline() {
     assert(parseTryAgainMs("no wait text") === 0, "无文案归 0");
   }
 
-  // ⑦ 上游请求头唯一实现（对话/登录/续期三处共用，方案 §3 契约）
+  // ⑦ 上游请求头唯一实现（对话/登录/续期三处共用，契约）
   {
     const h = clineHeaders.buildUpstreamHeaders(
       { upstreamHeaders: { "User-Agent": "Cline/9.9", "X-Custom": "", "Content-Type": "text/plain", Authorization: "Bearer hack", "X-Task-ID": "hack" } },

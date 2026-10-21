@@ -1,6 +1,6 @@
-// 反代网关 · AutoClaw token 刷新（参照实现 providers/autoclaw/refresh.rs）
+// 反代网关 · AutoClaw token 刷新（协议事实：refresh 实测）
 //
-// 关键取舍（方案 §7）：刷新结果**不落盘不落库**，只进适配器进程级凭证缓存。
+// 关键取舍：刷新结果**不落盘不落库**，只进适配器进程级凭证缓存。
 // 理由：AutoClaw 桌面端的 auth.json 是 safeStorage 加密登录态，服务端轮换 refresh_token
 // 后网关若持久化新值会与桌面端自己的刷新互相顶掉（掉登录根因）；代价是网关重启后
 // 可能要用库里旧 refresh_token 再刷一次（服务端宽限期内有效）。
@@ -44,9 +44,13 @@ async function refreshToken(env) {
   if (!r.ok || !data || typeof data !== "object") {
     return { ok: false, message: `AutoClaw 刷新接口失败（HTTP ${r.status}）` };
   }
+  // 业务码只在**字段真的存在**时判：`Number(undefined)` 是 NaN，而 `NaN !== 0` 恒为真——
+  // 刷新成功响应不带 code 时会被误判成「刷新失败」，于是签到/对话继续拿着旧 token 打，
+  // 表现为「登录态已过期」而刷新其实成功（与 checkin.cjs 同一处判据缺陷）
+  const hasCode = data.code !== undefined && data.code !== null;
   const code = Number(data.code);
-  if (code === 401 || code === 410000) return { ok: false, authError: true, message: "登录态已过期，请重新导入或登录" };
-  if (code !== 0) {
+  if (hasCode && (code === 401 || code === 410000)) return { ok: false, authError: true, message: "登录态已过期，请重新导入或登录" };
+  if (hasCode && code !== 0) {
     const msg = String(data.msg || data.message || "服务器未返回新 token");
     return { ok: false, message: `AutoClaw token 刷新失败 code=${code} msg=${msg}` };
   }

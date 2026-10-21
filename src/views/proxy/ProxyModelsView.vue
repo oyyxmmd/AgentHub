@@ -158,9 +158,13 @@ async function addReverseAlias() {
     err.value = "至少为一个渠道选择目标模型";
     return;
   }
-  const selfMappedChannel = Object.entries(targetMap).find(([, target]) => target.toLowerCase() === name.toLowerCase());
-  if (selfMappedChannel) {
-    err.value = `${channelName(selfMappedChannel[0])} 的实际模型不能与统一请求名相同`;
+  const selfMapped = Object.entries(targetMap).filter(([ch, target]) => {
+    if (target.toLowerCase() !== name.toLowerCase()) return false;
+    // 候选来自渠道原始目录：同名且是原生模型 = 合法恒等映射，只有非原生同名才是脏配置
+    return !channelTargetModels(ch).some((m) => m.toLowerCase() === target.toLowerCase());
+  });
+  if (selfMapped.length) {
+    err.value = `以下渠道的实际模型不是该渠道原生模型，不能与统一请求名相同：${selfMapped.map(([ch]) => channelName(ch)).join("、")}`;
     return;
   }
   const rev = { ...(app.config.proxy.modelReverseAliases || {}) };
@@ -635,6 +639,9 @@ onMounted(refresh);
         <div class="set-desc" style="margin-bottom: 10px">
           解决不同渠道同一模型命名不一致（例如 Trae 的 glm-5.3 与 WorkBuddy/ZCode 的名称不同）。客户端按统一名称请求，网关根据路由渠道自动发给对应渠道的模型名。
         </div>
+        <div class="set-desc" style="margin-bottom: 10px">
+          实际模型可以与统一请求名相同（恒等映射）：只要它是该渠道原生模型，保存后仍按该名称转发；大小写可以不同。
+        </div>
         <div class="rev-form">
           <div class="rev-row">
             <span class="rev-label">统一请求名：</span>
@@ -724,7 +731,7 @@ onMounted(refresh);
           <div class="rule-body">
             <div class="rule-item"><b>1. 渠道路由：</b>模型仅存在于单渠道 → 强制走该渠道；多源重叠 → per-model 覆盖优先，否则按路由策略打分。</div>
             <div class="rule-item"><b>2. 自定义模型映射：</b>请求入口先把别名解析为实际模型再路由（响应模型字段保持请求值）。</div>
-            <div class="rule-item"><b>3. 反向模型映射：</b>一个统一请求名映射到各渠道不同模型名，渠道确定后自动转为该渠道模型转发（响应保持统一请求名）。</div>
+            <div class="rule-item"><b>3. 反向模型映射：</b>一个统一请求名映射到各渠道不同模型名，渠道确定后自动转为该渠道模型转发（响应保持统一请求名）。实际模型与统一名相同且属于渠道原生模型时，按恒等映射处理。</div>
             <div class="rule-item"><b>4. 上下文与思考强度：</b>支持在表格中行内自定义覆盖，修改后即时注入出站参数并反映在模型目录。</div>
             <div class="rule-item"><b>5. 全局回退降级：</b>模型未知或号池耗尽 → 按配置页「不可用时自动切换模型」统一设置切到全局回退模型（客户端无感）。</div>
             <div class="rule-item"><b>6. 模型级负缓存：</b>模型级限流（6004）/ 该号不支持（11102）→ 只冷却「账号×模型」组合，切模型即豁免。</div>

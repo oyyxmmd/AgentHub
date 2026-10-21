@@ -149,7 +149,7 @@ export const useAppStore = defineStore("app", {
     helpOpen: false,             // 技能仓库使用帮助对话框
     helpSection: "",             // 打开时定位到的帮助小节 id
     // ===== 记忆中枢：页签显隐白名单（由 memory store 的 loadAll 从 cfg["ui.tabs"] 写回）=====
-    /** 空数组 = 未加载/未配置，pagesOf 兜底为默认 5 个（dashboard/browse/projects/auto/sync） */
+    /** 空数组 = 未加载/未配置，pagesOf 兜底为默认 8 个（dashboard/browse/projects/profile/agents/auto/import/sync） */
     memoryTabs: [] as string[],
   }),
   getters: {
@@ -164,11 +164,11 @@ export const useAppStore = defineStore("app", {
         .filter((m) => moduleEnabled(m.key))
         .map((m) => ({ ...m, enabled: !s.config.modules?.[m.key] || s.config.modules[m.key].enabled !== false }));
     },
-    /** 当前模块的子页面：memory 模块按 ui.tabs 白名单过滤（空=默认 5 个核心页；dashboard/browse 保底），其余模块全量返回 */
+    /** 当前模块的子页面：memory 模块按 ui.tabs 白名单过滤（空=默认 8 个核心页；dashboard/browse 保底），其余模块全量返回 */
     pagesOf(s): PageDef[] {
       const all = this.moduleOf(s.activeModule).pages;
       if (s.activeModule !== "memory") return all;
-      const DEFAULT_TABS = ["dashboard", "browse", "projects", "auto", "sync"];
+      const DEFAULT_TABS = ["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync"];
       const allow = new Set(s.memoryTabs.length ? s.memoryTabs : DEFAULT_TABS);
       allow.add("dashboard");
       allow.add("browse");

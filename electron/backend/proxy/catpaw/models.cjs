@@ -1,8 +1,8 @@
-// CatPaw 上游 modelType 映射表与入站参数解析（移植来源：参照实现 catpaw/models.rs，
-// 上游是 proxy-chat-utils.mjs 的 MODELS 与 resolveEffort / resolveContextWindow）。
+// CatPaw 上游 modelType 映射表与入站参数解析（协议依据：官方客户端实测，
+// 上游是官方客户端的 MODELS 与 resolveEffort / resolveContextWindow）。
 //
 // 数字 modelType 是**上游的内部 ID**：写错一个不会报错，只会让请求打到另一个模型，
-// 所以下表刻意保留「证据」注释，改动前必须回去核对参照实现与实测记录。
+// 所以下表刻意保留「证据」注释，改动前必须回去核对实测记录。
 //
 // 静态表不是模型清单的唯一来源：上游有远程目录（POST /api/agent/maas/model-types，见 catalog.js）。
 // 远程负责「有哪些模型、叫什么、倍率多少」这类会变的信息；静态表负责「上游数字 ID 与 context 档位」
@@ -11,7 +11,7 @@
 const CatPawError = require("./errors.cjs");
 
 /** 一个 CatPaw 模型的静态事实。
- *  数字 ID 证据（逐条对照参照实现，**不要凭名字猜**）：
+ *  数字 ID 证据（逐条对照实测，**不要凭名字猜**）：
  *    - 83 = Kimi-K3：长连接日志里 model:83 会话自述 Moonshot/Kimi，真实 Host 图片请求成功；
  *    - 91 = GLM-5.3-Flash：model:91 会话自述 Z.ai GLM、真实 Host 图片请求成功，
  *      桌面端持久化选择为 {"modelId":91,"modelParams":{"context":"1024000","effort":"max"}}。
@@ -65,7 +65,7 @@ const EFFORTS = ["low", "high", "max"];
  *  上游对三个枚举之外的值当场 400，而网关的档位表是 6 档（minimal/low/medium/high/xhigh/max）：
  *  AgentHub 的模型页把自定义思考强度**直接注入请求体**（server.cjs 的 modelCustom.reasoningEffort），
  *  原样透传会让「中/极高」这类合法设置把本来能用的请求打成 400。
- *  合流规则与参照实现的 effort_for_level 一致：
+ *  合流规则与上游 effort_for_level 一致：
  *    minimal|low → low；medium|high → high；xhigh|max → max */
 const LEVEL_RANK = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 5 };
 function effortForLevel(level) {
@@ -80,7 +80,7 @@ const OFF_LEVELS = ["off", "none", "disabled", "disable"];
 
 /** 从请求体读思考档位：`reasoning_effort ?? reasoningEffort ?? effort`（空值合并）。
  *  返回 null 有两种含义（都表示为「不发 declarativeParams.effort」）：没指定、或明确要求关闭。
- *  取值链与参照实现 resolve_effort 相同，但**多接了一段档位归并**——原因见 effortForLevel：
+ *  取值链与上游 resolve_effort 相同，但**多接了一段档位归并**——原因见 effortForLevel：
  *  走到这里的大多是网关自己注入的档位，400 掉它等于把「设置不生效」升级成「请求失败」 */
 function resolveEffort(body) {
   const source = body || {};

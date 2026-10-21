@@ -241,6 +241,17 @@ function registerPoolRoutes(app) {
   app.post("/api/accounts/import", handle((req, res) => {
     if (!requireFull(req, res)) return;
     const body = req.body || {};
+    // 桌面端账号列表导出是元数据包（无 token）：明确告知，不要逐条报“该候选不含可用凭据”
+    if (!Array.isArray(body) && body.format === "agenthub-accounts") {
+      res.status(400).json({
+        ok: false,
+        imported: 0,
+        total: Array.isArray(body.accounts) ? body.accounts.length : 0,
+        message: proxyIndex.METADATA_ONLY_MESSAGE,
+        results: [],
+      });
+      return;
+    }
     const list = Array.isArray(body) ? body : Array.isArray(body.accounts) ? body.accounts : [body.candidate || body];
     const channel = Array.isArray(body) ? "" : String(body.channel || "");
     const results = list.map((c) => {

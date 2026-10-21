@@ -1,0 +1,96 @@
+name: 🐞 故障报告
+description: 功能报错 / 数据不对 / 界面异常 / 装不上或起不来
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### 填之前先看三眼
+
+        下面字段除「你做了什么，看到什么」外都是**选填**，但填得越全，能直接动手修的概率越高。
+
+        - **标题写成「哪个板块 + 什么现象」**，例如「反代网关：Docker 版启动即退出，报缺 AGENTHUB_SECRET_KEY」。
+          只写「报错了」的话，看的人连是哪个模块、哪种部署形态都判断不了。
+        - **一条 issue 只报一件事**，两个不相干的问题请分开提。
+        - **凭证一律打码**：token、Cookie、API Key、WebDAV 密码、`AGENTHUB_SECRET_KEY` 都不要贴。
+          反代网关的操作日志会脱敏请求头，但**请求体与响应体是原样保存的**，可能带你的对话内容，贴之前自己过一眼。
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: 哪个板块
+      options:
+        - 反代网关（号池 / 模型目录 / Keys / 日志 / 网络代理）
+        - 技能仓库（中央技能库 / 去重与冲突 / 同步中心 / WebDAV）
+        - 用量统计（总览 / 明细 / 费用 / 计费规则 / 同步日志）
+        - 记忆中枢（浏览 / 项目归档 / 深度画像 / 自动化 / 导入）
+        - 界面与设置（主题 / 动效 / 设置弹窗）
+        - 安装与升级（安装包 / 自动更新）
+        - 其它 / 说不清是哪个
+    validations:
+      required: true
+
+  - type: dropdown
+    id: form
+    attributes:
+      label: 部署形态
+      description: 桌面版和 Docker 网关是两套数据目录，排查路径完全不同
+      options:
+        - 桌面版（Windows 安装包）
+        - Docker 网关（gateway/Dockerfile 或 docker compose）
+        - 两个都有，问题在两边都能复现
+        - 浏览器预览（npm run dev:web，仅前端 mock）
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本号
+      description: 桌面版看「设置 → 通用 → 更新」里的当前版本；Docker 版填镜像 tag 或 `docker inspect` 里的版本标签
+      placeholder: 1.80.0
+
+  - type: input
+    id: env
+    attributes:
+      label: 系统 / 运行环境
+      description: 桌面版填 Windows 版本；Docker 版填宿主系统 + 镜像基础版本（node:22 系列）
+      placeholder: Windows 11 24H2 / Ubuntu 24.04 + node:22.22.0
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 你做了什么，看到什么
+      description: |
+        报错原文请用三个反引号包起来，免得被 Markdown 吃掉格式：
+
+        ```
+        像这样
+        ```
+
+        反代网关的问题，最有用的两份材料是：
+        1. 「反代网关 → 日志」页签里对应时刻的记录（等级为「警告 / 错误」的那几条）；
+        2. Docker 版的容器日志：`docker logs --tail 200 <容器名>`。
+      placeholder: |
+        1. 打开「反代网关 → 号池」，添加一个账号
+        2. 模型目录里启用模型后，客户端发一句「你好」
+        3. 返回 401，每次必现
+
+        ```
+        把报错原文贴在这里
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 你期望的结果
+      description: 同一操作在别的版本 / 别的机器上是不是正常的？正常时是什么表现？
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其它补充
+      description: 截图、已经试过什么、什么情况下反而是好的（例如换网络就正常、重启就好、只在 Docker 版出现）

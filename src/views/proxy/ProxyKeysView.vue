@@ -1,4 +1,4 @@
-<!-- 反代网关 · API Keys：生成 / 列表（掩码 + 完整 Key 随时查看复制）/ 启停 / 编辑 / 删除（方案 §7 keys.html）
+<!-- 反代网关 · API Keys：生成 / 列表（掩码 + 完整 Key 随时查看复制）/ 启停 / 编辑 / 删除（keys.html）
      安全：鉴权实时查 SHA-256 哈希；完整 Key 经 DPAPI 加密存库，列表可随时查看 / 复制；状态开关即时生效 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";

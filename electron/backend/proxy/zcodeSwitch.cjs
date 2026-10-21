@@ -1,7 +1,7 @@
 // 反代网关 · ZCode 快捷切号（把号池账号写为本机 ZCode 客户端的当前登录态）
 //
-// 红线（用户点名）：切号后移动端远程连接地址绝不允许变。机制保证（zcode-switch
-// store.rs 生产实证 + 本机实测）：
+// 红线（用户点名）：切号后移动端远程连接地址绝不允许变。机制保证（生产实证 + 本机实测）：
+// 生产实证 + 本机实测）：
 //   ① 合并式写回 credentials.json——只动 oauth:*/zcodejwttoken/account-provider:* 凭据键，
 //      web-remote-control:* 前缀键（relay pass_hash）以 live 原值一字节不动（zcodeLocal.mergeWriteCredentials）；
 //   ② setting.json 的 webRemoteControlExternalRelayDevice.deviceSid 不碰（只写 providerFamilyDomain 两键）；

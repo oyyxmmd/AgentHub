@@ -1,12 +1,12 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
 
 // 记忆中枢 · 索引层：node:sqlite + FTS5 external content 双索引 + 触发器自动同步。
-// 硬结论来自《性能与准确性专项方案》：bigram 预分词、external content 表、
+// 硬结论来自实测：bigram 预分词、external content 表、
 // 触发器只对索引列变更触发（修正清单 F1）、混合评分放应用层。
 // node:sqlite 调用全部收敛在本文件（可行性复核 R2：未来 API 变更只改这里）。
 "use strict";
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS mem (
   t_body        TEXT,
   t_tags        TEXT,
   w_title       TEXT,
-  -- 检索热度（2026-10-16 借鉴 causal-memory 的 Q 值机制）：被检索命中的次数与最近命中时间。
+  -- 检索热度（2026-10-16 沿用 Q 值机制）：被检索命中的次数与最近命中时间。
   -- 只升不降（永不自动衰减），importance 是写入时的静态重要度，热度是「被用得越多越靠前」的动态补充。
   access_count   INTEGER DEFAULT 0,
   last_hit_at    INTEGER,
@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS review_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, kind);
 
--- 检索审计（2026-10-16 借鉴 causal-memory 的 recall_audit）：每次检索一行，
+-- 检索审计（2026-10-16 沿用 recall_audit 机制）：每次检索一行，
 -- 用于回答「搜了什么没搜到」「哪些记忆从未被命中」。写入 best-effort：
 -- 失败绝不影响检索。保留 90 天，写入时顺手清理。
 CREATE TABLE IF NOT EXISTS recall_log (

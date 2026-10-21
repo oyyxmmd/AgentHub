@@ -1,4 +1,4 @@
-// 反代网关 · HTTP 服务（方案 §4/§6.1）：Express @ 127.0.0.1:9527（可配置）
+// 反代网关 · HTTP 服务：Express @ 127.0.0.1:9527（可配置）
 // 端点：POST /v1/chat/completions、POST /v1/messages、POST /v1/responses（各 SSE 双态）
 //       / POST /v1/messages/count_tokens / GET /v1/models / GET /healthz / GET /status（调试，默认关）
 // 错误语义按**入站协议**回：OpenAI 侧 401 invalid_api_key / 429 配额或限流 / 400 参数 / 502 上游 /
@@ -21,6 +21,7 @@ const responsesIn = require("./protocols/responses-in.cjs");
 const responsesOut = require("./protocols/responses-out.cjs");
 const events = require("./events.cjs");
 const oplog = require("./oplog.cjs");
+const inflight = require("./inflight.cjs");
 
 let runtime = null; // { server, startedAt, port, bind, active }
 
@@ -83,7 +84,7 @@ function emitRequestThrottled() {
   }, 2000);
 }
 
-/** 渠道选择（方案 §6.2）：提供商前缀直达 → 单源强制 → per-model 覆盖 → 打分（健康度×余额）/ 指定渠道优先。
+/** 渠道选择：提供商前缀直达 → 单源强制 → per-model 覆盖 → 打分（健康度×余额）/ 指定渠道优先。
  *  关闭的渠道（上游启闭）不参与：modelOwners 已过滤（单源 → 空 → 400），
  *  key.route 指到关闭渠道按 auto 走（钉死的渠道被关后不能把请求带进死胡同） */
 function resolveChannel(key, model, settings) {
@@ -119,7 +120,7 @@ function resolveChannel(key, model, settings) {
   return { channel: null, unknownModel: true };
 }
 
-/** 渠道综合分：可用账号数 × 号池总余额（方案 §6.2 auto）；降级中的渠道记 0 分——
+/** 渠道综合分：可用账号数 × 号池总余额（auto 模式）；降级中的渠道记 0 分——
  *  熔断让位备选，到期半开自动恢复资格（成功一次清零，见 noteChannelSuccess）。
  *  关闭的渠道同样记 0 分（上游启闭：打分排不上去，路由不落） */
 function channelScore(channel) {
@@ -210,7 +211,7 @@ function normalizeChannelFailoverMax(v) {
   return Math.min(CHANNEL_FAILOVER_MAX_CAP, Math.max(1, Math.round(n)));
 }
 
-// ===== 瞬时错误原地重发（同账号重试，参考 agent2api retry_api 语义）=====
+// ===== 瞬时错误原地重发（同账号重试，retry_api 语义）=====
 // 5xx/网络/超时这类瞬时错误，同一账号先原地重发 N 次吸收抖动，用尽再换号。
 // 与 401 刷新重试、429 退避重试并列的第三档重试。
 const RETRY_SAME_MAX_COUNT = 5;          // 同账号原地重发次数上限（配置可覆盖）
@@ -302,9 +303,9 @@ function pickByOrder(order, candidates, groups) {
   return [...candidates].sort(cmpByOrder(order, groups))[0];
 }
 
-/** 单账号尝试：401 就地刷新凭证、同渠道重试一次（方案 §6.3 WB 实证，Trae 同理）。
+/** 单账号尝试：401 就地刷新凭证、同渠道重试一次（WB 实证，Trae 同理）。
  *  刷新走 single-flight（并发 401 共享同一次刷新，防 refreshToken 轮换互相践踏）；
- *  刷新失败不立即判废——连续 3 次才 relogin（参考项目语义），中间短冷却重试 */
+ *  刷新失败不立即判废——连续 3 次才 relogin（同语义），中间短冷却重试 */
 async function attemptChat(channel, acc, model, body, emit, meta) {
   const adapter = adapters.get(channel);
   let secrets = store.accountSecrets(store.getAccount(acc.id));
@@ -321,7 +322,7 @@ async function attemptChat(channel, acc, model, body, emit, meta) {
     if (e && e.status === 401) {
       const r = await adapters.refreshTokenLocked(channel, acc, secrets).catch(() => ({ ok: false }));
       if (r.ok) {
-        // noPersist 渠道（AutoClaw，方案 §7）：刷新结果只进适配器进程缓存，
+        // noPersist 渠道（AutoClaw）：刷新结果只进适配器进程缓存，
         // 不落库——服务端轮换 refresh_token，落库会与桌面端自己的刷新互相顶掉
         store.updateAccount(acc.id, r.noPersist
           ? { status: "online", coolUntil: 0, coolReason: "" }
@@ -336,17 +337,26 @@ async function attemptChat(channel, acc, model, body, emit, meta) {
   }
 }
 
-/** 从错误文本解析上游明示的限流重置时间（参考项目实证：「将在 2026-09-17 04:00 重置」）。
- *  对齐墙钟冷却比固定 60s 盲猜准确——重置前换哪个号打这个模型都是白费。
- *  文案固定按 UTC+8 解释（参考项目 ParseRateReset 口径，与本机时区无关） */
+/** 从错误文本解析上游明示的限流重置时间。
+ *  WB 的 6004 文案有两种语言：中文「将在 2026-09-17 04:00 重置」与英文
+ *  「your usage will reset at 2026-10-20 10:09:49 UTC+8」。旧实现只认中文
+ *  「将在…重置」整句，英文（以及时间后带 UTC+8 的文案）都解析不到，
+ *  6004 只能落 10 分钟兜底：真实重置还早时每 10 分钟重试一次，看起来像
+ *  额度永久用完；真实重置只剩几分钟时又比上游多关一段。
+ *  这里改成只认「日期时间」本身，语言/句式变化不再影响解析；上游时间
+ *  统一按 UTC+8 解释（ParseRateReset 口径，与本机时区无关）。 */
 function parseRateResetMs(text) {
-  const m = /将在\s*([0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2}[ T][0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)\s*重置/.exec(String(text || ""));
+  const m = /([0-9]{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})[ T]([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}))?/.exec(String(text || ""));
   if (!m) return 0;
-  const t = Date.parse(m[1].replace(/\//g, "-").replace(" ", "T") + "+08:00");
+  const p2 = (n) => String(n).padStart(2, "0");
+  const t = Date.parse(`${m[1]}-${p2(m[2])}-${p2(m[3])}T${p2(m[4])}:${m[5]}:${m[6] || "00"}+08:00`);
   return Number.isFinite(t) && t > Date.now() ? t : 0;
 }
 
-/** 错误分类（对齐参考项目 handler.applyErrorPolicy 全表 + 参考项目 SOLO 专项）：
+/** 「输入过大」判定：实现与词表在 util.cjs（唯一一份），server 与各适配器共用。 */
+const isInputTooLargeMsg = util.isInputTooLargeMsg;
+
+/** 错误分类（对齐 handler.applyErrorPolicy 全表 + SOLO 专项）：
  *  决定冷却档位与是否换号。6004 = 模型级限流（罚账号×模型，切模型豁免）；
  *  11102 = 该账号不支持此模型（6h 指数负缓存）；4008 = 模型/账号级限流；4001 = 模型配置问题
  * （不罚号）；11115 prompt 过长（零动作透传）；11101 参数错误（换号不罚号——不同账号模型权限不同）。
@@ -371,9 +381,22 @@ function classifyUpstream(e, planLimit, channel) {
   // 6004 模型级限流：code 字段与消息文本双通道判定——WB 流内 6004 的文案
   // （「您的使用量已超出频率限制，将在 XXX 重置」）不含数字码，只测文本会漏
   if (code === 6004 || /\b6004\b/.test(msg)) {
-    return { kind: "model_rate", switchable: true, status: 429, resetMs: parseRateResetMs(msg) };
+    // 重置时间优先取正文（英文 reset at / 中文「…重置」都能解析）；
+    // 正文没给时再用上游的 Retry-After 头族——WB 的 6004 有时只在头里带等待时长
+    return {
+      kind: "model_rate", switchable: true, status: 429,
+      resetMs: parseRateResetMs(msg) || (e.retryAfterMs ? Date.now() + e.retryAfterMs : 0),
+    };
   }
   if (/\b11102\b/.test(msg) || /service info not found/i.test(msg)) return { kind: "model_blocked", switchable: true, status: 404 };
+  // 输入过大（413 / 上游的「too long」族文案）：同一份 body 换任何账号都同错，
+  // 归 prompt_too_long 走零动作透传，绝不能冷却账号——否则一次超大 prompt 会把整条池逐个罚掉。
+  // 词表对齐 trae 的 INPUT_TOO_LARGE_MARKERS（大小写不敏感、中文原样匹配），
+  // 那里同时钉住了「413 排在最前」的顺序理由：body 恰好带 "1005…plan" 时不能被 plan 匹配劫持成硬冷却。
+  // 顺序：11115 与 402/429 等已有判定在前（它们更具体），本条只兜「其它 4xx 的过大文案」。
+  if (code === 413 || (e && e.status === 413) || isInputTooLargeMsg(msg)) {
+    return { kind: "prompt_too_long", switchable: false, status: 413 };
+  }
   if (/\b11115\b/.test(msg) || /prompt is too long|prompt_too_long/i.test(msg)) {
     return { kind: "prompt_too_long", switchable: false, status: 400 }; // 请求本身超限：零动作透传
   }
@@ -389,6 +412,11 @@ function classifyUpstream(e, planLimit, channel) {
   // 首字节超时（上游迟迟不吐第一个 token）：多为"这次 prompt 太大 / 上游这一刻忙"，
   // 不是账号故障——单独分类，只换号不冷却、也不计入 5xx/网络熔断
   if (e && e.firstByteTimeout) return { kind: "slow", switchable: true, status: 504 };
+  // 流中空闲超时（相邻两块数据之间超过 streamIdleMs 没有任何字节）：与首字节超时同一性质——
+  // 保护性判定，不是账号故障。上游把连接挂住（风控软拦截、后端卡死）与下游网络抖动都长这样，
+  // 罚号只会把整池逐个冻掉（实测：连续 3 次 idle 即触发 5xx 熔断 30 分钟）。
+  // 归 slow：换号重试、不冷却、不进熔断；文案已由 pumpSse 给出「流中读超时（Ns）」，无需改写
+  if (e && e.idleTimeout) return { kind: "slow", switchable: true, status: 504 };
   return { kind: "server", switchable: true, status: 502 }; // 5xx / 网络 / 超时
 }
 
@@ -527,6 +555,9 @@ function applyCool(accId, model, cls, message) {
     cls.kind === "bad_params" ||
     cls.kind === "prompt_too_long" ||
     cls.kind === "slow" ||
+    // model_rate（6004）只罚「账号×模型」：错误原因已随模型级冷却一起落库（号池悬浮明细可查），
+    // 再写账号 lastError 会让冷却/重置结束后卡片仍挂着旧 429，被读成「额度一直没恢复」
+    cls.kind === "model_rate" ||
     (cls.kind === "model_denied" && !cls.channelLevel);
   if (!silent && message) {
     store.noteError(accId, message);
@@ -556,13 +587,13 @@ function applyCool(accId, model, cls, message) {
       pool.coolAccountMs(accId, Date.now() + 60000, message); // 404 短冷却不累计，防雪崩
       return;
     case "relogin":
-      // 连续 3 次凭证失效才判废（参考项目 sessionDeadThreshold）；否则 60s 短冷却给重试机会
+      // 连续 3 次凭证失效才判废（sessionDeadThreshold）；否则 60s 短冷却给重试机会
       if (pool.noteSessionDead(accId)) pool.coolAccount(accId, "relogin", `${message || "凭证失效"}（连续 3 次，请重新登录）`);
       else pool.coolAccountMs(accId, Date.now() + 60000, `${message || "凭证失效"}（短冷却重试）`);
       return;
     case "server": {
       // 5xx/网络：单次失败不冷却（只由外层轮转换号），连续 3 次才熔断（30m 指数封顶 6h）。
-      // 参考项目语义（note_error 的 err_count 分支）：网络抖动/上游偶发 5xx 立即罚 10 分钟
+      // 语义（note_error 的 err_count 分支）：网络抖动/上游偶发 5xx 立即罚 10 分钟
       // 会把号池一次打空（实测：一次首字节超时 → 全渠道 503 直到手动解冷却）
       const until = pool.noteServerError(accId);
       if (until) pool.coolAccountMs(accId, until, message);
@@ -614,6 +645,20 @@ async function handleChat(req, res, settings, surface, convNotes) {
   // 「这次请求丢了什么」的排查线索，日志页本来就能查（issue #126 作者给的三个选项里选 op_logs）
   const usageRow = { ts: startedAt, reqId, keyId: "", keyName: "", channel: "", accountId: "", accountName: "", model: String(body.model || ""), status: 0, convNotes: Array.isArray(convNotes) ? convNotes.join(" | ").slice(0, 300) : "" };
 
+  // 尝试级明细：每次真实上游请求一条（渠道 / 账号 / 结果 / 耗时）。
+  // 只进 op_logs 的 detail，**不落 usage_requests**（加列要走 DB 迁移，而这条信息的用途是
+  // 「这条请求为什么慢 / 为什么换了三次号」的排障线索，日志页本来就能查）。
+  // 最终错误消息里已经拼了「试过哪些渠道、用过哪些账号」，但那是**汇总**：看不到顺序、
+  // 看不到每次失败的原因、也看不到换号之间隔了多久——而「同一个号连续被选中两次」
+  // 这类问题只有逐条明细才暴露得出来。
+  const attempts = [];
+  const describeAttempts = () => {
+    if (attempts.length < 2) return ""; // 单次尝试没有信息量，不占日志体积
+    return "attempts: " + attempts
+      .map((a) => `${a.chan}/${a.acc || "-"}:${a.outcome || "?"}${a.ms ? `(${a.ms}ms)` : ""}`)
+      .join(" → ");
+  };
+
   const record = (extra) => {
     usageRow.latencyMs = Date.now() - startedAt;
     Object.assign(usageRow, extra || {});
@@ -627,7 +672,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
     const st = Number(usageRow.status) || 0;
     oplog.log(st >= 500 || st === 0 ? "error" : st >= 400 ? "warn" : "info", "代理请求",
       `${usageRow.model || "-"} · HTTP ${st || "-"} · ${usageRow.latencyMs}ms${usageRow.error ? " · " + String(usageRow.error).slice(0, 120) : ""}`,
-      { channel: usageRow.channel, target: [usageRow.keyName, usageRow.accountName].filter(Boolean).join(" / "), detail: [usageRow.error, usageRow.convNotes].filter(Boolean).join(" · ") });
+      { channel: usageRow.channel, target: [usageRow.keyName, usageRow.accountName].filter(Boolean).join(" / "), detail: [usageRow.error, usageRow.convNotes, describeAttempts()].filter(Boolean).join(" · ") });
   };
 
   // ===== 鉴权：库中只存哈希，实时查表（启停/删除即时生效）。Key 从哪个头读由协议面定 =====
@@ -647,7 +692,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
     record({ status: 401, error: "key disabled" });
     return sink.endErr(401, "API Key 已停用", "invalid_request_error", "invalid_api_key");
   }
-  // Key 级渠道/模型白名单（参考 agent2api apiKeys allowedProviders/allowedModels，空数组 = 不限制）：
+  // Key 级渠道/模型白名单（apiKeys 的 allowedProviders/allowedModels，空数组 = 不限制）：
   // 泄露影响面收敛的最小权限化措施。模型名按请求的对外模型名（body.model）判定，渠道判定在路由后。
   const keyAllowedModels = Array.isArray(key.allowedModels) ? key.allowedModels : [];
   const keyAllowedChannels = Array.isArray(key.allowedChannels) ? key.allowedChannels : [];
@@ -738,7 +783,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
   }
 
   // ===== 出线准备 =====
-  // 会话元数据：轮内稳定（参考项目 ChatMeta——一次 user send 内的重试/换号复用同一
+  // 会话元数据：轮内稳定（ChatMeta——一次 user send 内的重试/换号复用同一
   // X-Conversation-Request-ID，上游后台按它聚合）；会话键按前 3 条消息指纹派生
   const chatMeta = {
     conversationRequestId: crypto.randomBytes(16).toString("hex"),
@@ -791,7 +836,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
       if (ev.reason) finishReason = ev.reason;
       sink.onFinish(finishReason);
     } else if (ev.type === "error") {
-      // 流中错误：注入 OpenAI 错误对象后仍发 [DONE]（幂等兜底，方案 §6.3）。
+      // 流中错误：注入 OpenAI 错误对象后仍发 [DONE]（幂等兜底）。
       // 但内容尚未开始时错误不下发——交给换号逻辑，换号成功客户端完全无感（防监测：不暴露多账号切换痕迹）。
       // 无论下没下发都要记账：没出过内容的 error 意味着本次尝试实质失败，不能伪装成 200 空响应
       streamErr = ev;
@@ -799,13 +844,27 @@ async function handleChat(req, res, settings, surface, convNotes) {
     }
   };
 
+  let dedupeSlot = null; // 同 body 去重槽位（finally 释放；null = 本次未排队）
   try {
+    // ===== 同 body 去重排队（防风控的**行为层**手段，理由见 inflight.cjs 文件头）=====
+    // 位置刻意选在鉴权/参数校验之后、选路之前：
+    //   · 非法请求不该占用队列（鉴权失败没有上游请求，排队毫无意义）；
+    //   · 必须在「占账号租约、消耗上游尝试预算」之前——否则等待者一醒来就发现预算已被
+    //     前一个请求吃掉，排队换来的只是更晚的失败。
+    // 槽位在 finally 释放：流式响应要等正文下发完才结束，这正是「持到请求结束」的含义。
+    if (settings.dedupeSameBody !== false) {
+      dedupeSlot = await inflight.acquire(inflight.bodyKey(body), {
+        waitMs: Number(settings.dedupeWaitMs) > 0 ? Number(settings.dedupeWaitMs) : inflight.DEFAULT_WAIT_MS,
+        onWait: ({ waitedMs, inflightMs }) => oplog.log("info", "请求排队",
+          `相同请求正在处理中，已等待 ${waitedMs}ms（前序在途 ${inflightMs}ms）`),
+      });
+    }
     // 在途计数在 try 内起算（issue #106 加固）：从起算到 finally 扣回之间任何一处抛错都有
     // finally 兜底，绝无「抛一次漏一个名额」——旧写法把 += 1 放在 try 之外 109 行处，那段
     // 一旦有人加了会抛的代码，泄漏满上限后网关就会对所有请求恒 429，只能重启
     rt.active += 1;
     sink.writeHead();
-    // 15s keep-alive 注释行（防中间层回收，方案 §2.2 联调坑）；有真实输出时静默。
+    // 15s keep-alive 注释行（防中间层回收，联调坑）；有真实输出时静默。
     // 清理放在外层 finally：循环体异常（DB 故障等）直接跳走时定时器也必须清，
     // 不然每 5 秒空转一次还阻止进程退出，随失败请求数累积
     let lastWrite = Date.now();
@@ -894,7 +953,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
           triedChannels.push({ chan, accounts: [], note: "渠道降级中" });
           continue;
         }
-        // 单渠道在途已满：跳过先试备选（选路过滤，参考实现 routing::at_concurrency_limit 的语义）。
+        // 单渠道在途已满：跳过先试备选（选路过滤，routing::at_concurrency_limit 的语义）。
         // 全部候选都满时由链尾的 lastErr 汇总成 429 如实上报——绝不能像旧全局闸门那样在进入
         // 渠道解析之前就把请求 429 掉（issue #106：一个渠道打满连带拒绝所有其它渠道）
         const chanInflight = rt.activeByChannel.get(chan) || 0;
@@ -926,7 +985,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
         const triedAccountNames = []; // 本渠道实际选中的账号名（最终错误文案用；去重保序）
         const rateRetried = new Set(); // 无明示时间的 429 同号退避重试标记（每号限一次）
         const transientRetried = new Map(); // 瞬时错误（5xx/网络/超时）同账号原地重发计数：accId → 已重发次数
-        // 每账号并发租约：expire_first 排序与并发无关，同窗口并发会话否则全打同一账号（参考项目租约语义）
+        // 每账号并发租约：expire_first 排序与并发无关，同窗口并发会话否则全打同一账号（租约语义）
         const perAccountLimit = Number(settings.concurrencyPerAccount) > 0 ? Number(settings.concurrencyPerAccount) : 3;
         let poolEmpty = false; // 号池无可用账号（全冷却/耗尽/负缓存打光）
         let realTries = 0;     // 本渠道真实上游尝试次数（区分「打过但失败」与「没打就打光」）
@@ -959,8 +1018,18 @@ async function handleChat(req, res, settings, surface, convNotes) {
           realTries++;
           usageRow.accountId = acc.id;
           usageRow.accountName = acc.name;
+          // 尝试级明细（声明在 try 外：catch/finally 都要回填结论）。
+          // outcome 只记第一次结论——后面 catch 与 finally 可能先后各标一次，
+          // 先到的那个才是真实原因（finally 的兜底值只是「没走到任何判定分支」）
+          const attemptRec = { chan, acc: maskAccountName(acc.name), model: targetModel, startedAt: Date.now(), outcome: "", ms: 0 };
+          attempts.push(attemptRec);
+          const markAttempt = (outcome) => {
+            if (attemptRec.outcome) return;
+            attemptRec.outcome = String(outcome || "?");
+            attemptRec.ms = Date.now() - attemptRec.startedAt;
+          };
           try {
-            // 拟人抖动（方案 §9：不超单人使用强度的限速与随机抖动）：每次上游请求前随机停 40~220ms，
+            // 拟人抖动（不超单人使用强度的限速与随机抖动）：每次上游请求前随机停 40~220ms，
             // 把机器式的瞬时连发抹成真实客户端节奏，降低被上游风控识别为反代的概率
             if (settings.humanizeJitter !== false) {
               await new Promise((r) => setTimeout(r, 40 + Math.random() * 180));
@@ -1019,6 +1088,10 @@ async function handleChat(req, res, settings, surface, convNotes) {
               lastErr = Object.assign(new Error(String(streamErr.message || "上游返回错误")), {
                 status: streamErr.status || 502,
                 code: streamErr.code || 0,
+                // 上游在流内错误里给出的「建议多久后重试」（Qoder 10605 排队等）：
+                // 不透传会让通用 429 分支按「无明示时长」只退 1s 再打，高峰期每个号
+                // 都要白撞一遍；透传后 classifyUpstream 会换算成墙钟 resetMs。
+                ...(streamErr.retryAfterMs ? { retryAfterMs: Number(streamErr.retryAfterMs) } : {}),
               });
               // 与 catch 路径（下方 classifyUpstream 后的 switchable 检查）同口径：
               // 确定性拒绝（prompt_too_long / fatal / model_denied）换号必白撞，
@@ -1035,6 +1108,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
               continue;
             }
             done = true;
+            markAttempt("ok");
             if (chan !== primaryChannel) failoverFrom = primaryChannel; // 记账轨迹：实际走的是备选渠道
           } catch (e) {
             lastErr = e;
@@ -1042,6 +1116,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
             // 就地收尾，本轮以错误结束，由客户端下一次请求自然重试
             if (sentDelta || ttftMs) {
               fatalErr = Object.assign(new Error(`上游流已输出后中断：${String((e && e.message) || "未知错误").slice(0, 200)}`), { status: 502 });
+              markAttempt("interrupted");
               break;
             }
             // WAF Block / 渠道白名单 11128：渠道级故障——降级整个渠道（指数退避），不换号不罚号，跳备选继续
@@ -1053,6 +1128,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
                 { status: 503 }
               );
               degradedHere = "block";
+              markAttempt("channel_block");
               break;
             }
             // 上游按客户端/渠道资格拒绝（渠道级，与账号无关）→ 跳备选渠道、不罚号、不同渠道换号重撞。
@@ -1066,17 +1142,20 @@ async function handleChat(req, res, settings, surface, convNotes) {
                 { status: 400 }
               );
               noteChannelFail(chan); // 计入既有「连续 2 次才降级」节奏，但不立刻拉黑整个渠道
+              markAttempt("client_gate");
               break;
             }
             if (e && e.fatal) {
               fatalErr = e; // 400 参数类等直接透传，不再换号也不回退
+              markAttempt("fatal");
               break;
             }
             const cls = classifyUpstream(e, false, chan);
             humanizeAccountBlocked(e, cls);
+            markAttempt(cls.kind);
             // 瞬时错误（5xx/网络/超时）同账号原地重发：先在这个账号上按配置次数重发吸收抖动，
             // 用尽才走换号。首字节超时（firstByteTimeout）虽是"慢"不是"账号故障"，
-            // 但原地重发同一份 body 结果不会变（上游这一刻就是慢），故不重发、只换号（agent2api 同口径）。
+            // 但原地重发同一份 body 结果不会变（上游这一刻就是慢），故不重发、只换号（同口径）。
             // 429 与 401 有专属动作（429 短退避重试 / 401 刷新凭证重试），不走本档（见下方各自分支）。
             if (cls.kind === "server" && !e.firstByteTimeout) {
               const maxSame = retrySameAccountCount(settings);
@@ -1094,13 +1173,21 @@ async function handleChat(req, res, settings, surface, convNotes) {
               }
             }
             // 无明示重置时间的 429：上游多为 1~3s 短窗限流，退避 1s 重试一次再落冷却换号
-            // （参考项目 RetrySame 语义）；有墙钟/Retry-After 的 429 重试必白费，直接冷却。
+            // （RetrySame 语义）；有墙钟/Retry-After 的 429 重试必白费，直接冷却。
             // 单号池场景下这一跳决定 429 是就地消化还是直接抛给客户端
             if (cls.kind === "rate" && !cls.resetMs && !rateRetried.has(acc.id)) {
               rateRetried.add(acc.id);
               tried.delete(acc.id); // 允许重新选中本号（多号池防惊群可能让位别的号，同样不罚号）
               attempt--;
-              await new Promise((r) => setTimeout(r, 1000));
+              // 延迟参数化 + ±15% 抖动：原来是写死的 1s。多号池同时撞 429 时，固定延时会让
+              // 同一批账号在同一毫秒醒来、再一起打上去——上游看到的正是「整齐划一的机器节奏」。
+              // 抖动把这一批打散到 0.85~1.15 倍区间，成本为零（平均延时不变）。
+              // 基数可配：短窗限流（1~3s）用 1s 就够；有的上游窗口更长，调大比「冷却换号」划算。
+              const rateBase = Number(settings.rateRetryDelayMs) > 0
+                ? Math.min(Number(settings.rateRetryDelayMs), 15000)
+                : 1000;
+              const rateDelay = Math.round(rateBase * (0.85 + Math.random() * 0.3));
+              await new Promise((r) => setTimeout(r, rateDelay));
               continue;
             }
             applyCool(acc.id, targetModel, cls, e.message);
@@ -1111,6 +1198,10 @@ async function handleChat(req, res, settings, surface, convNotes) {
           } finally {
             pool.releaseAccount(acc.id);
             rt.activeByChannel.set(chan, Math.max(0, (rt.activeByChannel.get(chan) || 0) - 1));
+            // 兜底：走到这里还没有结论 = 本轮是「就地重试」（5xx 重发 / 429 退避 / 模型级
+            // 限流换号 / 流中错误换号）。具体原因已在上面各分支各自打了日志，这里只标个位次，
+            // 让「同一账号被连续试了两次」这种问题在明细里一眼可见
+            markAttempt("retry");
           }
         }
         // 渠道尝试结束仍未成功：连续 2 次「真实打过上游仍打光」才降级渠道（后续请求直接走
@@ -1133,7 +1224,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
     }
 
     if (done) {
-      // 收尾：末 chunk 附 usage + [DONE]；无 done 事件也兜底结束（方案 §6.3）
+      // 收尾：末 chunk 附 usage + [DONE]；无 done 事件也兜底结束
       const usage = lastUsage || {
         prompt_tokens: util.estimateTokens(JSON.stringify(body.messages)),
         completion_tokens: util.estimateTokens(sink.aggregated().content),
@@ -1146,7 +1237,7 @@ async function handleChat(req, res, settings, surface, convNotes) {
       // 不算真成功，不清渠道降级态（并发场景下会把别人刚熔断的渠道误放回来）
       pool.noteSuccess(usageRow.accountId, usedTargetModel);
       if (!planLimitEnd) noteChannelSuccess(usageRow.channel);
-      // 上游 usage.credit 实际扣减余额（参考项目 NoteModelCost）：两次定时刷新之间
+      // 上游 usage.credit 实际扣减余额（NoteModelCost）：两次定时刷新之间
       // 余额不再虚高，「余额不足自动切换」更实时；无限额度哨兵(-1)与估算 usage 不扣
       const creditUsed = Number(usage.credit ?? usage.total_credit ?? 0) || 0;
       if (usageRow.accountId && creditUsed > 0) {
@@ -1167,6 +1258,14 @@ async function handleChat(req, res, settings, surface, convNotes) {
       // 上游 200 但一个 token 都没产出：只标注、不改判成功/失败（本机真实流水 id=63 就是这种行，
       // 用户与维护者都容易把它读成「正常回答」）——issue #78 的诊断增强
       if (Number(usage.completion_tokens) === 0) errParts.push("notice:empty-completion");
+      // 流内内容审核拒绝（finish_reason=content_filter / refusal）：HTTP 200、SSE 正常收尾，
+      // 但正文是一句固定拒绝话术——只看状态码就是一次**假成功**（refusal 的成因，
+      // 实测 OfficeAce / 华为 AgentArts 网关如此，ZCode 的 agentic 请求也出现过）。
+      // 这里只标注不换号：换号同样会被拒（审核按内容判定），重发只会把整个号池撞一遍。
+      // 标出来的价值是排障——否则日志里是一条看不出任何问题的绿 200。
+      if (/content[_-]?filter|refusal|safety/i.test(String(finishReason || ""))) {
+        errParts.push(`notice:content-filter(${finishReason})`);
+      }
       record({
         status: 200, ttftMs, promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens,
         // 缓存 token：OpenAI 语义取 prompt_tokens_details.cached_tokens，Anthropic 上游取 cache_read_input_tokens
@@ -1222,6 +1321,11 @@ async function handleChat(req, res, settings, surface, convNotes) {
     // 不点明的话会被读成「用这个渠道发过请求」。判定用 upstreamTries 而不是轨迹里的账号名：
     // fatal（上游 400 透传）那条路径刻意不往轨迹里 push，用轨迹会误报「没发过请求」
     if (!allConcBlocked && !upstreamTries) msg = `未发起任何上游请求（候选渠道号池为空或降级中）：${msg}`;
+    // 6004 原话是「usage exceeds frequency limit」，账号积分其实还在；用户很容易读成
+    // 「额度用完」去充值。补一句本机口径（不替代上游 reset 时间，只解释错误性质）
+    if (/\b6004\b/.test(msg) && !msg.includes("6004 =")) {
+      msg += "（6004 = 账号×模型的频率上限，不是积分耗尽；可按上游给的时间等待，或改用其它模型）";
+    }
     // AgentHub 请求 id 前缀：用户报障时直接引用它，就能在明细里定位到同一行（issue #78）。
     // 同时把上游的 code / request_id 落进记账（客户端消息会截断，长标识常被切掉）
     msg = `[ah:${String(reqId).slice(0, 8)}] ${msg}`;
@@ -1240,6 +1344,14 @@ async function handleChat(req, res, settings, surface, convNotes) {
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
     if (rt) rt.active -= 1; // rt 已随起算移入 try：起算前就抛错（如 stop 竞态）时无事可扣
+    // 去重槽位释放：必须在这里（而不是成功分支），失败/抛错/客户端断开同样要放行后来者
+    if (dedupeSlot) {
+      try {
+        dedupeSlot.release();
+      } catch {
+        /* 释放失败不掩盖真正的错误 */
+      }
+    }
   }
 }
 
@@ -1253,7 +1365,7 @@ function buildApp(settings) {
     if (runtime) return next();
     sendError(res, 503, "网关服务已停止", "server_error", "service_stopped");
   });
-  app.use(express.json({ limit: "32mb" })); // 方案 §6.9：单请求体上限 32MB（多模态 base64）
+  app.use(express.json({ limit: "32mb" })); // 单请求体上限 32MB（多模态 base64）
 
   app.post("/v1/chat/completions", (req, res) => handleChat(req, res, settings(), OPENAI_SURFACE).catch((e) => {
     if (!res.headersSent) sendError(res, 500, String((e && e.message) || e), "server_error");
@@ -1311,7 +1423,7 @@ function buildApp(settings) {
     });
   });
 
-  // 模型目录：三渠道合并视图，鉴权可选（方案 §6.1）；停用模型不对外列出（调不通就不给看，省下游翻找）。
+  // 模型目录：三渠道合并视图，鉴权可选；停用模型不对外列出（调不通就不给看，省下游翻找）。
   // 「没有号池」的渠道（渠道被关 / 一个账号都没有）不对外列（issue #90）；
   // 有账号的渠道一律列出——cooling/额度耗尽/账号停用都只是暂时或主动不可用，
   // 模型保留展示、请求时拿到 503/402 明确文案，避免客户端模型列表整体闪没
@@ -1338,7 +1450,7 @@ function buildApp(settings) {
     res.status(healthy ? 200 : 503).json({ ok: healthy });
   });
 
-  // 调试快照：默认关闭（设置里显式开启），且校验回环地址（方案 §6.7）
+  // 调试快照：默认关闭（设置里显式开启），且校验回环地址
   app.get("/status", (req, res) => {
     const cfg = settings();
     const ip = req.socket.remoteAddress || "";

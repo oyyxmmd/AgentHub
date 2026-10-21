@@ -1,13 +1,13 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
 
 // 记忆中枢 · 分词器：CJK bigram 预分词 + 英文整词小写 + 单字 CJK run 保留自身。
-// 依据《性能与准确性专项方案》§3：trigram 中文 2 字词召回 0%、全局 unigram 召回反降至 77.4%；
-// 单字 run 保留借鉴 basic-memory 的 script_run_grams（孤立单字可查，不污染多字 run）。
+// 依据实测：trigram 中文 2 字词召回 0%、全局 unigram 召回反降至 77.4%；
+// 单字 run 保留 script_run_grams（孤立单字可查，不污染多字 run）。
 "use strict";
 
 function isCJK(ch) {
@@ -51,7 +51,7 @@ function tokenize(text) {
   return tokenizeList(text).join(" ");
 }
 
-// 写侧加权：标题分词串重复 boost 次（专项方案 §7.4）
+// 写侧加权：标题分词串重复 boost 次
 function weightedTitle(title, boost) {
   const t = tokenize(title);
   if (!t) return "";

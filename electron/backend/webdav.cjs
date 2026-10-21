@@ -81,21 +81,29 @@ const isS3 = (cfg) => !!(cfg && cfg.__s3);
 // 全应用同一时刻只放行一个远端同步任务：抢不到的入口直接跳过（定时任务下轮补跑，
 // 手动入口把原因提示给用户）。模块自身的防重入（isRunning / state.running）仍各自保留。
 let syncRunTag = null;
+let syncRunAt = 0;
 
 /** 尝试占住全应用唯一的远端同步槽位；被占用返回 false（调用方跳过本轮） */
 function tryBeginSync(tag) {
   if (syncRunTag) return false;
   syncRunTag = String(tag || "sync");
+  syncRunAt = Date.now();
   return true;
 }
 
 function endSync() {
   syncRunTag = null;
+  syncRunAt = 0;
 }
 
 /** 当前占用者标签（null = 空闲），供入口提示与自测 */
 function syncBusyTag() {
   return syncRunTag;
+}
+
+/** 当前同步已持锁时长（ms，空闲返回 0）：主进程 watchdog 据此记录疑似卡死 */
+function syncHeldMs() {
+  return syncRunTag ? Date.now() - syncRunAt : 0;
 }
 
 /** 网络层异常分类：超时 / 无法连接 / 取消 / 其他，供上层给出明确提示 */
@@ -348,4 +356,4 @@ async function test(cfg) {
   return isS3(cfg) ? s3.test(cfg) : testDav(cfg);
 }
 
-module.exports = { joinUrl, normalizeEndpoint, list, get, getText, put, remove, ensureDir, test, setActiveSignal, syncActiveSignal, networkKind, describeFailure, isNetworkError, tryBeginSync, endSync, syncBusyTag };
+module.exports = { joinUrl, normalizeEndpoint, list, get, getText, put, remove, ensureDir, test, setActiveSignal, syncActiveSignal, networkKind, describeFailure, isNetworkError, tryBeginSync, endSync, syncBusyTag, syncHeldMs };

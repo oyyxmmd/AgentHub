@@ -12,6 +12,7 @@ OpenAI / Anthropic / Responses 三协议，自带 Web 控制台与管理 REST AP
 | 三协议转发（14 个渠道，与桌面版同一套适配器） | 本机软件导入账号（容器里没有桌面客户端） |
 | 号池调度：轮换 / 冷却 / 熔断 / 成本路由 | IDE 切号（写回本机客户端登录文件） |
 | 定时签到、额度自动刷新、号池定时同步 | 人机校验弹窗（ZCode 领取需人工，走桌面版） |
+| 网络代理出口池（http / socks5，固定或轮询出口） |  |
 | 管理 API：Key / 账号 / 渠道 / 配置 / 备份 | Qoder 双区（需要 Windows 客户端 wasm 签名，容器内必然失败，已默认禁用） |
 | WebDAV/S3 号池跨形态同步（与桌面版互通） | 与桌面版共用同一个数据目录（凭据信封不兼容，见 §5.4） |
 
@@ -144,6 +145,7 @@ gateway-data/
 ├── config.json     网关配置（WebDAV 凭据以 enc:v2: 密文存储）
 ├── proxy/
 │   ├── stats.db    号池 / Key / 用量（WAL 模式）
+│   ├── netproxy.json  网络代理出口池（密码以 enc:v2: 密文存储）
 │   └── rules/     渠道规则
 └── gateway.lock    单实例锁（进程退出自动清理；强杀残留会被下次启动接管）
 ```
@@ -204,7 +206,9 @@ curl -X PUT http://127.0.0.1:9528/api/config/webdav \
 ### 6.2 JSON 导入
 
 ```bash
-# 桌面版导出的号池快照，或手工凭据（单条/数组均可）
+# 手工/脚本生成的含凭据 JSON（单条/数组均可）
+# 注意：桌面端「导出选中账号」是元数据包（不含 token），不能用于灌号；
+#       跨机传号请走 §6.1 的号池同步。
 curl -X POST http://127.0.0.1:9528/api/accounts/import \
   -H "Authorization: Bearer $AGENTHUB_ADMIN_TOKEN" -H "Content-Type: application/json" \
   -d '{"channel":"modelscope","accounts":[{"uid":"u1","name":"我的号","token":"..."}]}'
@@ -213,6 +217,7 @@ curl -X POST http://127.0.0.1:9528/api/accounts/import \
 ### 6.3 与桌面版协同的分工
 
 - **登录/扫码/本机导入**：在桌面版做（OAuth 回调、设备码、客户端登录态都在那边）；
+- **跨机传号**：桌面版设置 → 号池同步（WebDAV/S3），账号与凭据加密同步到容器；桌面端「导出选中账号」只有元数据，不能直接导入容器；
 - **人机校验**（ZCode 领奖）：在桌面版号池页手动过码，Docker 侧自动签到遇到需要过码的行会如实标记；
 - **号池**：两边经 §6.1 同步后都有；哪边重新登录过，凭据按"有效性优先 + 时间新者胜"仲裁。
 

@@ -57,8 +57,13 @@ jobs:
           run_sbx tools/proxy-adapter-contract-selftest.cjs
           run_sbx tools/proxy-key-lww-selftest.cjs
           run_sbx tools/proxy-failover-selftest.cjs
+          # ModelScope：签到/点赞只读契约与到账确认结构（不调用 checkin，零公开副作用）
+          run_sbx tools/proxy-modelscope-selftest.cjs
+          # #152 到期口径回归：adapter 明确 0 / 缺省 / 已到期复活锚点 / 无到期可选
+          run_sbx tools/proxy-credits-expiry-selftest.cjs
           run_sbx tools/proxy-cost-route-selftest.cjs
           run_sbx tools/proxy-empty-pool-route-selftest.cjs
+          run_sbx tools/proxy-stats-rename-selftest.cjs
 
   docker:
     runs-on: ubuntu-latest

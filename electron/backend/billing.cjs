@@ -23,7 +23,7 @@ const OPENROUTER_URL = "https://openrouter.ai/api/v1/models";
 const FETCH_TIMEOUT_MS = 20000;
 const PRICES_FILE = "usage-tracker/prices.json";
 
-// 远程价格源默认地址（参考 sub2api 的 pricing.remote_url / hash_url，LiteLLM 兼容格式）
+// 远程价格源默认地址（pricing.remote_url / hash_url，LiteLLM 兼容格式）
 const REMOTE_PRICING_DEFAULTS = {
   url: "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.json",
   hashUrl: "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.sha256",
@@ -239,7 +239,7 @@ async function syncPrices(wd, deviceName) {
   return { action: "unchanged" };
 }
 
-// ===== 远程价格源自动拉取（来源 remote，参考 sub2api PricingService）=====
+// ===== 远程价格源自动拉取（来源 remote，PricingService）=====
 
 /** 上次拉取状态（meta 记账） */
 function getRemotePricingStatus() {
@@ -251,7 +251,7 @@ function getRemotePricingStatus() {
 }
 
 /**
- * 从远程价格源拉取并应用（来源 remote）。借鉴 sub2api：
+ * 从远程价格源拉取并应用（来源 remote）：
  * 哈希比对短路由（远程没变就拉个哈希文件，省流量）→ 全量下载解析 →
  * 只对「本地真实出现过用量」的模型入库（交集）→ 同价跳过 / 异价关旧段开新段。
  * 任何失败向上抛出，由调用方记日志兜底（不影响数据同步）。

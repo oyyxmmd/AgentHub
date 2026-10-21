@@ -1,6 +1,6 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
@@ -110,7 +110,7 @@ async function setUiTabs(page, sleep2, wanted) {
 }
 
 const ALL_TAB_NAMES = ["仪表盘", "记忆浏览", "项目归档", "深层画像", "Agent 接入", "检索与索引", "自动化", "导入与去重", "WebDAV同步"];
-const DEFAULT_TAB_NAMES = ["仪表盘", "记忆浏览", "项目归档", "自动化", "WebDAV同步"];
+const DEFAULT_TAB_NAMES = ["仪表盘", "记忆浏览", "项目归档", "深层画像", "Agent 接入", "自动化", "导入与去重", "WebDAV同步"];
 
 async function main() {
   const indexFile = path.join(__dirname, "..", "dist", "index.html");
@@ -171,14 +171,14 @@ async function main() {
   const names = tabs.map((t) => t.text);
   check("页签条不再有独立的「待确认」页", !names.some((n) => n.startsWith("待确认")), JSON.stringify(names));
   check("末端页签名为「WebDAV同步」", names.some((n) => n.startsWith("WebDAV同步")), JSON.stringify(names));
-  check("页签总数默认为 5（v1.26 起低频四页收进配置·界面，可勾选找回）", names.length === 5, String(names.length));
+  check("页签总数默认为 8（2026-10-20 起仅「检索与索引」收进配置·界面，可勾选找回）", names.length === 8, String(names.length));
   check(
     "记忆浏览页签带待处理红点（收件箱已并入，待裁决数挂在它上面）",
     tabs.some((t) => t.text.startsWith("记忆浏览") && t.dot),
     JSON.stringify(tabs.filter((t) => t.dot).map((t) => t.text)),
   );
 
-  // 后续用例要点到被默认隐藏的页（深层画像 / 导入与去重等）：先把 ui.tabs 勾全，结尾恢复默认 5 个
+  // 后续用例要点到默认隐藏的「检索与索引」：先把 ui.tabs 勾全，结尾恢复默认 8 个
   await setUiTabs(page, sleep, ALL_TAB_NAMES);
   check(
     "配置勾全后页签恢复 9 个（ui.tabs 白名单生效）",
@@ -767,7 +767,7 @@ async function main() {
   console.log("[10] 运行期无 JS 报错");
   check("控制台无 error", errors.length === 0, errors.slice(0, 3).join(" | "));
 
-  // 收尾：把 ui.tabs 恢复成默认 5 个核心页（探针环境以外的配置不被污染）
+  // 收尾：把 ui.tabs 恢复成默认 8 个核心页（探针环境以外的配置不被污染）
   await setUiTabs(page, sleep, DEFAULT_TAB_NAMES);
 
   console.log(`\n结果：通过 ${pass} 项，失败 ${failCount} 项`);

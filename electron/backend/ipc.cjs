@@ -142,6 +142,16 @@ function register(ctx) {
   ipcMain.handle("install_update", () => updater.triggerInstall());
   ipcMain.handle("open_release_page", () => updater.openReleases());
   ipcMain.handle("open_repo_page", () => updater.openRepo());
+  // 设置页「反馈与需求」的入口：用系统默认浏览器打开 issue 表单（应用内 webview 打不开
+  // GitHub 的登录态，也没法提交表单）。只放行本项目仓库的 https 链接 —— 渲染层即使被
+  // 注入也打不开任意地址，白名单比「只校验 http(s)」更难被滥用。
+  ipcMain.handle("open_external_url", handle(async ({ url } = {}) => {
+    const target = String(url || "");
+    const allow = /^https:\/\/github\.com\/HUIdada1\/AgentHub(\/|$|\?)/i.test(target);
+    if (!allow) return { ok: false, message: "只允许打开本项目仓库的链接" };
+    await shell.openExternal(target);
+    return { ok: true };
+  }));
 
   // ===== 技能仓库：WebDAV 跨设备同步（服务器凭据走统一 webdavShared，根目录取 roots.skills） =====
   ipcMain.handle("webdav_test", handle(({ config: form }) => {

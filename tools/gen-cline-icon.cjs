@@ -2,7 +2,7 @@
 // 256×256 PNG（与其它渠道图标同尺寸）。两个池共用同一图形，右下角池角标区分：
 // cline_free.png = FREE（绿）/ cline_pass.png = PASS（紫）。
 //
-// 为什么用脚本自绘：图形自行设计（方案 §11：斜杠 + 圆的 CLI 意象，加池角标与品牌色解耦），
+// 为什么用脚本自绘：图形自行设计（斜杠 + 圆的 CLI 意象，加池角标与品牌色解耦），
 // 本项目图标资产是入库 PNG；脚本留仓库，改形状/配色可复现。3×3 超采样出抗锯齿边缘。
 //
 // 用法：node tools/gen-cline-icon.cjs
@@ -14,7 +14,7 @@ const zlib = require("node:zlib");
 const SIZE = 256;
 const BLUE = [66, 120, 250, 255]; // 主色（终端窗，靛蓝）
 const BLUE_DEEP = [40, 84, 200, 255]; // 提示符与光标（深一档）
-// 池角标底：FREE 绿 / PASS 紫（与品牌色解耦，方案 §11）
+// 池角标底：FREE 绿 / PASS 紫（与品牌色解耦）
 const BADGE_FREE = [34, 150, 94, 235];
 const BADGE_PASS = [124, 82, 214, 235];
 

@@ -28,7 +28,7 @@ function T(name, fn) {
     .catch((e) => { fail++; failures.push(`${name}: ${(e && e.message) || e}`); console.log(`FAIL  ${name}: ${(e && e.message) || e}`); });
 }
 
-/** 上游 11140 的真实响应体（照抄线上报文：displayMsg 是那句误导性的内容审核文案） */
+/** 上游 11140 的真实响应体（对齐线上报文：displayMsg 是那句误导性的内容审核文案） */
 const BLOCKED_BODY = JSON.stringify({
   code: 11140,
   msg: "request illegal",

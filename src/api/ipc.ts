@@ -10,6 +10,7 @@ import type {
   ProxyCheckinRow, ProxyGrowthRow, ProxyGrowthLogEntry, CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, DirectAppType, DirectStatus, DirectApplyResult, DirectRestoreResult, ZcodeDeviceStatusResult, ZcodeClaimModeResult,
   ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   ProxyOpLogList,
+  ProxyNetProxyList, ProxyNetProxyItem, ProxyNetProxyTest, ProxyNetProxyMode,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
   MemoryAgentCard, MemoryAgentVerify, MemoryBridgeStatus, MemoryConfigEnvelope, MemoryStatusEnvelope,
   MemoryToolRow,
@@ -26,6 +27,7 @@ export type {
   DirectAppType, DirectStatus, DirectApplyResult, DirectRestoreResult,
   ProxyProvider, ProxyProviderKind, ProxyProviderModel, ProxyProviderTestResult,
   ProxyOpLogList, ProxyOpLogRow,
+  ProxyNetProxyList, ProxyNetProxyItem, ProxyNetProxyTest, ProxyNetProxyMode,
   MemoryRow, MemoryDetail, MemoryStats, MemoryIndexStatus, MemoryTimelineNode, MemoryProjectCard,
   MemoryAgentCard, MemoryAgentVerify, MemoryBridgeStatus, MemoryConfigEnvelope, MemoryStatusEnvelope,
   MemoryToolRow, MemoryEvent,
@@ -148,6 +150,9 @@ export const downloadUpdate = () => call<UpdateStatus>("download_update");
 export const installUpdate = () => call<UpdateStatus>("install_update");
 export const openReleasePage = () => call<void>("open_release_page");
 export const openRepoPage = () => call<void>("open_repo_page");
+/** 用系统默认浏览器打开本项目仓库的链接（设置 · 反馈与需求；主进程侧有域名白名单） */
+export const openExternalUrl = (url: string) =>
+  call<{ ok: boolean; message?: string }>("open_external_url", { url });
 
 /** 订阅主进程广播（更新状态 / WebDAV 进度 / focus-update 跳转信号），返回退订函数。
  *  Web 托管形态走 SSE（信封同形）；纯静态预览（mock）没有事件源 */
@@ -303,6 +308,13 @@ export const proxyAccountRemove = (id: string) => call<{ ok: boolean; message?: 
 /** 批量删除（号池列表多选）：主进程逐个走单删链路（墓碑先行 + WebDAV 传播），removed = 实删条数 */
 export const proxyAccountRemoveBatch = (ids: string[]) =>
   call<{ ok: boolean; removed?: number; missing?: number; message?: string }>("proxy_account_remove_batch", { ids });
+/** 明文导出选中账号（号池多选「导出凭据」）：token/refreshToken 为解密后的明文，
+ *  供用户在其它软件里直接使用；落盘由渲染层 Blob 下载完成 */
+export const proxyAccountExportPlain = (ids: string[]) =>
+  call<{ ok: boolean; accounts?: Record<string, unknown>[]; missing?: string[]; exportedAt?: number; message?: string }>(
+    "proxy_account_export_plain",
+    { ids }
+  );
 export const proxyAccountToggle = (id: string, enabled: boolean) =>
   call<{ ok: boolean; message?: string }>("proxy_account_toggle", { id, enabled });
 /** 重命名账号（自定义备注），WebDAV 同步时 LWW 传播 */
@@ -501,6 +513,37 @@ export const proxyOpLogOps = () => call<string[]>("proxy_oplog_ops");
 export const proxyOpLogExport = (filter: Omit<ProxyOpLogFilter, "limit" | "offset">) =>
   call<{ ok: boolean; path?: string; count?: number; message?: string }>("proxy_oplog_export", filter as Record<string, unknown>);
 export const proxyRulesList = () => call<ProxyRuleFile[]>("proxy_rules_list");
+
+// ===== 反代网关：网络代理（「网络代理」页签，出口池） =====
+export interface ProxyNetProxyDraft {
+  /** 带 id 即编辑；密码留空表示不改（clearPassword 才清空） */
+  id?: string;
+  name: string;
+  protocol: "http" | "socks5";
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  clearPassword?: boolean;
+  enabled?: boolean;
+}
+export const proxyNetproxyList = () => call<ProxyNetProxyList>("proxy_netproxy_list");
+export const proxyNetproxySave = (draft: ProxyNetProxyDraft) =>
+  call<{ ok: boolean; item: ProxyNetProxyItem }>("proxy_netproxy_save", draft as unknown as Record<string, unknown>);
+export const proxyNetproxyRemove = (id: string) => call<{ ok: boolean }>("proxy_netproxy_remove", { id });
+export const proxyNetproxyToggle = (id: string, enabled: boolean) =>
+  call<{ ok: boolean; item: ProxyNetProxyItem }>("proxy_netproxy_toggle", { id, enabled });
+/** 测已存条目（结果落进条目）；传 draft 则测未保存的表单（不落盘）。
+ *  看门狗传 0：出口测试的时长由后端的「测试超时」决定（默认 15s，最长 120s），
+ *  比渲染层 45s 默认看门狗更长——套默认值会把「慢出口」误报成「主进程卡住」。 */
+export const proxyNetproxyTest = (args: { id?: string; draft?: Omit<ProxyNetProxyDraft, "id" | "clearPassword"> }) =>
+  call<ProxyNetProxyTest & { ok: boolean }>("proxy_netproxy_test", args as unknown as Record<string, unknown>, 0);
+export const proxyNetproxySaveSettings = (args: {
+  mode?: ProxyNetProxyMode;
+  fixedId?: string;
+  testUrl?: string;
+  timeoutMs?: number;
+}) => call<ProxyNetProxyList>("proxy_netproxy_settings", args as Record<string, unknown>);
 export const proxyOpenRulesDir = () => call<{ ok: boolean }>("proxy_open_rules_dir");
 export const proxyOpenDataDir = () => call<{ ok: boolean }>("proxy_open_data_dir");
 export const proxyVaultStatus = () => call<{ encrypted: boolean; driver: string; dataDir: string }>("proxy_vault_status");

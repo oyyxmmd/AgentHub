@@ -1,4 +1,4 @@
-// 反代网关 · AutoClaw 余额（参照实现 providers/autoclaw/balance.rs）
+// 反代网关 · AutoClaw 余额（协议事实：官方客户端实测）
 //
 // 四个端点聚合：钱包 v2 → 兜底 v1 → 即将过期（失败不阻塞）→ 订阅（失败不影响积分）。
 // 积分是原始数值透传（无单位换算；balance_view 是上游带格式的展示串）。
@@ -53,7 +53,7 @@ function normalizeWalletsV1(data) {
   return { total, wallets: [...byScope.values()] };
 }
 
-/** 订阅归一：结构未实测过（上游深嵌套形态不明），按参照实现做浅层候选字段扫描（深度 ≤3）。
+/** 订阅归一：结构未实测过（上游深嵌套形态不明），按浅层候选字段扫描（深度 ≤3）。
  *  找不到任何已知字段 → 返回 null（不编造订阅信息）。 */
 const SUB_FIELDS = {
   planName: ["productName", "planName", "memberName", "subscribeName", "vipName"],

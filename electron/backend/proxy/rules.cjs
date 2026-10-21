@@ -1,4 +1,4 @@
-// 反代网关 · 外置规则热加载（方案 §6.6 第②层）
+// 反代网关 · 外置规则热加载（第②层）
 // rules/*.json 首次启动从内置默认值拷贝，用户可直接改文件；chokidar 监听变更即重载内存态，无需重启
 // 坏 JSON 回退上次快照并在面板警示（status 里带 error）
 "use strict";
@@ -8,7 +8,7 @@ const store = require("./store.cjs");
 
 // ===== 内置默认规则（上游变更时用户改文件即生效，无需发版） =====
 const DEFAULTS = {
-  // Trae 模型显示名 → [config_name, model_name]（方案 §2.1 必填注入字段）
+  // Trae 模型显示名 → [config_name, model_name]（必填注入字段）
   "model_map.json": {
     "deepseek-v4-flash": ["DeepSeek-V4-Flash", "deepseek_v4_flash__dev"],
     "deepseek-v4": ["DeepSeek-V4", "deepseek_v4__dev"],
@@ -24,7 +24,7 @@ const DEFAULTS = {
     workbuddy_ai: ["default-model", "fast-model", "deepseek-v4.1-flash", "kimi-k2.8-preview", "glm-5.3", "glm-5.2"],
   },
   // 拉取到的权威模型目录（含倍率/能力/上下文元数据）：各渠道「拉取模型」写回此文件，可手编热生效。
-  // 内置默认 = Trae 静态兜底清单（参考项目逆向实证 32 个 config_name）+ WB 双区基础目录，
+  // 内置默认 = Trae 静态兜底清单（逆向实证 32 个 config_name）+ WB 双区基础目录，
   // 保证从未拉取过时模型目录开箱即用；拉取成功后整段覆盖对应渠道
   "catalog.json": {
     trae: {
@@ -168,7 +168,7 @@ const DEFAULTS = {
       ],
     },
     // ===== Cline 双池：静态兜底（远程目录拉取后整段覆盖对应渠道）=====
-    // 取自参考实现实测的 recommended-models 响应（2026-09）的稳定主力模型，**不抄全**：
+    // 取自实测的 recommended-models 响应（2026-09）的稳定主力模型，**不抄全**：
     // 上游清单会变（模型上下架频繁），抄全只会得到一份很快过时的表，其余靠拉取补齐。
     // ⚠ 模型 id 必须带池前缀（cline-free/ / cline-pass/ 是计费通道选择器，剥掉转发 404
     // model not found）；免费池那两条裸 id（z-ai/、poolside/）**同样是免费池成员**
@@ -195,7 +195,7 @@ const DEFAULTS = {
       ],
     },
   },
-  // Trae function 字段按模型分发（TraeWorkAssistant models_sync.rs 实证：
+  // Trae function 字段按模型分发（实测：
   // 部分模型仅在 solo_agent 下可用，其余走 solo_work_lite；未命中默认 solo_work_lite）
   "function_map.json": {
     "doubao-seed-code": "solo_agent",
@@ -203,7 +203,7 @@ const DEFAULTS = {
     "qwen3.8-flash": "solo_agent",
   },
   // WorkBuddy 审核指纹最小改写表（from→to 逐字替换；键名要够长防误伤）
-  // 对齐参考项目 sanitizeRewrites：上游按整句精确匹配拦截（400 code 11-128），
+  // 对齐 sanitizeRewrites：上游按整句精确匹配拦截（400 code 11-128），
   // 只保留整句形态的改写——禁止短键全局替换（会把用户正文/代码里的普通词组一并改掉）
   "wb_template_map.json": {
     "You are Claude Code, Anthropic's official CLI for Claude": "You are CodeBuddy, an AI coding assistant tool for Claude",
@@ -216,7 +216,7 @@ const DEFAULTS = {
   // 各渠道默认头 / UA 伪装 / 上游域配置 / 登录端配置
   "headers.json": {
     trae: {
-      // agent 域（对话/模型目录）实证只有一个 mchost.guru（参考项目 AgentHost）；
+      // agent 域（对话/模型目录）实证只有一个 mchost.guru（AgentHost）；
       // api.trae.cn 只服务 /trae/api/v2/...（ug/pay），打 /api/agent/... 会吃 TLB 404，
       // 故镜像默认留空（官方镜像域可用时在此填写完整 URL）
       chatUrl: "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
@@ -224,7 +224,7 @@ const DEFAULTS = {
       creditsUrl: "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",
       exchangeUrl: "https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken",
       userInfoUrl: "https://api.trae.com.cn/cloudide/api/v3/trae/GetUserInfo",
-      // 模型目录拉取（参考项目实证：get_detail_param 返回 config_info_list[].config_name + display_name）
+      // 模型目录拉取（实测：get_detail_param 返回 config_info_list[].config_name + display_name）
       modelsUrl: "https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param",
       mirrorModelsUrl: "",
       userAgent: "TraeClient/TTNet",
@@ -253,9 +253,9 @@ const DEFAULTS = {
     workbuddy: {
       chatUrl: "https://copilot.tencent.com/v2/chat/completions",
       billingBase: "https://www.codebuddy.cn",
-      // chat 出站 Origin/Referer 基域（参考项目 headers.go originRefererFor 实证 CN=codebuddy.cn）
+      // chat 出站 Origin/Referer 基域（originRefererFor 实证 CN=codebuddy.cn）
       origin: "https://www.codebuddy.cn",
-      // 官方桌面端指纹（参考项目逆向实证）：三段式 UA 与 IDE 归属头组，少一项都可能被风控判为网关
+      // 官方桌面端指纹（逆向实证）：三段式 UA 与 IDE 归属头组，少一项都可能被风控判为网关
       clientVersion: "5.5.4",
       cliVersion: "2.137.1",
       userAgent: "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1",
@@ -267,14 +267,14 @@ const DEFAULTS = {
       catalogUA: "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1",
       // 登录/账号类插件端点的上游域（与计费域不同，必须单独给）
       pluginBase: "https://copilot.tencent.com",
-      // 刷新渠道标识（两参考项目不一致：workbuddy2api="plugin"、TWA="workbuddy"，实测后固化）
+      // 刷新渠道标识（两处口径不一致："plugin" 与 "workbuddy"，实测后固化）
       refreshSource: "plugin",
       // X-Device-Token 设备风控头兜底值（优先级：账号 deviceToken > 此处 > data 目录 device_token.txt）
       deviceToken: "",
     },
     workbuddy_ai: {
       chatUrl: "https://www.workbuddy.ai/v2/chat/completions",
-      // 官方国际客户端现行对话路径（优先），404/405 时回退上方 /v2（参考项目实证）
+      // 官方国际客户端现行对话路径（优先），404/405 时回退上方 /v2（实测）
       consoleChatUrl: "https://www.workbuddy.ai/console/chat/completions",
       billingBase: "https://www.workbuddy.ai",
       origin: "https://www.workbuddy.ai",
@@ -293,7 +293,7 @@ const DEFAULTS = {
     },
     // ===== Cline 双池（cline_free / cline_pass 共用同一段）=====
     // 同域同协议同伪装头（api.cline.bot），两池只差「收哪个池的模型」，配置无需拆两份。
-    // 协议事实（2026-09 参考实现 agent2api 实测 + 本方案核实）：
+    // 协议事实（2026-09 实测 + 复核）：
     // ① LLM 端点是 POST {apiBase}/chat/completions（完整路径 /api/v1/chat/completions，
     //    路径只有一个 v1，发成 /api/v1/v1/... 是 404 Not Found）；
     // ② X-CLIENT-TYPE: cline-sdk 是免费池硬门槛（缺它免费池一律 403
@@ -343,7 +343,7 @@ const DEFAULTS = {
       userInfoUrl: "https://xiaohuanxiong.com/api/web/auth/v1/user_info",
       grantUrl: "https://xiaohuanxiong.com/api/web/desktop/v1/login/points/grant",
       // 首次手机端登录奖励端点（一次性新手福利，与 desktop 端点互不共享额度、各领一次；
-      // 身份头报 app-android，同一把 Bearer token——示例项目 agent2api 从官方安卓包逆向实测）
+      // 身份头报 app-android，同一把 Bearer token——从官方安卓包逆向实测）
       mobileGrantUrl: "https://xiaohuanxiong.com/api/web/mobile/v1/login/points/grant",
       refreshUrl: "https://xiaohuanxiong.com/api/web/auth/v1/refresh",
       // x-client-* 六头取值（box-agent 链路 platform 带架构 `desktop-windows-x64`；
@@ -354,7 +354,7 @@ const DEFAULTS = {
       clientChannel: "official",
     },
     // ===== LobsterAI（网易有道龙虾）=====
-    // 协议事实（2026-10-05 实测 + 参考实现 lobsterai2api@21c39a4 交叉验证）：
+    // 协议事实（2026-10-05 实测 + 交叉验证）：
     // 鉴权 = Bearer JWT（OAuth 授权码换发，回环回调 127.0.0.1/auth/callback）+ 设备 uuid + keyfrom 时间戳。
     // 关键约束：① 对话上游**只接受 stream=true**（非流式实测 500）；
     //          ② 签到活动按 clientVersion 门禁——旧版本号返回 slotState=empty（实测 0.1.0 被隐藏、
@@ -442,13 +442,13 @@ const DEFAULTS = {
       //   「仅 Cookie/ms- 可用族」点赞 /api/v1/mcpServers/*/stars + 令牌管理 /api/v1/users/tokens*
       // 实测：OAuth 调点赞 → 401 "oauth token is not supported by this endpoint"
       //       （改请求头、找 openapi 替代、扩 scope、动态注册声明权限，四条路全失败）
-      // 而 ms- 令牌虽能点赞，但不触发 daily_active —— 参考项目实测注释：
+      // 而 ms- 令牌虽能点赞，但不触发 daily_active —— 实测注释：
       //   「Bearer Token 虽能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入日活，daily_active
       //     每日魔粒不会发放；只有 Web 会话（Cookie）活动才触发奖励」
       // ⇒ Cookie 是唯一同时覆盖「点赞」与「日活」的凭据。
       // 做法：OAuth 授权时在应用内窗口捕获 Web Cookie（用户零额外操作）。
       cookieTouchPaths: ["/my/overview", "/", "/home", "/models", "/datasets", "/my/tasks"],
-      // 前端每次加载都会调的两个登录事件端点（参考项目 HAR 抓包确认）——
+      // 前端每次加载都会调的两个登录事件端点（HAR 抓包确认）——
       // daily_active 即「注册并登陆，每日登录即可获取」，必须补这两下触碰
       cookieLoginEventPaths: ["/api/v1/users/login/info", "/api/v1/users/authorized/check"],
       // 魔粒激活用的 openapi 轻量端点（Cookie 亦可调，作为日活信号补充）
@@ -478,10 +478,13 @@ const DEFAULTS = {
       ruleLike: "interaction_like",
       // 点赞目标分页大小（实测 30 可一次拿够 20 个未星标目标）
       mcpPageSize: 30,
+      // 列表响应给 Data.McpServer.TotalCount；按总数动态翻页，但保留扫描安全阀，
+      // 避免上游总数异常时无限请求。实测热门排序前 3 页可能全部 AlreadyStar=true。
+      mcpMaxScanPages: 20,
       // 必须带浏览器上下文，否则风控中间件忽略请求（实测）
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
       refererPath: "/my/overview",
-      // 点赞间隔（ms）：避免高频被风控，参考实现用 200-400ms，这里取更保守的 400-900ms
+      // 点赞间隔（ms）：避免高频被风控，取 400-900ms 更保守
       likeDelayMinMs: 400,
       likeDelayMaxMs: 900,
       // 单轮点赞上限（安全阀：即使上游 daily_cap 异常放大也不超此值）
@@ -550,7 +553,7 @@ const DEFAULTS = {
     // 有状态会话协议（round → event(running) → turn(SSE) → 工具循环 → event(completed)）。
     // 客户端身份常量（toolVersion / agentVersion / appKey / source / mode）**必须与真实客户端保持一致**，
     // 上游按它们解释请求语义与工具形态；客户端升级后改这里即热生效，无需发版。
-    // permissionMode 是本家固定的绕过权限档（参照实现写死在请求体里）。
+    // permissionMode 是本家固定的绕过权限档（写死在请求体里）。
     catpaw: {
       baseUrl: "https://ai.catpaw.meituan.com",
       source: "CatX",
@@ -559,7 +562,7 @@ const DEFAULTS = {
       agentVersion: "1.0.1",
       appKey: "fe_com.sankuai.catpaw.external.front",
       permissionMode: "unsafeBypassPermissions",
-      // 超时三分档：短请求（round/event/stop，参照实现 30s/3s）、turn 的 SSE 总预算（15min）
+      // 超时三分档：短请求（round/event/stop，30s/3s）、turn 的 SSE 总预算（15min）
       requestTimeoutMs: 30000,
       stopTimeoutMs: 3000,
       sseTimeoutMs: 900000,
@@ -585,6 +588,9 @@ const DEFAULTS = {
       // 结尾斜杠是上游要求的（带不带斜杠是两个路由）
       loginPath: "/userapi/v1/agent-login/",
       userProfilePath: "/userapi/v1/user-profile",
+      // 客户端启动同款的「登录」端点：活动福利（Weekly Perks / 登录奖励）没有领取接口，
+      // 服务端把发放判据挂在这个动作上（签到后触发，见 autoclaw/checkin.cjs）
+      userInfoPath: "/userapi/v1/user-info",
       walletsPath: "/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw",
       walletInstancesPath: "/agent-assetmgr/api/v1/wallet-instances?wallet_type=all&wallet_scope=all",
       pointsExpiringPath: "/agent-assetmgr/api/v1/points/expiring?biz_app_id=autoclaw",
@@ -612,6 +618,9 @@ const DEFAULTS = {
       sendCodePath: "/userapi/v1/agent-send-code",
       loginPath: "/userapi/v1/agent-login/",
       userProfilePath: "/userapi/v1/user-profile",
+      // 客户端启动同款的「登录」端点：活动福利（Weekly Perks / 登录奖励）没有领取接口，
+      // 服务端把发放判据挂在这个动作上（签到后触发，见 autoclaw/checkin.cjs）
+      userInfoPath: "/userapi/v1/user-info",
       walletsPath: "/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw",
       walletInstancesPath: "/agent-assetmgr/api/v1/wallet-instances?wallet_type=all&wallet_scope=all",
       pointsExpiringPath: "/agent-assetmgr/api/v1/points/expiring?biz_app_id=autoclaw",

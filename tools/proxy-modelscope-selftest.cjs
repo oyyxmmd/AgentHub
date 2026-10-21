@@ -144,7 +144,7 @@ async function T(name, fn) {
   // ===== T7 配置键齐备 =====
   await T("T7 rules 配置键齐备（魔粒控制面 + 任务规则键 + 安全阀）", () => {
     const c = rules.get("headers.json").modelscope;
-    for (const k of ["chatUrl", "modelsUrl", "apiBase", "balancePath", "earnRulesPath", "transactionsPath", "mcpServersPath", "starPathPrefix", "ruleDailyActive", "ruleAliyunBind", "ruleLike", "likeHardCap"]) {
+    for (const k of ["chatUrl", "modelsUrl", "apiBase", "balancePath", "earnRulesPath", "transactionsPath", "mcpServersPath", "starPathPrefix", "ruleDailyActive", "ruleAliyunBind", "ruleLike", "likeHardCap", "mcpMaxScanPages"]) {
       assert.ok(c[k] !== undefined && c[k] !== "", `配置缺 ${k}`);
     }
     assert.strictEqual(c.ruleDailyActive, "daily_active");
@@ -179,6 +179,19 @@ async function T(name, fn) {
   await T("T9 checkin 幂等：按 today_used/today_remain 计算剩余额度", () => {
     const body = fnBody("async checkin(account, secrets) {", "async fetchLikeTargets");
     assert.ok(body.length > 0, "应能定位 checkin 函数体");
+    assert.ok(/const progressed = confirmedLikes > 0 \|\| \(likeUsedAfter > used\) \|\| \(gained > 0\)/.test(body), "社区动作成功不能冒充魔粒入账，必须由发放记录、规则计数或余额确认");
+    assert.ok(/ok: progressed \|\| remain === 0/.test(body), "未到账且仍有剩余任务时必须如实返回失败");
+    assert.ok(/fetchLikeTargetsResult/.test(body), "空目标与目标查询失败必须使用可诊断结果区分");
+    assert.ok(/fetchEarnTransactions/.test(body), "应读取官网同款 EARN 发放记录作为到账凭据");
+    assert.ok(/waitMagicubeReward/.test(body), "每次社区互动后必须轮询规则、余额和发放记录");
+    assert.ok(/已停止继续操作/.test(body), "首个未确认奖励的互动后必须停止，避免批量制造无奖励星标");
+    // 复核加固：① 确认基线要在 webTouch 之后重取余额，否则日活 200 的异步到账会冒充首个点赞的入账；
+    //            ② EARN 基线拉取失败时不得把全量记录当增量（会直接假确认）。
+    assert.ok(/const likeBase = await this\.magicubesGet\(secrets, this\.cfg\(\)\.balancePath\)/.test(body), "确认基线必须在 webTouch/规则读取之后重取余额");
+    assert.ok(/const txBaselineOk = !!beforeTransactions\.ok/.test(body), "EARN 基线失败必须显式记录并停用增量信号");
+    assert.ok(/transactionKeys: txBaselineOk \? transactionKeys : null/.test(body), "EARN 基线失败时不得把全量记录当增量比较");
+    const waitBody = fnBody("async waitMagicubeReward(secrets, before, attempts) {", "ruleOf(rules, key)");
+    assert.ok(/txResult\.ok && before\.transactionKeys/.test(waitBody), "waitMagicubeReward 必须忽略基线不可用时的发放记录信号");
     assert.ok(/today_used/.test(body), "checkin 应读 today_used");
     assert.ok(/remain/.test(body), "checkin 应算剩余额度");
     assert.ok(/likeHardCap/.test(body), "checkin 应受安全阀约束");
@@ -366,7 +379,7 @@ async function T(name, fn) {
   // ===== T24 Cookie 双凭据通道（方案 A1 的核心设计） =====
   // 背景（2026-10-06 实测穷尽四条路径确立）：魔搭端点分两族且严格互斥，
   //   「OAuth 可用族」推理 + 魔粒；「仅 Cookie/ms- 可用族」点赞 + 令牌管理。
-  //   且 ms- 令牌能点赞但不触发 daily_active（参考项目实测注释：仅 Web 会话触发日活）
+  //   且 ms- 令牌能点赞但不触发 daily_active（实测注释：仅 Web 会话触发日活）
   //   ⇒ Cookie 是唯一两全的凭据。本组断言锁定这套分层不被后续改动破坏。
   await T("T24 Cookie 通道：星标族用 Cookie、日活靠 webTouch、OAuth 账号无凭据时如实提示", () => {
     const src = fs.readFileSync(path.join(__dirname, "..", "electron", "backend", "proxy", "adapters.cjs"), "utf8");
@@ -379,6 +392,8 @@ async function T(name, fn) {
     assert.ok(/starHeaders/.test(likeFn), "点赞应用 starHeaders（Cookie 优先）");
     assert.ok(/starHeaders/.test(tgtFn), "列目标应用 starHeaders");
     assert.ok(!/this\.apiHeaders/.test(likeFn), "点赞不得再用 apiHeaders（OAuth 令牌会被上游 401）");
+    assert.ok(/TotalCount/.test(tgtFn), "目标列表必须按 Data.McpServer.TotalCount 动态翻页，不能硬编码前三页");
+    assert.ok(/mcpMaxScanPages/.test(tgtFn), "动态翻页必须保留最大扫描页数安全阀");
 
     // ② 日活必须靠 webTouch 触碰 Web 页面 + login/info（Bearer 不计日活）
     assert.ok(/async webTouch/.test(body), "应实现 webTouch");

@@ -28,6 +28,39 @@ function osVersion() {
   }
 }
 
+/** 排队建议时长的读取（qoder QueueInfo，字段同名）：
+ *  上游在 10605 排队态的正文里给 `retryAfterSeconds` 或 `waitTime`（单位秒，实测 9~30），
+ *  正文常是**多层嵌套的 JSON 字符串**（`{"code":"403","message":"{\"code\":\"10605\",…}"}`），
+ *  所以要顺着 message / body / data 钻几层再取。
+ *  两个键都没有时返回空对象——**绝不猜值**：猜短了照旧白撞，猜长了平白多等。
+ *  @returns {{retryAfterSecs?:number, retryAfterMs?:number, queueType?:string}} */
+function parseQueueAdvice(inner, msg) {
+  let secs = 0;
+  let queueType = "";
+  let current = inner;
+  let text = String(msg || "");
+  for (let depth = 0; depth < 5; depth++) {
+    let node = current;
+    if (node == null && text) {
+      try { node = JSON.parse(text); } catch { break; }
+    }
+    if (!node || typeof node !== "object") break;
+    const raw = node.retryAfterSeconds ?? node.retry_after_seconds ?? node.waitTime ?? node.wait_time;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0 && !secs) secs = n;
+    if (!queueType && typeof node.queueType === "string") queueType = node.queueType;
+    // 往下钻一层：正文里嵌套的 JSON 字符串
+    const next = node.message ?? node.body ?? node.data;
+    if (typeof next === "string" && next.trim()) { text = next; current = null; continue; }
+    if (next && typeof next === "object") { current = next; continue; }
+    break;
+  }
+  return {
+    ...(secs ? { retryAfterSecs: secs, retryAfterMs: secs * 1000 } : {}),
+    ...(queueType ? { queueType } : {}),
+  };
+}
+
 /** 静态兜底模型表（catalog 不可用时的最小可用集，全部实测 format=openai）。
  *
  *  ⚠️ 按 product 隔离：这两个产品的模型 key 并不通用（CN 与 intl 是两套上游目录，
@@ -74,7 +107,7 @@ const newId = () => crypto.randomUUID();
 function toQoderMessages(messages) {
   const out = [];
   const systemHeads = [];
-  // system 统一前置（参考实测：上游只认首条 system，放中间会失效）；OpenAI 新协议的
+  // system 统一前置（实测：上游只认首条 system，放中间会失效）；OpenAI 新协议的
   // developer 角色归并为 system（静默丢弃会让用户的系统提示词无声消失）
   for (const m of Array.isArray(messages) ? messages : []) {
     if (!m || typeof m !== "object") continue;
@@ -472,11 +505,21 @@ function makeQoder(product, deps) {
               emit({ type: "error", status: 402, code: 116, message: msg });
               return;
             }
-            // 10605 免费模型排队中（参考实测 403+10605，官方 CLI 按可重试排队态处理）：
-            // 按 429 归类走通用退避（无明示重置时间时 1s 重试一次再落冷却），
-            // 落 502 会被当成「上游不稳定」熔断节奏，高峰期整池无自救
+            // 10605 免费模型排队中（实测 403+10605，官方 CLI 按可重试排队态处理）：
+            // 按 429 归类走通用退避，**并把上游建议的重试间隔带上**。
+            // 实测：`retryAfterSeconds` / `waitTime` 是上游明示的
+            // 建议间隔（实测 9～30 秒浮动）。不带它，通用层会按「无明示 429」只退 1s 再打，
+            // 高峰期每个号都要白撞一遍才知道还在排队；带上就落 10 分钟冷却（视上游值），
+            // 由编排层直接换号。两个键都没有时不猜值（保持原行为）。
             if (String(innerCode) === "10605" || /排队/.test(String(msg))) {
-              emit({ type: "error", status: 429, code: 10605, message: `Qoder 模型排队中：${String(msg)}` });
+              const queue = parseQueueAdvice(inner, msg);
+              emit({
+                type: "error",
+                status: 429,
+                code: 10605,
+                message: `Qoder 模型排队中${queue.retryAfterSecs ? `（上游建议 ${queue.retryAfterSecs}s 后重试）` : ""}：${String(msg)}`,
+                ...(queue.retryAfterMs ? { retryAfterMs: queue.retryAfterMs } : {}),
+              });
               return;
             }
             const st = code === "UNAUTHORIZED" || /token|unauthor/i.test(String(msg)) ? 401 : 502;
@@ -606,7 +649,7 @@ function makeQoder(product, deps) {
         "Cosy-Version": c.cosyVersion || "0.4.3",
         "Cosy-MachineId": (account.meta && account.meta.machineId) || account.machineId || "",
         "Cosy-MachineOS": osVersion(),
-        "Cosy-MachineHostname": os.hostname(),
+        "Cosy-MachineHostname": U.byteSafeHeaderValue(os.hostname()),
         "Cosy-MachineToken": risk.machineToken,
         "Cosy-MachineType": risk.machineType,
         "Cosy-MachineCode": risk.machineCode,
@@ -667,7 +710,7 @@ function makeQoder(product, deps) {
           continue;
         }
         if (r.status === 401 || r.status === 403) return { authError: true, message: "凭证失效" };
-        // 409 + ALREADY_CLAIMED 是上游并发/重放时的「今天已领过」成功语义（参考实测），
+        // 409 + ALREADY_CLAIMED 是上游并发/重放时的「今天已领过」成功语义（实测），
         // 落 !r.ok 会误报领取失败
         if (r.status === 409 && r.data && r.data.result === "ALREADY_CLAIMED") {
           replayedAny += 1;
@@ -719,7 +762,7 @@ function makeQoder(product, deps) {
         "Cosy-Version": c.cosyVersion || "0.4.3",
         "Cosy-MachineId": (account.meta && account.meta.machineId) || account.machineId || "",
         "Cosy-MachineOS": osVersion(),
-        "Cosy-MachineHostname": os.hostname(),
+        "Cosy-MachineHostname": U.byteSafeHeaderValue(os.hostname()),
         "Cosy-MachineToken": risk.machineToken,
         "Cosy-MachineType": risk.machineType,
         "Cosy-MachineCode": risk.machineCode,

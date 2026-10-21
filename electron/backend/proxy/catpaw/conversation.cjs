@@ -1,5 +1,5 @@
 // CatPaw 轮次状态机：round → event(running) → turn(SSE) → 工具循环 → event(completed)
-// （移植来源：参照实现 catpaw/conversation.rs）。
+// （协议依据：官方客户端实测）。
 //
 // 时序与三条硬约束：
 //   全新会话         round(全量)   → event(running) → turn(user)     → … → event(completed)
@@ -12,8 +12,8 @@
 //   3. 同一会话 id 已有流式请求在跑 → 新请求走**独立 conversation**；非流式辅助请求
 //      （客户端标题/摘要类）**不读不写**会话映射。
 //
-// 与参照实现的一处差异：round 被上游以「会话正在执行中」拒绝时**自愈重试一次**
-// （新 conversation 全量 round）——参照实现只依赖下一轮先 turn/stop；这里多一层兜底，
+// 与上游的一处差异：round 被上游以「会话正在执行中」拒绝时**自愈重试一次**
+// （新 conversation 全量 round）——上游只依赖下一轮先 turn/stop；这里多一层兜底，
 // 因为注册表可能因进程重启/TTL 淘汰而丢失「上一轮还在跑」的信息，那条旧 conversation 就再没人停得掉。
 "use strict";
 const CatPawError = require("./errors.cjs");
@@ -94,7 +94,7 @@ function buildTurnBody(prepared, decision, guard) {
   return { body, finalType };
 }
 
-/** 上游「会话正在执行中」的判定：上游这个拒绝没有稳定业务码（参照实现也只靠文案匹配），
+/** 上游「会话正在执行中」的判定：上游这个拒绝没有稳定业务码（只靠文案匹配），
  *  匹配失败只会退化成「不自愈」，不会误伤别的错误 */
 function isBusyError(error) {
   return String((error && error.message) || "").includes("执行中");
@@ -245,11 +245,11 @@ async function execute(ctx, prepared, credentials) {
     await driveStream(tctx, stream, guard, history, emit);
     return { status: 200, planLimit: false };
   } catch (error) {
-    // spurious 判定（对齐参照实现 Drop）：round 从未成功（guard.active=false）时
+    // spurious 判定（对齐上游 Drop 语义）：round 从未成功（guard.active=false）时
     // conversation 上没有进行中的轮次，向一个从未 round 过的 conversation 发 turn/stop
     // 是多余的往返 + 噪声——只 close（其内部 active=false 不报终态，只放开占用）
     if (!guard.settled && guard.active) {
-      // 未显式收尾的兜底（等价参照实现的 Drop）：打断上游轮次 + 回报 canceled，
+      // 未显式收尾的兜底（等价上游的 Drop）：打断上游轮次 + 回报 canceled，
       // 上游硬约束要求 conversation 不能停在「执行中」
       log.verbose(`轮次未显式收尾（异常路径），补 stop + canceled：${(error && error.message) || ""}`);
       await guard.interrupt();

@@ -872,6 +872,9 @@ module.exports = { run, cancel, progress, configured, noteRemoved, noteKeyRemove
   // mergeSnapshot 不走这两个导出的话，「包集随同步传播」只能靠 grep 源文件钉，抓不到
   // 「写错了 LWW 门的位置」这类真缺陷
   exportPool, mergeSnapshot,
+  // 元数据明文化（号池「导出凭据」复用：zcode 切号快照是 DPAPI 密文，导出给外部软件用
+  // 必须先解密；与同步快照共用同一份实现，两处各写一份会让字段清单分叉）
+  prepareMetaForExport,
   // 共享配置同步（自测与诊断用；主流程在 run() 内部调用 runSharedSync）
   exportShared, applyShared, encodeEnvelope, decodeEnvelope, runSharedSync,
   // 号池归档封套（自测用：与共享配置共用同一 encode/decodeEnvelope，去重后靠这组断言守住行为）

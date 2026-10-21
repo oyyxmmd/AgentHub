@@ -3,7 +3,7 @@
 // 设计立场（三案评审裁决）：不实现无头自动求解（happy-dom/jsdom 指纹对抗是灰色地带，
 // 一旦被阿里风控标记即整池失效，且 2500+ 行高维护代码）。领取奖励是低频操作，
 // 走「内嵌沙箱 BrowserWindow 跑阿里云官方 SDK」：无感验证优先，8s 不过转交互式弹窗。
-// 事实基线：zcode-switch captcha.html + src/captcha.js（initAliyunCaptcha /
+// 事实基线：官方客户端 captcha 实现（initAliyunCaptcha /
 // startTracelessVerification / success(captchaVerifyParam) 流程逐行对齐）。
 //
 // 托底设计（卡顿审查 R1）：这个窗口等待的是「外部网络 + 用户操作」两类不可控事件，

@@ -16,7 +16,8 @@
 //            v3 起以 ProfileEncryptor 键反查 er 开括号，不再依赖 QoderContext 的距离）
 //          · 胶水懒加载器：由 `ProfileEncryptor` 实现类的 `=class` 定义向前定位，
 //            兜底从 er 容器开括号向前找最近的懒加载赋值
-//        追加补丁：触发懒加载（可选）+ 导出 initGlue()/glue()（内部用内嵌 base64 初始化 wasm）。
+//        追加补丁：先中和文件末尾的 worker 启动入口，再触发懒加载 + 导出 initGlue()/glue()。
+//        **不中和会闪退**：import 会执行模块顶层语句，worker main 跑起来后会 process.exit。
 //     两条路径的产物缓存键一致：obf 的 size+mtime + 提取方式，客户端升级自动重建。
 //
 // 胶水为**标准 wasm-bindgen 产物**，import 全部来自 ./qoder_auth_wasm_bg.js；wasm 本体 298,606 B，
@@ -28,6 +29,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 const { pathToFileURL } = require("node:url");
 const config = require("../config.cjs");
 const install = require("./qoderInstall.cjs");
@@ -38,7 +40,10 @@ const WASM_MAGIC = "AGFzbQEAAAA"; // 内嵌 wasm 的 base64 魔数（\0asm）；
 // loaderWasm/loaderGlue 已降为可选（见 pickByStructure 末尾的补救逻辑与 patchText）：
 // 顶层常量形态下它们本来就不存在，不触发也不会错；initGlue 不依赖它们。
 const REQUIRED_FEATURES = ["wasmVar", "glueVar", "initAsync"];
-const CACHE_VERSION = 3; // v3：pickByStructure 增加 profileEnc 反查 / 懒加载器形态放宽，旧缓存自动失效
+const CACHE_VERSION = 4; // v4：中和 worker 顶层启动入口（v3 补丁 import 后会 process.exit 闪退）
+// worker 启动入口必须位于文件末尾才允许截断；中部命中是函数定义，截断会丢模块代码。
+// 现网样本的入口都在最后 8KB 内（0.9.18/1.1.40 约 100B，1.1.71/1.1.73 约 2KB）。
+const BOOTSTRAP_NEAR_EOF = 8192;
 
 /** 客户端 resources 目录（多候选定位，见 qoderInstall.cjs） */
 function installResources(product) {
@@ -105,8 +110,8 @@ function pickByStructure(text) {
     // 命中 /dev/null 集合的 D7A）。「紧跟」既覆盖包装名变化（b 只是本版本名字），
     // 又天然排除巧合；闭包内赋值不紧跟的形态由下方补救⑤（从声明位置向前找）兜底。
     loaderWasm: pick([
-      /,\s*([A-Za-z_$][\w$]*)=b\(\(\)=>\{[A-Za-z_$][\w$]*="AGFzbQEAAAA/,
-      /,\s*([A-Za-z_$][\w$]*)=(?:async\s+)?(?:[\w$]+\s*)?\([^)]*\)\s*(?:=>)?\s*\{[A-Za-z_$][\w$]*="AGFzbQEAAAA/,
+      /,\s*([A-Za-z_$][\w$]*)=b\(\(\)=>\{[A-Za-z_$][\w$]*=["'`]AGFzbQEAAAA/,
+      /,\s*([A-Za-z_$][\w$]*)=(?:async\s+)?(?:[\w$]+\s*)?\([^)]*\)\s*(?:=>)?\s*\{[A-Za-z_$][\w$]*=["'`]AGFzbQEAAAA/,
     ]),
     // 胶水容器 er(X,{…QoderContext:()=>…})：键名跨版本稳定，但容器字段会变多——
     // 原 800 字符上限在字段增加时会失配，宽松版放到 3000 并允许 er( 后有空白
@@ -162,7 +167,7 @@ function pickByStructure(text) {
   })();
   // wasm 声明位置（loaderWasm 补救用）
   const wasmDeclAt = (() => {
-    const m = text.match(/([A-Za-z_$][\w$]*)="AGFzbQEAAAA/);
+    const m = text.match(/([A-Za-z_$][\w$]*)=["'`]AGFzbQEAAAA/);
     return m ? m.index : -1;
   })();
   if (regCall) {
@@ -191,6 +196,84 @@ function pickByStructure(text) {
   return names;
 }
 
+/**
+ * 定位 worker 顶层启动入口。现网客户端有三种收尾形态：
+ *   ① process.env.QODERCLI_RUNTIME_PACKAGING="worker_mjs",parse(process.argv),main().catch(...)
+ *   ② SD(),qar(async()=>{...})（qar 内部再读 process.argv）
+ *   ③ AQ(),"sites"===process.argv[2]?...:j0r(async()=>{...})
+ * 先认「真正会调用 worker」的形态（invocation），env 赋值单独出现不启动 worker，
+ * 只作为没命中调用形态时的兜底。同一段入口命中多个锚点时取**末尾窗口内最靠后**的一个：
+ * env 常在调用之前（裁在调用处即可，留下的 env 赋值无害），而 ② 的 env 在函数体内、
+ * 调用在文件最末——取最靠后才是那一次真实调用。
+ */
+function findWorkerBootstrap(text) {
+  const nearEof = (re) => {
+    let m;
+    let last = null;
+    while ((m = re.exec(text))) {
+      if (text.length - m.index <= BOOTSTRAP_NEAR_EOF) last = m.index;
+    }
+    return last;
+  };
+  const invocations = [
+    ["async-call", /,\s*[A-Za-z_$][\w$]*\s*\(\s*async\s*\(\)\s*=>\s*\{/g],
+    ["sites-ternary", /,\s*[^,;{}]{0,200}?===\s*process\.argv\[2\]\s*\?/g],
+    ["argv-call", /,\s*[A-Za-z_$][\w$]*\s*\(\s*process\.argv/g],
+  ];
+  let best = null;
+  for (const [anchor, re] of invocations) {
+    const at = nearEof(re);
+    if (at !== null && (!best || at > best.at)) best = { anchor, at, kind: "invocation" };
+  }
+  if (!best) {
+    const at = nearEof(/process\.env\.QODERCLI_RUNTIME_PACKAGING\s*=\s*["']worker_mjs["']/g);
+    if (at !== null) best = { anchor: "env", at, kind: "env" };
+  }
+  if (!best) return null;
+  return { ...best, fromEnd: text.length - best.at };
+}
+
+/**
+ * 把末尾的 worker 启动入口换成空语句，保留它之前的模块代码。
+ * 实测：0.9.18 裁到 env 赋值、1.1.71 裁到 `,qar(`、1.1.73 裁到 `,"sites"...`，
+ * 之后 initGlue() 均可正常初始化且进程不再退出。
+ */
+function neutralizeWorkerBootstrap(text) {
+  const hit = findWorkerBootstrap(text);
+  if (!hit) return { text, bootstrap: null };
+  // 锚点可能落在逗号上（SD(),qar(...)）：保留前面的表达式，用一个空语句收尾。
+  // 用换行再分号，避免截断点正好落在行注释末尾时被注释吞掉。
+  return { text: `${text.slice(0, hit.at).trimEnd()}\n;\n`, bootstrap: hit };
+}
+
+/** 补丁模块自检：子进程 import + initGlue，worker 入口若没中和干净会在这里退出。 */
+function smokePatchedModule(file) {
+  const code = [
+    "try {",
+    "  const m = await import(process.argv[1]);",
+    "  await m.initGlue();",
+    "  await new Promise((r) => setTimeout(r, 1200));",
+    '  console.log("SIGNER-OK");',
+    "  process.exit(0);",
+    "} catch (e) {",
+    '  console.error("SIGNER-ERR", e && (e.stack || e.message));',
+    "  process.exit(8);",
+    "}",
+  ].join("\n");
+  // Electron 主进程里 process.execPath 是 AgentHub.exe，必须用 ELECTRON_RUN_AS_NODE 以 Node 模式跑。
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", code, pathToFileURL(file).href], {
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    timeout: 20000,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (r.error) throw new Error(`签名器补丁自检启动失败：${r.error.message}`);
+  if (r.status !== 0 || !/SIGNER-OK/.test(String(r.stdout || ""))) {
+    const detail = String(r.stderr || r.stdout || "").replace(/\s+/g, " ").slice(-500);
+    throw new Error(`签名器补丁自检失败（exit=${r.status}${r.signal ? ` signal=${r.signal}` : ""}）：${detail || "无输出"}`);
+  }
+}
+
 /** 生成补丁文本；两条路径产物对上层暴露同一套 API：initGlue()（async）/ glue() */
 function patchText(text) {
   const cut = text.indexOf(ENTRY_MARK);
@@ -209,7 +292,8 @@ function patchText(text) {
   }
   // loaderWasm / loaderGlue 为可选（顶层常量形态下不存在，不触发也不会错）：
   // 有则触发懒加载（胶水/wasm 未加载时 initGlue 内部会报更直观的错），无则跳过。
-  const lines = [text, ""];
+  const neutral = neutralizeWorkerBootstrap(text);
+  const lines = [neutral.text, ""];
   if (n.loaderGlue) {
     lines.push(`try { ${n.loaderGlue}(); } catch (e) { /* 懒加载失败留给 initGlue 报错 */ }`);
   }
@@ -256,13 +340,25 @@ function buildPatchedModule(product, loc) {
     }
     throw e;
   }
-  const tmp = `${out}.tmp.${process.pid}`;
+  const tmp = `${out}.tmp.${process.pid}.mjs`;
   fs.writeFileSync(tmp, patched, "utf8");
-  fs.renameSync(tmp, out);
-  // 清理旧版本缓存（同渠道只保留最新一份，避免 33MB 累积）
+  try {
+    // 静态兜底：补丁里不允许再出现会调用 worker 的入口（单独的 env 赋值无害）；
+    // 动态兜底：子进程 import 后不能退出。
+    const leftover = findWorkerBootstrap(patched);
+    if (leftover && leftover.kind === "invocation") {
+      throw new Error(`补丁仍包含 worker 启动入口（锚点=${leftover.anchor}，距末尾 ${leftover.fromEnd}B）`);
+    }
+    smokePatchedModule(tmp);
+    fs.renameSync(tmp, out);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 已删除 */ }
+    throw new Error(`Qoder 签名器补丁不可用：${(e && e.message) || e}`);
+  }
+  // 清理旧版本缓存（同渠道只保留最新一份，避免 33MB 累积）；跳过并发构建的自检临时文件
   try {
     for (const f of fs.readdirSync(cacheDir())) {
-      if (f.startsWith(`worker-${product}-`) && f !== path.basename(out) && f.endsWith(".mjs")) {
+      if (f.startsWith(`worker-${product}-`) && f !== path.basename(out) && f.endsWith(".mjs") && !f.includes(".tmp.")) {
         fs.unlinkSync(path.join(cacheDir(), f));
       }
     }
@@ -394,6 +490,7 @@ function probe(product) {
   const wasmAt = text.indexOf(WASM_MAGIC);
   const features = pickByStructure(text);
   const missing = REQUIRED_FEATURES.filter((k) => !features[k]);
+  const bootstrap = findWorkerBootstrap(text);
   return {
     product,
     installed: true,
@@ -404,9 +501,10 @@ function probe(product) {
     obfMtime: new Date(Math.floor(st.mtimeMs)).toISOString(),
     entryMark: { mark: ENTRY_MARK, hit: entryAt >= 0, offset: entryAt },
     inlineWasm: { magic: WASM_MAGIC, hit: wasmAt >= 0, offset: wasmAt },
+    workerBootstrap: bootstrap ? { anchor: bootstrap.anchor, kind: bootstrap.kind, offset: bootstrap.at, fromEnd: bootstrap.fromEnd } : null,
     features,
     missing,
-    path: entryAt >= 0 ? "截断路径（入口标记命中）" : missing.length ? "两条路径均失败" : "通用路径（结构提取成功）",
+    path: entryAt >= 0 ? "截断路径（入口标记命中）" : missing.length ? "两条路径均失败" : "通用路径（结构提取成功，末尾入口已中和）",
     snippets: probeSnippets(text, entryAt),
   };
 }
@@ -418,12 +516,12 @@ function probeSnippets(text, entryAt) {
     return m ? text.slice(Math.max(0, m.index - 80), m.index + 220) : "";
   };
   return {
-    wasmDecl: near(/([A-Za-z_$][\w$]*)="AGFzbQEAAAA/),
-    wasmLoader: near(/,\s*([A-Za-z_$][\w$]*)=b\(\(\)=>\{[A-Za-z_$][\w$]*="AGFzbQEAAAA/),
+    wasmDecl: near(/([A-Za-z_$][\w$]*)=["'`]AGFzbQEAAAA/),
+    wasmLoader: near(/,\s*([A-Za-z_$][\w$]*)=b\(\(\)=>\{[A-Za-z_$][\w$]*=["'`]AGFzbQEAAAA/),
     erCall: near(/er\(([A-Za-z_$][\w$]*),\s*\{[^{}]{0,800}?QoderContext:\(\)=>/),
     profileEnc: near(/ProfileEncryptor:\(\)=>([A-Za-z_$][\w$]*)/),
     entryMark: entryAt < 0 ? "" : text.slice(Math.max(0, entryAt - 160), entryAt + 160),
   };
 }
 
-module.exports = { locate, available, createSession, describe, probe, installResources, buildPatchedModule, patchText, pickByStructure };
+module.exports = { locate, available, createSession, describe, probe, installResources, buildPatchedModule, patchText, pickByStructure, findWorkerBootstrap };

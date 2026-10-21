@@ -1,5 +1,5 @@
 // CatPaw 上游 HTTP 传输层：请求头 / 短请求 / 状态回报 / 打断 / turn 建流
-// （移植来源：参照实现 catpaw/upstream_http.rs）。
+// （协议依据：官方客户端实测）。
 //
 // 与其它渠道适配器的差别只有三点，都来自 CatPaw 的协议特性：
 //   1. 请求头是 Cookie 形态（X-Passport-Token）而不是 Bearer；
@@ -46,13 +46,13 @@ function settings() {
   return merged;
 }
 
-/** 上游 base URL（CATPAW_UPSTREAM_BASE_URL 可覆盖——参照实现用它做本地联调） */
+/** 上游 base URL（CATPAW_UPSTREAM_BASE_URL 可覆盖——本地联调用） */
 function upstreamBaseUrl() {
   const raw = String(process.env.CATPAW_UPSTREAM_BASE_URL || "").trim().replace(/\/+$/, "");
   return raw || String(settings().baseUrl).replace(/\/+$/, "");
 }
 
-/** 上游请求头集合（参照实现 createHeaders）：M-TRACEID 每请求新随机 UUID（去连字符） */
+/** 上游请求头集合（createHeaders）：M-TRACEID 每请求新随机 UUID（去连字符） */
 function requestHeaders(credentials, accept) {
   const cfg = settings();
   const headers = {

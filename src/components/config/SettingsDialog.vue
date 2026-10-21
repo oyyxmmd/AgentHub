@@ -1,4 +1,4 @@
-<!-- 全局设置弹窗：左下角设置按钮打开。通用 / WebDAV 同步 / 同步时间 / 数据与备份四块，
+<!-- 全局设置弹窗：左下角设置按钮打开。通用 / WebDAV 同步 / 同步时间 / 数据与备份 / 反馈与需求五块，
      左列模块按钮点击切换，右侧内容定高滚动（弹窗大小固定，不随内容长高）；
      各模块自己的配置不在弹窗里，在对应板块右上「配置」按钮切换的配置页中 -->
 <script setup lang="ts">
@@ -9,6 +9,7 @@ import ConfigGeneralSection from "./ConfigGeneralSection.vue";
 import ConfigWebdavSection from "./ConfigWebdavSection.vue";
 import ConfigTimingSection from "./ConfigTimingSection.vue";
 import ConfigDataSection from "./ConfigDataSection.vue";
+import ConfigFeedbackSection from "./ConfigFeedbackSection.vue";
 
 const app = useAppStore();
 
@@ -28,7 +29,7 @@ watch(
     <template #header>
       <div>
         <div class="sd-title">设置</div>
-        <div class="sd-sub">通用 · WebDAV 同步 · 同步时间 · 数据与备份（各模块配置在对应板块右上「配置」）</div>
+        <div class="sd-sub">通用 · WebDAV 同步 · 同步时间 · 数据与备份 · 反馈与需求（各模块配置在对应板块右上「配置」）</div>
       </div>
     </template>
     <div class="sd-layout">
@@ -52,6 +53,7 @@ watch(
         <div v-if="visited.webdav" v-show="app.settingsTab === 'webdav'"><ConfigWebdavSection /></div>
         <div v-if="visited.timing" v-show="app.settingsTab === 'timing'"><ConfigTimingSection /></div>
         <div v-if="visited.data" v-show="app.settingsTab === 'data'"><ConfigDataSection /></div>
+        <div v-if="visited.feedback" v-show="app.settingsTab === 'feedback'"><ConfigFeedbackSection /></div>
       </div>
     </div>
   </el-dialog>

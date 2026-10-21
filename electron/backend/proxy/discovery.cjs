@@ -1,6 +1,6 @@
 // 反代网关 · 凭据接入：本机软件导入（首选）→ OAuth 登录（兜底）→ 手动粘贴
 //
-// 三条渠道各自独立的登录方式（参考 cockpit-tools 的实证口径）：
+// 三条渠道各自独立的登录方式（官方客户端实证口径）：
 //   trae        Trae SOLO CN：PKCE(S256) + 本地回环回调 http://127.0.0.1:<port>/authorize
 //               登录主机由官方 GetLoginGuidance 下发（失败才用 www.trae.cn 兜底），
 //               授权地址必须带 auth_from=solo / hide_saas_login / code_challenge，缺一不可
@@ -114,7 +114,7 @@ function traeStoragePaths(appDirs) {
 // ===== Trae ByteCrypto（storage.json 里 iCubeAuthInfo 的信封格式） =====
 // 结构：6 字节头 + 32 字节随机 key 材料 + AES-128-CBC(PKCS7) 密文；
 // 明文 = SHA512(正文) || 正文。key/iv 由 SHA512(SHA512(key材料) ‖ salt) 的前 32 字节切出，salt = A xor B。
-// 两套常量来自官方客户端内置密钥表（与参考项目一致），不做联网获取。
+// 两套常量来自官方客户端内置密钥表（与上游一致），不做联网获取。
 
 const BC_HEADER_LEN = 6;
 const BC_KEY_LEN = 32;
@@ -1042,7 +1042,7 @@ const ERR_PAGE = (text) => {
 };
 // 官方授权页登录前会先空参探测回调地址可达性，回 200 挂起页并继续等待。
 // 脚本把 fragment 里的参数（#refreshToken=…）转成 query 后自动重载——官方某些回流形态把参数放在 hash 里，
-// hash 不会发给服务器，只能靠页面脚本回捞（参考项目 callback_pending_html 同款）
+// hash 不会发给服务器，只能靠页面脚本回捞（callback_pending_html 同款）
 const PENDING_PAGE = oauthPageShell(
   "wait",
   "正在等待授权结果…",
@@ -1086,10 +1086,10 @@ function listenLoopback(server) {
 }
 
 /**
- * 回调校验（参考项目实证：官方页不回传我们自定义的 state，只回 refreshToken/userInfo/userJwt，
+ * 回调校验（实测：官方页不回传我们自定义的 state，只回 refreshToken/userInfo/userJwt，
  * 还可能带官方自己的 login_trace_id）。校验只挡明确的外来请求：
  * ① 带 state → 必须与本次会话一致（state 是我们自定义的，官方永不回传，回传了却不一致=外来请求）；
- * ② login_trace_id 不一致 → 参考项目只告警继续处理（官方可能自行改写），不拦截；
+ * ② login_trace_id 不一致 → 只告警继续处理（官方可能自行改写），不拦截；
  * ③ 都没有 → 回环地址只在本机可达，凭据参数齐全即接受。
  * 校验不通过只拒绝本次请求，不结束会话（本地探测/误打端口不能杀掉正在等待的登录）
  */
@@ -1100,7 +1100,7 @@ function validateTraeCallback(q, session) {
       return { ok: false, message: "state 校验不通过（非本次发起的授权会话）" };
     }
   }
-  // ②/③ 口径：login_trace_id 官方可能自行改写（参考项目只告警不拦截），回环地址仅本机可达，
+  // ②/③ 口径：login_trace_id 官方可能自行改写（只告警不拦截），回环地址仅本机可达，
   // 携带凭据即放行——但 traceId 对不上时留一条告警日志，出问题时留得查
   const traceId = q.get("login_trace_id") || q.get("loginTraceID");
   if (traceId != null && traceId !== "" && session.traceId && traceId !== session.traceId) {
@@ -1131,7 +1131,7 @@ function parseJsonParam(raw) {
   return null;
 }
 
-/** authCodeInfo（URL 编码 JSON）里挖授权码，参考项目 extract_auth_code_from_auth_code_info */
+/** authCodeInfo（URL 编码 JSON）里挖授权码，extract_auth_code_from_auth_code_info */
 function authCodeFromInfo(raw) {
   const info = parseJsonParam(raw);
   if (!info) return "";
@@ -1140,7 +1140,7 @@ function authCodeFromInfo(raw) {
 }
 
 /** 回调参数 → 账号凭据：优先 accessToken，其次 userJwt.Token / refreshToken 换 token，最后 authCode（含 authCodeInfo）换 token。
- *  回调里的 loginHost 优先作为换令牌上游（参考项目用回调 host 选 ExchangeToken 域） */
+ *  回调里的 loginHost 优先作为换令牌上游（用回调 host 选 ExchangeToken 域） */
 async function resolveTraeCredentials(q, session) {
   let accessToken = String(q.get("accessToken") || "").replace(/^Cloud-IDE-JWT\s+/i, "");
   let refreshToken = q.get("refreshToken") || "";
@@ -2096,7 +2096,7 @@ function readAccountMeta(id) {
 }
 
 /**
- * 登录后激活链（zcode-account-switcher oauth.js + zcode-api resolver.ts 实证）：
+ * 登录后激活链（官方客户端 oauth + resolver 实证）：
  * 新账号必须补 POST z/login 触发服务端初始化 billing plan，否则额度查询/claim 全为空；
  * 然后经 getCustomerInfo → 默认机构/默认项目 → find-or-create「zcode-api-key」→ copy 取 secret
  * 解析出 coding-plan 凭据（{apiKey}.{secret}），写入 refresh_enc 与 meta.sw.codingPlanKeys。
@@ -2257,7 +2257,7 @@ async function beginTraeOAuth(channel, onDone) {
     }
     const hasCred = ["accessToken", "access_token", "refreshToken", "refresh_token", "userJwt", "user_jwt", "UserJwt", "userInfo", "user_info", "authCode", "auth_code", "authCodeInfo", "auth_code_info", "code", "token"].some((k) => q.get(k));
     if (!hasCred) {
-      // 官方授权页在用户登录前会先空参探测回调地址可达性（参考项目实证）：
+      // 官方授权页在用户登录前会先空参探测回调地址可达性（实测）：
       // 回 200 挂起页继续等待，绝不能按失败处理——老实现在这里报错并结束会话，
       // 登录完成后真正的回调打进来时服务器已经关了，「登录后无法回调」就是这么来的
       if (res) res.end(PENDING_PAGE);
@@ -2323,7 +2323,7 @@ async function beginTraeOAuth(channel, onDone) {
     buildVersion,
     onDone,
     timer: setTimeout(() => finishOAuth({ ok: false, message: "登录超时（3 分钟）" }), OAUTH_TIMEOUT_MS),
-    // 手动粘贴回调地址的入口（浏览器没跳到回环地址时的兜底，参考项目同款）
+    // 手动粘贴回调地址的入口（浏览器没跳到回环地址时的兜底，同款）
     submit: async (rawInput) => {
       if (!oauthSession) return { ok: false, message: "当前没有进行中的登录" };
       const q = parseCallbackInput(rawInput);
@@ -2350,7 +2350,7 @@ function parseCallbackInput(raw) {
     const u = new URL(text);
     const fromSearch = fromQuery(u.search);
     if (fromSearch) return fromSearch;
-    // 官方部分回流形态把参数放在 #hash 里（参考项目挂起页脚本会把 hash 转成 query 再回打）
+    // 官方部分回流形态把参数放在 #hash 里（挂起页脚本会把 hash 转成 query 再回打）
     const fromHash = fromQuery(u.hash.replace(/^#/, ""));
     if (fromHash) return fromHash;
     return null;
@@ -2562,7 +2562,7 @@ function finishOAuth(result) {
 // ===== LobsterAI（网易有道龙虾）：官方回环 OAuth（无需安装客户端） =====
 // 官方登录页形态：{portal}/portal#/login?source=electron&redirect_uri=http://127.0.0.1:<port>/auth/callback&state=<state>
 // 登录成功 → 前端导航到 redirect_uri 并带 ?code=…&state=… → 本进程用 code 调
-// POST /api/auth/exchange 换 accessToken/refreshToken（实测协议，参考实现 login 工具同款）。
+// POST /api/auth/exchange 换 accessToken/refreshToken（实测协议，登录工具同款）。
 // 因为回调地址就是本机回环、授权码由 AgentHub 自己消费，所以不依赖官方客户端在场。
 
 /** LobsterAI 配置（headers.json.lobster） */
@@ -3084,7 +3084,7 @@ async function importModelScopeToken(token) {
  *   魔搭把端点分成两族且**严格互斥**（实测穷尽四条路径）：
  *     「OAuth 可用族」推理 /v1/chat + 魔粒 /openapi/v1/*
  *     「仅 Cookie/ms- 可用族」点赞 /api/v1/mcpServers/* + 令牌管理 /api/v1/users/tokens*
- *   且 ms- 令牌能点赞但不触发 daily_active（参考项目实测注释：只有 Web 会话才触发日活）。
+ *   且 ms- 令牌能点赞但不触发 daily_active（实测注释：只有 Web 会话才触发日活）。
  *   ⇒ **Cookie 是唯一同时覆盖「点赞」与「日活」的凭据**。
  *   授权窗用独立 partition，登录后 Cookie 就在该 partition 的 jar 里——直接读走即可，
  *   用户仍然只需点一次「授权」，体验与其它渠道一致。

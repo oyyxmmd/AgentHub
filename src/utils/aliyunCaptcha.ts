@@ -1,6 +1,6 @@
-// 阿里云无痕验证（滑块）求解器 —— 从 AutoClaw 客户端渲染层逐条移植
-// （参照 agent2api ui/aliyun-captcha.js 的 solve 分支；静默铸造 mintTraceless 为
-//   参照项目 ZCode 领取专用，AgentHub 无此场景，未移植）。
+// 阿里云无痕验证（滑块）求解器 —— 对齐 AutoClaw 客户端渲染层
+// （ui/aliyun-captcha 的 solve 分支；静默铸造 mintTraceless 为
+//   该渠道领取专用，AgentHub 无此场景，未启用）。
 //
 // 用途：AutoClaw 国际版网页登录前强制过一道风控滑块，拿到不透明 verifyParam
 // 才能向上游换授权地址。SDK 从 o.alicdn.com 加载——主窗口 CSP 必须放行（issue #105：
@@ -308,7 +308,7 @@ async function waitForWarmup() {
  * 走一次完整验证码：初始化 → 预热 → 弹滑块 → 用户拖 → 拿串交给调用方。
  * request(verifyParam)：调用方注入的「用这个串去干那件事」，resolve 出来的值原样成为
  * solve() 的返回值。120 秒超时只包「拖滑块 + 那一次请求」——等登录回调这类长流程
- * 必须放在 solve() 返回之后，否则会被验证码超时误杀（三方状态错乱，参照实现实证的坑）。
+ * 必须放在 solve() 返回之后，否则会被验证码超时误杀（三方状态错乱，实测的坑）。
  */
 export async function solveCaptcha(config: CaptchaConfig, request: (verifyParam: string) => Promise<unknown>): Promise<unknown> {
   await initializeAliyunCaptcha(config);

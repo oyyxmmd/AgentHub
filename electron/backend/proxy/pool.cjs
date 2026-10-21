@@ -1,4 +1,4 @@
-// 反代网关 · 号池服务（方案 §6.10）：账号状态机 + 池内调度 + 错误分类冷却
+// 反代网关 · 号池服务：账号状态机 + 池内调度 + 错误分类冷却
 // 状态机五态：online / cooling / exhausted / relogin / disabled；调度只挑 online
 "use strict";
 const store = require("./store.cjs");
@@ -99,7 +99,7 @@ function zeroBalanceUsable(channel) {
  *  ② 余额到期自动切换——到期时间已过的账号余额视为失效，标记并跳过；
  *     搭配默认 expire_first 策略：快到期账号永远排在最前优先消耗（到期前榨干），过期即自动切走。
  * 被跳过的账号等下次额度刷新拿到新余额/新到期时间后自动复活（credits.cjs）。
- * maxInFlight > 0 时在途数已达上限的账号不参与候选（参考项目租约语义），
+ * maxInFlight > 0 时在途数已达上限的账号不参与候选（租约语义），
  * 全部忙时降级取在途最小者（不过载拒绝）；100ms 内刚选中过的账号让位给其他候选（防惊群）。
  */
 function pickAccount(channel, strategy, excludeIds, maxInFlight, pinnedId) {
@@ -117,14 +117,16 @@ function pickAccount(channel, strategy, excludeIds, maxInFlight, pinnedId) {
       continue;
     }
     if (a.expiresAt > 0 && a.expiresAt <= now) {
-      // ② 余额已到期：标记失效（靠额度刷新复活），自动切换下一账号
-      store.updateAccount(a.id, { status: "exhausted", coolUntil: 0, coolReason: "余额已到期，已自动切换" });
+      // ② 余额已到期：标记失效（靠额度刷新复活），自动切换下一账号。
+      // coolUntil 不能写 0：effectiveStatus 的派生复活判据要求 cool_until 非 0，写 0 会让
+      // 这类 exhausted 永远失去「次日 04:00 复活」兜底，只剩余额刷新一条独木桥（#152）
+      store.updateAccount(a.id, { status: "exhausted", coolUntil: nextDay4AM(), coolReason: "余额已到期，已自动切换" });
       continue;
     }
     candidates.push(a);
   }
   if (!candidates.length) return null;
-  // 并发租约：在途数达上限的账号让位；全忙时取在途最小者（不过载拒绝，参考项目语义）
+  // 并发租约：在途数达上限的账号让位；全忙时取在途最小者（不过载拒绝）
   let pool2 = candidates;
   const limit = Number(maxInFlight) > 0 ? Number(maxInFlight) : 0;
   if (limit) {
@@ -170,7 +172,7 @@ function pickAccount(channel, strategy, excludeIds, maxInFlight, pinnedId) {
   return picked;
 }
 
-/** 次日 04:00（402 积分耗尽的长冷却点，对齐参考项目 HardCredit） */
+/** 次日 04:00（402 积分耗尽的长冷却点，对齐 HardCredit） */
 function nextDay4AM() {
   const d = new Date();
   d.setHours(4, 0, 0, 0);
@@ -179,7 +181,7 @@ function nextDay4AM() {
 }
 
 // ===== 模型级负缓存（账号×模型，内存态 + 落库持久化）=====
-// 参考项目实证：6004 = 模型级限流（换模型即豁免）、11102 = 该账号不支持此模型。
+// 实测：6004 = 模型级限流（换模型即豁免）、11102 = 该账号不支持此模型。
 // 这两类错误罚"账号×模型"组合而不是整个账号——账号对其他模型仍可用。
 // 6004 对齐墙钟可达数小时、11102 封顶 24h，纯内存态重启即丢 → 每次重启都白撞一次
 // 上游 429 才能重建负缓存（2026-09-21 实测），故写穿 model_cooldowns 表
@@ -203,7 +205,7 @@ function ensureModelCoolHydrated() {
 }
 
 /** 模型级冷却/负缓存：untilMs 之后自动豁免；定期清扫防内存膨胀。
- *  opts.backoff = 11102 指数退避（参考项目 BlockModelBackoff）：命中次数递增，base→cap 封顶 */
+ *  opts.backoff = 11102 指数退避（BlockModelBackoff）：命中次数递增，base→cap 封顶 */
 function coolAccountModel(accId, model, untilMs, reason, opts) {
   ensureModelCoolHydrated();
   if (modelCool.size > 20000) {
@@ -240,7 +242,7 @@ function isModelCooled(accId, model) {
   return true;
 }
 
-/** 错误分类冷却（方案 §6.10）：402→exhausted 至次日 04:00；429→60s；5xx→10min；401→relogin */
+/** 错误分类冷却：402→exhausted 至次日 04:00；429→60s；5xx→10min；401→relogin */
 function coolAccount(id, kind, detail) {
   const now = Date.now();
   switch (kind) {
@@ -277,7 +279,7 @@ function coolAccountMs(id, untilMs, detail) {
 const inFlight = new Map(); // accId → 在途请求数
 const lastPickAt = new Map(); // accId → 上次被 pickAccount 选中的时间戳
 const softStreaks = new Map(); // accId → 连续 429（无明示重置时间）次数
-const sessionDeadFails = new Map(); // accId → 连续凭证失效次数（参考项目：3 次才判废）
+const sessionDeadFails = new Map(); // accId → 连续凭证失效次数（3 次才判废）
 const serverFails = new Map(); // accId → 连续 5xx/网络失败次数（熔断器：3 次起 30m 指数封顶 6h）
 
 function acquireAccount(id) { inFlight.set(id, (inFlight.get(id) || 0) + 1); }
@@ -290,21 +292,21 @@ function inFlightCount(id) {
   return inFlight.get(id) || 0;
 }
 
-/** 429 无明示重置时间时的有界指数退避：60s 基数翻倍封顶 2h（参考项目 CooldownSoftRate 语义） */
+/** 429 无明示重置时间时的有界指数退避：60s 基数翻倍封顶 2h（CooldownSoftRate 语义） */
 function softBackoffMs(id) {
   const n = softStreaks.get(id) || 0;
   softStreaks.set(id, n + 1);
   return Math.min(60000 * Math.pow(2, Math.min(n, 7)), 2 * 3600000);
 }
 
-/** 凭证失效计数：返回是否已达判废阈值（连续 3 次，参考项目 sessionDeadThreshold=3） */
+/** 凭证失效计数：返回是否已达判废阈值（连续 3 次，sessionDeadThreshold=3） */
 function noteSessionDead(id) {
   const n = (sessionDeadFails.get(id) || 0) + 1;
   sessionDeadFails.set(id, n);
   return n >= 3;
 }
 
-/** 5xx/网络熔断（参考项目 breaker：连续 3 次起 30m 指数封顶 6h）。
+/** 5xx/网络熔断（breaker：连续 3 次起 30m 指数封顶 6h）。
  *  返回冷却截止时刻；未达触发阈值返回 0（调用方走基础冷却） */
 function noteServerError(id) {
   const n = (serverFails.get(id) || 0) + 1;
@@ -313,7 +315,7 @@ function noteServerError(id) {
   return Date.now() + Math.min(30 * 60000 * Math.pow(2, Math.min(n - 3, 3)), 6 * 3600000);
 }
 
-/** 成功收尾：清软限流 streak / 凭证失效计数 / 熔断计数 / 该账号该模型的负缓存（参考项目 NoteSuccess 语义） */
+/** 成功收尾：清软限流 streak / 凭证失效计数 / 熔断计数 / 该账号该模型的负缓存（NoteSuccess 语义） */
 function noteSuccess(id, model) {
   if (id == null) return;
   softStreaks.delete(id);

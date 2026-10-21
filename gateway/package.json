@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "express": "^4.21.2",
-    "chokidar": "^3.6.0"
+    "chokidar": "^3.6.0",
+    "undici": "^8.12.3"
   },
   "engines": {
     "node": ">=22.5"

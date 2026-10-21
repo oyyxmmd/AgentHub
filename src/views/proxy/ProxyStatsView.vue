@@ -28,6 +28,10 @@ type Preset = (typeof PRESETS)[number]["key"];
 const DAY_MS = 86400000;
 const preset = ref<Preset>("7d");
 const customRange = ref<[string, string] | null>(null);
+// 响应式时间锚：Date.now() 不是响应式依赖，直接在 range computed 里取会让区间冻结在
+// 页面挂载时刻——「今天」档的 to 停在那一刻，之后的新请求 ts > to 永远查不到（点刷新
+// 也没用，重启组件重建才好）。每次刷新前先推进 nowTick，让区间跟着当下时刻走。
+const nowTick = ref(Date.now());
 
 function dayStart(ts: number): number {
   const d = new Date(ts);
@@ -40,9 +44,9 @@ function dateInput(ts: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-/** 当前生效区间（毫秒闭区间）：档位或自定义日期变化时自动重算 */
+/** 当前生效区间（毫秒闭区间）：档位、自定义日期或时间锚变化时自动重算 */
 const range = computed<{ from: number; to: number }>(() => {
-  const now = Date.now();
+  const now = nowTick.value;
   if (preset.value === "custom") {
     const c = customRange.value;
     if (c && c[0] && c[1]) {
@@ -98,7 +102,7 @@ const detail = ref<ProxyStatsDetail | null>(null);
 const page = ref(1);
 const pageSize = 15;
 const err = ref("");
-const filters = reactive({ key: "", model: "", channel: "", status: "" });
+const filters = reactive({key: "", model: "", channel: "", status: ""}); // key 存 Key 的 keyId（明细筛选是下拉精确选择）
 
 const s = computed(() => ov.value?.summary);
 const successCls = computed(() => ((s.value?.successRate ?? 100) < 99 ? "err" : "acc"));
@@ -148,7 +152,7 @@ async function loadDetail() {
       to,
       page: page.value,
       pageSize,
-      key: filters.key || undefined,
+      keyId: filters.key || undefined,
       model: filters.model || undefined,
       channel: filters.channel || undefined,
       status: filters.status || undefined,
@@ -159,6 +163,7 @@ async function loadDetail() {
 }
 
 async function reload() {
+  nowTick.value = Date.now(); // 先推进时间锚再取数：手动刷新要看到「此刻」为止的数据
   await Promise.all([refresh(), loadDetail()]);
 }
 
@@ -182,9 +187,10 @@ function resetFilters() {
   filters.status = "";
   applyFilter();
 }
-/** 从各 Key 用量表下钻：把 Key 名灌进明细搜索框并滚过去 */
+
+/** 从各 Key 用量表下钻：把 Key 的 keyId 灌进明细筛选下拉并滚过去 */
 function drillToKey(k: ProxyStatsKeyRow) {
-  filters.key = k.name || k.keyId;
+  filters.key = k.keyId;
   filters.channel = "";
   filters.status = "";
   page.value = 1;
@@ -223,20 +229,25 @@ async function doCleanup() {
 /** 本页是否处于前台：页面经 v-show 保活，事件刷新只在激活时跑，切走即停 */
 const active = computed(() => app.activeModule === "proxy" && app.activePage === "stats");
 
-// 事件合流：概览 + 明细一起拉，1s 窗口合并防重入
-const scheduleRefresh = coalesceAsync(() => Promise.all([refresh(), loadDetail()]), 1000);
+// 事件合流：概览 + 明细一起拉，1s 窗口合并防重入；先推进时间锚，让 range 拿到当下区间
+const scheduleRefresh = coalesceAsync(() => {
+  nowTick.value = Date.now();
+  return Promise.all([refresh(), loadDetail()]);
+}, 1000);
 
-// 区间变化：回到第 1 页并整体重拉
-watch(range, () => {
+// 档位/自定义日期变化：回到第 1 页并整体重拉。监听源头而不是 range 本身——
+// nowTick 推进也会重算 range，若 watch(range) 会造成「刷新→重算→再刷新」的循环
+watch([preset, customRange], () => {
   page.value = 1;
   scheduleRefresh();
 });
 // 文本搜索防抖 300ms（每次敲键都打一次 IPC 太浪费）
-watch([() => filters.key, () => filters.model], () => {
+watch(() => filters.model, () => {
   window.clearTimeout(searchTimer);
   searchTimer = window.setTimeout(applyFilter, 300);
 });
-watch([() => filters.channel, () => filters.status], applyFilter);
+// 下拉筛选（Key / 渠道 / 状态）都是点选，选中立即刷新
+watch([() => filters.key, () => filters.channel, () => filters.status], applyFilter);
 
 watch(active, (on) => {
   if (on) scheduleRefresh();
@@ -352,14 +363,14 @@ onUnmounted(() => {
           <span class="right">TOP 10</span>
         </div>
         <div class="tbl-wrap">
-          <table class="tbl">
+          <table class="tbl tbl-c">
             <tbody>
               <tr>
-                <th style="text-align: left">{{ dimLabel }}</th>
-                <th style="text-align: left; width: 32%">占比（{{ topBy === "tokens" ? "Token" : "请求" }}）</th>
+                <th>{{ dimLabel }}</th>
+                <th style="width: 32%">占比（{{ topBy === "tokens" ? "Token" : "请求" }}）</th>
                 <th>请求</th><th>请求 Tok</th><th>响应 Tok</th><th>总 Tok</th><th>成功率</th><th>平均 TTFT</th>
               </tr>
-              <tr v-for="r in topRows" :key="r.name">
+              <tr v-for="r in topRows" :key="r.id">
                 <td>{{ r.label }}</td>
                 <td>
                   <div class="ratio">
@@ -386,10 +397,18 @@ onUnmounted(() => {
       <div class="card anim" style="margin-top: 12px">
         <div class="card-title">各 Key 用量 <span class="right">按总 Token 倒序 · 共 {{ keyRows.length }} 把</span></div>
         <div class="tbl-wrap">
-          <table class="tbl">
+          <table class="tbl tbl-c">
             <tbody>
               <tr>
-                <th style="text-align: left">Key</th><th>请求</th><th>请求 Tok</th><th>响应 Tok</th><th>总 Tok</th><th>成功率</th><th>平均 TTFT</th><th>最近使用</th><th></th>
+                <th>Key</th>
+                <th>请求</th>
+                <th>请求 Tok</th>
+                <th>响应 Tok</th>
+                <th>总 Tok</th>
+                <th>成功率</th>
+                <th>平均 TTFT</th>
+                <th>最近使用</th>
+                <th></th>
               </tr>
               <tr v-for="k in keyRows" :key="k.keyId">
                 <td>{{ k.name || "（未命名）" }}</td>
@@ -410,15 +429,20 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 请求明细：Key / 模型模糊搜索 + 渠道 / 状态过滤 + 筛选汇总 -->
+      <!-- 请求明细：Key 下拉选择 + 模型模糊搜索 + 渠道 / 状态过滤 + 筛选汇总 -->
       <div ref="detailRef" class="card anim" style="margin-top: 12px">
         <div class="card-title">
           请求明细
           <span class="right">{{ fmtInt(detail?.total || 0) }} 条 · 第 {{ page }}/{{ totalPages }} 页</span>
         </div>
         <div class="detail-filters">
-          <el-input v-model="filters.key" placeholder="搜索 Key 名 / ID" clearable class="f-input" popper-class="glass-popper" />
-          <el-input v-model="filters.model" placeholder="搜索模型" clearable class="f-input" popper-class="glass-popper" />
+          <el-select v-model="filters.key" placeholder="全部 Key" clearable class="f-el-select"
+                     popper-class="glass-popper">
+            <el-option value="" label="全部 Key"/>
+            <el-option v-for="k in keyRows" :key="k.keyId" :value="k.keyId" :label="k.name || k.keyId"/>
+          </el-select>
+          <el-input v-model="filters.model" placeholder="搜索模型" clearable class="f-el-input"
+                    popper-class="glass-popper"/>
           <el-select v-model="filters.channel" placeholder="全部渠道" clearable class="f-el-select" popper-class="glass-popper">
             <el-option value="" label="全部渠道" />
             <el-option v-for="c in channelOptions" :key="c.id" :value="c.id" :label="c.label" />
@@ -434,7 +458,7 @@ onUnmounted(() => {
           <span class="detail-agg">{{ detail?.agg ? `命中 ${fmtInt(detail.agg.req)} 条 · 输入 ${fmtK(detail.agg.promptTokens)} · 输出 ${fmtK(detail.agg.completionTokens)} · 合计 ${fmtK(detail.agg.tokens)}` : "" }}</span>
         </div>
         <div class="tbl-wrap">
-          <table class="tbl">
+          <table class="tbl tbl-c">
             <tbody>
               <tr><th>时间</th><th>模型</th><th>渠道</th><th>KEY</th><th>账号</th><th>状态</th><th>请求 Tok</th><th>缓存命中</th><th>响应 Tok</th><th>TTFT</th><th>耗时</th></tr>
               <tr v-for="r in detail?.rows || []" :key="r.id">
@@ -556,13 +580,13 @@ onUnmounted(() => {
   gap: 8px;
   margin-bottom: 10px;
 }
-.detail-filters :deep(.f-input) {
+.detail-filters :deep(.f-el-input) {
   width: 180px;
 }
 .detail-filters :deep(.f-el-select) {
   width: 140px;
 }
-.detail-filters :deep(.f-input .el-input__wrapper),
+.detail-filters :deep(.f-el-input .el-input__wrapper),
 .detail-filters :deep(.f-el-select .el-select__wrapper) {
   min-height: 30px;
   font-size: 12.5px;
@@ -572,6 +596,12 @@ onUnmounted(() => {
   font-size: 11.5px;
   color: var(--text-3);
   font-family: var(--font-mono);
+}
+
+/* 三个表（TOP / 各 Key / 明细）字段值居中；th 全局 .tbl 已居中，这里覆盖默认左对齐的 td */
+.tbl-c th,
+.tbl-c td {
+  text-align: center;
 }
 
 /* 成功率低于阈值时着色（TOP / Key 表共用） */

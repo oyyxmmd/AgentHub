@@ -447,11 +447,13 @@ const PROXY_TREND = Array.from({ length: 7 }, (_, i) => {
 });
 
 // ===== 预览用：区间化统计总览（与真实后端契约一致，见《反代网关-用量统计增强方案.md》§4.2） =====
-/** 富字段排行行：由「请求数 + 总 Token」派生出输入/输出/缓存与成功率，形状与后端 statsTopRich 对齐 */
-function mockTopRow(name: string, req: number, tokens: number) {
+/** 富字段排行行：由「请求数 + 总 Token」派生出输入/输出/缓存与成功率，形状与后端 statsTopRich 对齐。
+ *  id 是分组身份：channel/model 就是值本身，key/account 是 key_id/account_id（名字可改、可能撞名，
+ *  列表 v-for 绑的是它），所以这里允许单独指定，缺省才回落成 name */
+function mockTopRow(name: string, req: number, tokens: number, id = name) {
   const ok = Math.round(req * 0.99);
   return {
-    name, req, ok, err: req - ok, successRate: req ? Math.round((ok / req) * 1000) / 10 : 0,
+    id, name, req, ok, err: req - ok, successRate: req ? Math.round((ok / req) * 1000) / 10 : 0,
     promptTokens: Math.round(tokens * 0.78), completionTokens: Math.round(tokens * 0.22),
     cacheReadTokens: Math.round(tokens * 0.28), cacheCreationTokens: 0, tokens,
     ttftAvg: 820, latencyAvg: 1900,
@@ -488,13 +490,13 @@ function mockProxyOverview(args?: { from?: number; to?: number; granularity?: st
     tops: {
       channel: [mockTopRow("trae", 745, 182000), mockTopRow("workbuddy", 421, 96000), mockTopRow("workbuddy_ai", 118, 34400)],
       model: [mockTopRow("deepseek-v4-flash", 512, 120000), mockTopRow("glm-4.6", 233, 62000), mockTopRow("claude-sonnet-4.5", 301, 88000)],
-      key: [mockTopRow("本地主 Key", 612, 148200), mockTopRow("Trae 专用", 403, 96400), mockTopRow("WorkBuddy 专用", 269, 67800)],
+      key: [mockTopRow("本地主 Key", 612, 148200, "k1"), mockTopRow("Trae 专用", 403, 96400, "k2"), mockTopRow("WorkBuddy 专用", 269, 67800, "k3")],
       account: [mockTopRow("主账号 · 沐", 560, 132000), mockTopRow("工作号", 421, 96000), mockTopRow("备用号", 185, 50000)],
     },
     keys: [
-      { keyId: "k1", lastTs: NOW - 60000, ...mockTopRow("本地主 Key", 612, 148200) },
-      { keyId: "k2", lastTs: NOW - 89000, ...mockTopRow("Trae 专用", 403, 96400) },
-      { keyId: "k3", lastTs: NOW - 140000, ...mockTopRow("WorkBuddy 专用", 269, 67800) },
+      { keyId: "k1", lastTs: NOW - 60000, ...mockTopRow("本地主 Key", 612, 148200, "k1") },
+      { keyId: "k2", lastTs: NOW - 89000, ...mockTopRow("Trae 专用", 403, 96400, "k2") },
+      { keyId: "k3", lastTs: NOW - 140000, ...mockTopRow("WorkBuddy 专用", 269, 67800, "k3") },
     ],
     status: [
       { name: "成功 2xx", key: "ok", value: 1276 },
@@ -526,8 +528,38 @@ const PROXY_MODELS = [
   { id: "cline-pass/glm-5.3", object: "model", created: 0, owned_by: "cline_pass", sources: ["cline_pass"], name: "GLM-5.3（ClinePass）", rate: null, capabilities: { images: true, reasoning: true, tools: true }, contextLength: 200000, maxOutputTokens: 0, enabled: true, override: "", fallback: "" },
 ];
 
-const PROXY_RULES = [
-  { file: "model_map.json", desc: "Trae 模型映射（显示名 → config_name/model_name）", size: 642, mtimeMs: NOW - 86400000, ok: true, error: "" },
+/** 网络代理（出口池）预览数据：结构对齐后端 netproxy.json，增删改只在内存里生效 */
+const NETPROXY_MOCK: {
+  mode: "off" | "fixed" | "rotate";
+  fixedId: string;
+  settings: { testUrl: string; timeoutMs: number; defaultTestUrl: string; defaultTimeoutMs: number };
+  items: {
+    id: string; name: string; protocol: "http" | "socks5"; host: string; port: number;
+    username: string; hasPassword: boolean; enabled: boolean;
+    lastTest: { success: boolean; status: number | null; ip: string; durationMs: number; error: string; at: number } | null;
+    createdAt: number; updatedAt: number;
+  }[];
+} = {
+  mode: "off",
+  fixedId: "",
+  settings: { testUrl: "", timeoutMs: 15000, defaultTestUrl: "https://api.deepseek.com/", defaultTimeoutMs: 15000 },
+  items: [
+    {
+      id: "np-demo-1", name: "本机 Clash（混合端口）", protocol: "http", host: "127.0.0.1", port: 7890,
+      username: "", hasPassword: false, enabled: true,
+      lastTest: { success: true, status: 200, ip: "23.106.44.177", durationMs: 318, error: "", at: NOW - 600000 },
+      createdAt: NOW - 86400000, updatedAt: NOW - 600000,
+    },
+    {
+      id: "np-demo-2", name: "公司出口（需认证）", protocol: "socks5", host: "10.0.0.8", port: 1080,
+      username: "demo", hasPassword: true, enabled: false,
+      lastTest: { success: false, status: null, ip: "", durationMs: 15012, error: "连接超时（15 秒）", at: NOW - 3600000 },
+      createdAt: NOW - 172800000, updatedAt: NOW - 3600000,
+    },
+  ],
+};
+
+const PROXY_RULES = [  { file: "model_map.json", desc: "Trae 模型映射（显示名 → config_name/model_name）", size: 642, mtimeMs: NOW - 86400000, ok: true, error: "" },
   { file: "wb_models.json", desc: "WorkBuddy 双区模型目录（兜底，catalog.json 优先）", size: 318, mtimeMs: NOW - 86400000, ok: true, error: "" },
   { file: "catalog.json", desc: "模型权威目录（拉取模型写回：倍率/能力/上下文，可手编）", size: 2048, mtimeMs: NOW - 3600000, ok: true, error: "" },
   { file: "wb_template_map.json", desc: "WorkBuddy 审核模板最小改写表", size: 274, mtimeMs: NOW - 2 * 86400000, ok: true, error: "" },
@@ -550,7 +582,7 @@ const MOCK_CFG: Record<string, unknown> = {
   import: { dryRunFirst: true, batchSize: 200, maxBatchBytes: 8388608, sensitiveSkip: true, md: { observationMarkers: true, extractTags: true }, sources: [] },
   privacy: { redact: false, pause: false, localOnlyProjects: [] },
   sync: { enabled: true, auto: true, intervalMin: 60, packSizeLimitMB: 50, excludeIndex: true },
-  ui: { pageSize: 50, defaultTab: "dashboard", tabs: ["dashboard", "browse", "projects", "auto", "sync"], realtimeRefresh: true },
+  ui: { pageSize: 50, defaultTab: "dashboard", tabs: ["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync"], realtimeRefresh: true },
 };
 
 /** 点路径写进 mock 配置树（中间层级缺失就补对象）：与前端 save(entries) 的点路径口径一致 */
@@ -756,7 +788,7 @@ export const mock = {
             "sync.excludeIndex": { type: "boolean", def: true, label: "索引库不入同步包", group: "同步", hot: true },
             "ui.pageSize": { type: "number", def: 50, min: 10, max: 500, label: "列表每页条数", group: "界面", hot: true },
             "ui.defaultTab": { type: "enum", def: "dashboard", options: ["dashboard", "browse", "projects", "profile", "agents", "index", "auto", "import", "sync"], label: "默认页签", group: "界面", hot: true },
-            "ui.tabs": { type: "multiselect", options: ["dashboard", "browse", "projects", "profile", "agents", "index", "auto", "import", "sync"], def: ["dashboard", "browse", "projects", "auto", "sync"], label: "显示的页签", group: "界面", hot: true },
+            "ui.tabs": { type: "multiselect", options: ["dashboard", "browse", "projects", "profile", "agents", "index", "auto", "import", "sync"], def: ["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync"], label: "显示的页签", group: "界面", hot: true },
             "ui.realtimeRefresh": { type: "boolean", def: true, label: "浏览页实时刷新", group: "界面", hot: true },
           },
           root: "C:\\Users\\demo\\AgentHub\\memory",
@@ -1292,6 +1324,31 @@ export const mock = {
       case "proxy_oauth_cancel":
       case "proxy_oauth_submit_callback":
         return { ok: true };
+      // 明文导出（预览）：形状与主进程一致，凭据是占位明文
+      case "proxy_account_export_plain":
+        return {
+          ok: true,
+          exportedAt: NOW,
+          missing: [],
+          accounts: [
+            {
+              channel: "trae",
+              uid: "demo-uid-0001",
+              name: "演示账号",
+              note: "",
+              token: "demo-access-token",
+              refreshToken: "demo-refresh-token",
+              tokenExp: NOW + 3600000,
+              expiresAt: 0,
+              credits: 1000,
+              status: "online",
+              source: "paste",
+              createdAt: NOW,
+              updatedAt: NOW,
+              meta: {},
+            },
+          ],
+        };
       case "proxy_pool":
         return (JSON.parse(JSON.stringify(PROXY_POOL)) as (typeof PROXY_POOL[number])[]).map((c) => ({
           ...c,
@@ -1537,12 +1594,18 @@ export const mock = {
           { name: "workbuddy", req: 421, tokens: 96000 },
         ];
       case "proxy_stats_detail": {
-        // 与后端同口径：Key / 模型模糊搜索 + 渠道 / 状态过滤，并回筛选命中的 token 汇总
-        const a = (args || {}) as { key?: string; model?: string; channel?: string; status?: string; page?: number; pageSize?: number };
-        const kw = String(a.key || "").toLowerCase();
+        // 与后端同口径：Key 精确（key_id = ?）+ 模型模糊 + 渠道 / 状态过滤，并回筛选命中的 token 汇总
+        const a = (args || {}) as {
+          keyId?: string;
+          model?: string;
+          channel?: string;
+          status?: string;
+          page?: number;
+          pageSize?: number
+        };
         const mw = String(a.model || "").toLowerCase();
         let rows = PROXY_USAGE.filter((r) => {
-          if (kw && !(r.keyName || "").toLowerCase().includes(kw) && !(r.keyId || "").toLowerCase().includes(kw)) return false;
+          if (a.keyId && r.keyId !== a.keyId) return false;
           if (mw && !(r.model || "").toLowerCase().includes(mw)) return false;
           if (a.channel && r.channel !== a.channel) return false;
           if (a.status === "ok" && !(r.status >= 200 && r.status < 300)) return false;
@@ -1605,6 +1668,70 @@ export const mock = {
         return { ok: true };
       case "proxy_vault_status":
         return { encrypted: true, driver: "node:sqlite", dataDir: "(浏览器预览)" };
+      case "proxy_netproxy_list":
+        return JSON.parse(JSON.stringify(NETPROXY_MOCK));
+      case "proxy_netproxy_save": {
+        const d = args || {};
+        const port = Number(d.port);
+        if (!String(d.name || "").trim()) throw new Error("请填写代理名称");
+        if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("代理端口必须是 1-65535 的整数");
+        if (d.id) {
+          const hit = NETPROXY_MOCK.items.find((i) => i.id === d.id);
+          if (!hit) throw new Error("代理不存在（可能已被删除）");
+          Object.assign(hit, {
+            name: String(d.name), protocol: d.protocol === "socks5" ? "socks5" : "http",
+            host: String(d.host || ""), port, username: String(d.username || ""),
+            hasPassword: d.clearPassword ? false : hit.hasPassword || !!d.password,
+            enabled: d.enabled !== false, updatedAt: Date.now(),
+          });
+          return { ok: true, item: JSON.parse(JSON.stringify(hit)) };
+        }
+        const item = {
+          id: `np-demo-${Date.now()}`, name: String(d.name), protocol: (d.protocol === "socks5" ? "socks5" : "http") as "http" | "socks5",
+          host: String(d.host || ""), port, username: String(d.username || ""), hasPassword: !!d.password,
+          enabled: d.enabled !== false, lastTest: null, createdAt: Date.now(), updatedAt: Date.now(),
+        };
+        NETPROXY_MOCK.items.push(item);
+        return { ok: true, item: JSON.parse(JSON.stringify(item)) };
+      }
+      case "proxy_netproxy_remove": {
+        const idx = NETPROXY_MOCK.items.findIndex((i) => i.id === args?.id);
+        if (idx < 0) throw new Error("代理不存在（可能已被删除）");
+        NETPROXY_MOCK.items.splice(idx, 1);
+        if (NETPROXY_MOCK.fixedId === args?.id) {
+          NETPROXY_MOCK.fixedId = "";
+          if (NETPROXY_MOCK.mode === "fixed") NETPROXY_MOCK.mode = "off";
+        }
+        return { ok: true };
+      }
+      case "proxy_netproxy_toggle": {
+        const hit = NETPROXY_MOCK.items.find((i) => i.id === args?.id);
+        if (!hit) throw new Error("代理不存在（可能已被删除）");
+        hit.enabled = args?.enabled !== false;
+        hit.updatedAt = Date.now();
+        return { ok: true, item: JSON.parse(JSON.stringify(hit)) };
+      }
+      case "proxy_netproxy_test": {
+        const target = args?.id ? NETPROXY_MOCK.items.find((i) => i.id === args.id) : args?.draft;
+        if (!target) throw new Error("缺少要测试的代理");
+        const result = {
+          ok: true, success: true, status: 200, ip: "23.106.44.177",
+          durationMs: 260 + Math.round(Math.random() * 180), error: "",
+        };
+        if (args?.id) {
+          const hit = NETPROXY_MOCK.items.find((i) => i.id === args.id);
+          if (hit) hit.lastTest = { ...result, at: Date.now() };
+        }
+        return result;
+      }
+      case "proxy_netproxy_settings": {
+        if (args?.mode) NETPROXY_MOCK.mode = args.mode as "off" | "fixed" | "rotate";
+        if (args?.fixedId != null) NETPROXY_MOCK.fixedId = String(args.fixedId);
+        if (args?.mode === "fixed" && !NETPROXY_MOCK.fixedId) throw new Error("选择「固定出口」时必须指定一条出口");
+        if (args?.testUrl != null) NETPROXY_MOCK.settings.testUrl = String(args.testUrl);
+        if (args?.timeoutMs != null) NETPROXY_MOCK.settings.timeoutMs = Math.max(1000, Math.min(120000, Number(args.timeoutMs) || 15000));
+        return JSON.parse(JSON.stringify(NETPROXY_MOCK));
+      }
       case "webdav_shared_get":
         return {
           type: "webdav",

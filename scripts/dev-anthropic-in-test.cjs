@@ -552,7 +552,7 @@ const MSG = (extra) => Object.assign({ model: MODEL, max_tokens: 512, stream: tr
     ok(disabled.res.status === 400 && /已被禁用/.test(disabled.res.text), "⑪ 模型被禁用时也是 Messages 形状", [disabled.res.status, disabled.res.text.slice(0, 160)]);
 
     // 429 的 error.type：Anthropic 的枚举里有独立的 rate_limit_error，客户端按它决定「退避重试」
-    // 还是「报网关故障」。按状态码查表而不是照抄调度侧传来的 OpenAI 形 type 就是为了这个。
+    // 还是「报网关故障」。按状态码查表而不是直接沿用调度侧传来的 OpenAI 形 type 就是为了这个。
     TODAY_REQ = 99;
     const quota = await run({ picks: [], scripts: [[]], body: MSG(), headers: apiKey(quotaKey.secret) });
     TODAY_REQ = 0;

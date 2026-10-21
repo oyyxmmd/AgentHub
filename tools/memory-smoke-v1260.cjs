@@ -1,6 +1,6 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
@@ -137,10 +137,10 @@ async function main() {
   console.log("[f] ui.tabs 配置键");
   const tabsDef = SCHEMA["ui.tabs"];
   check("ui.tabs 存在且为 multiselect", !!tabsDef && tabsDef.type === "multiselect", JSON.stringify(tabsDef && tabsDef.type));
-  check("ui.tabs 默认 5 项且含 dashboard/browse", Array.isArray(tabsDef.def) && tabsDef.def.length === 5 && tabsDef.def.includes("dashboard") && tabsDef.def.includes("browse"), JSON.stringify(tabsDef.def));
+  check("ui.tabs 默认 8 项且含 dashboard/browse", Array.isArray(tabsDef.def) && tabsDef.def.length === 8 && tabsDef.def.includes("dashboard") && tabsDef.def.includes("browse"), JSON.stringify(tabsDef.def));
   check("ui.tabs options 覆盖 9 个页签", Array.isArray(tabsDef.options) && tabsDef.options.length === 9 && tabsDef.options.includes("profile") && tabsDef.options.includes("sync"), JSON.stringify(tabsDef.options));
   const defaults = flattenDefaults();
-  check("flattenDefaults 含 ui.tabs 默认值", Array.isArray(defaults["ui.tabs"]) && defaults["ui.tabs"].length === 5);
+  check("flattenDefaults 含 ui.tabs 默认值", Array.isArray(defaults["ui.tabs"]) && defaults["ui.tabs"].length === 8);
 
   console.log("[g] import.maxBatchBytes 默认值与边界");
   const mb = SCHEMA["import.maxBatchBytes"];

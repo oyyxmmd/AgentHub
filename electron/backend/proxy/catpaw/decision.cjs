@@ -1,4 +1,4 @@
-// CatPaw 轮次判定：三条规则决定这次请求怎么走上游（移植来源：参照实现 catpaw/decision.rs）。
+// CatPaw 轮次判定：三条规则决定这次请求怎么走上游（协议依据：官方客户端实测）。
 //
 // 三规则的顺序不可交换：
 //   1. 历史末尾是 assistant(tool_calls) + 全部 tool 结果，且 tool_call_id 命中注册表
@@ -63,7 +63,7 @@ function pendingCallIds(messages) {
 
 /** 工具续接要提交的那条 tool 消息。
  *
- *  与参照实现的一处差异：原实现用会话里存的 toolCalls 回填 toolName，这里改成从**本次请求历史**里
+ *  与上游的一处差异：上游用会话里存的 toolCalls 回填 toolName，这里改成从**本次请求历史**里
  *  那条 assistant 消息的 tool_calls 取——两者是同一批数据（会话里那份就是上一轮上游返回、被客户端回显的），
  *  而本次请求的值不会过期。回填是必需的：toolName 进指纹，缺了会让客户端下一轮回显的 tool 消息
  *  与注册表指纹对不上，误判「历史被改写」而全量重建 */
@@ -98,7 +98,7 @@ function continuationMessage(rawMessages, session) {
   return { ...message, content: rewritten };
 }
 
-/** 轮次判定（参照实现 streamRequest 开头那一段，**顺序照抄**）。
+/** 轮次判定（streamRequest 开头那一段，**顺序严格对齐**）。
  *  persistent = 本次请求占用了长会话（无状态辅助请求 / 并发冲突走原判定但关掉长会话映射那一读） */
 function decide({ rawMessages, sessionId, modelType, accountId, prepared, persistent }) {
   // ── 规则 1：工具续接（按 tool_call_id 命中注册表）──

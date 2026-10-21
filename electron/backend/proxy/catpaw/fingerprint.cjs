@@ -1,12 +1,12 @@
-// CatPaw 消息指纹与指纹链（移植来源：参照实现 catpaw/fingerprint.rs，其上游是
-// catpaw-upstream-messages.mjs 的 messageFingerprint 与 catpaw-upstream-client.mjs 的增量定位）。
+// CatPaw 消息指纹与指纹链（协议依据：官方客户端实测，其上游是
+// messageFingerprint 与增量定位）。
 //
 // 指纹的用途：CatPaw 上游是**有状态会话协议**，同一客户端会话复用同一个 conversationId，
 // 后续轮次的 round 只提交「增量消息」。代理要回答「客户端这次提交的历史里哪一段上游已经见过」，
 // 办法是给每条归一化消息算稳定指纹，把已同步的指纹按序存在会话注册表里，
 // 新请求到达时用最后一条已同步指纹在客户端历史里定位，之后的部分就是增量。
 //
-// serialization 必须与上游/参照实现逐字对齐：先摊平成字符串数组再 JSON.stringify 后取 SHA-256，
+// serialization 必须与上游逐字对齐：先摊平成字符串数组再 JSON.stringify 后取 SHA-256，
 // 不对消息对象直接 stringify（那会把字段顺序、messageId 卷进来）。参与指纹的字段只有
 // type/role、块的 type/text/toolCallId/toolName/toolParams/toolResult；
 // 不参与的有 messageId（归一化对缺失 id 会生成随机 UUID，塞进去等于每条都不稳定）、

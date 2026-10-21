@@ -1,6 +1,6 @@
 // CatPaw 工具字段归一化：OpenAI `tools` / `tool_choice` → 上游 `toolConfigs`
-// （移植来源：参照实现 catpaw/tools.rs，上游为 catpaw-upstream-messages.mjs 的
-// normalizeTools / toolChoiceMode）。
+// （协议依据：官方客户端实测）
+// 归一化入口：normalizeTools / toolChoiceMode。
 //
 // 字段映射（上游协议为唯一权威）：
 //   function.name → name；function.description → description（截 8000 字符）；

@@ -1,5 +1,5 @@
 // CatPaw 入站准备层：原始 OpenAI 请求体 → 本轮执行所需的归一化素材
-// （移植来源：参照实现 catpaw/prepare.rs）。
+// （协议依据：官方客户端实测）。
 //
 // 一个客户端请求进来是「无状态 OpenAI 形态」（完整历史 + tools + 各种参数），
 // 而上游 round/turn 要的是它自己的消息块与字段。本文件把前者翻译成后者，并在出网之前完成：
@@ -16,7 +16,7 @@ const { resolveModelRequest, resolveEffort, resolveContextWindow } = require("./
 const { normalizeTools, selectTools, toolChoiceMode } = require("./tools.cjs");
 const catalog = require("./catalog.cjs");
 
-/** 归一化 + 参数解析。校验优先级照抄参照实现：消息 → effort → tools → tool_choice */
+/** 归一化 + 参数解析。校验优先级对齐上游：消息 → effort → tools → tool_choice */
 function prepare(body) {
   const source = body || {};
   const resolution = resolveModelRequest(source.model, { find: catalog.findRemote, knownIds: catalog.knownIds });

@@ -1,6 +1,6 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
@@ -30,7 +30,7 @@ const { ImportEngine } = require("./import/engine.cjs");
 const { LlmClient } = require("./llm/client.cjs");
 const agents = require("./agents.cjs");
 const tools = require("./tools.cjs");
-const { SCHEMA, defaultConfig: schemaDefaults, validateValue, migrateTaskTimes } = require("./config-schema.cjs");
+const { SCHEMA, defaultConfig: schemaDefaults, validateValue, migrateTaskTimes, migrateUiTabs } = require("./config-schema.cjs");
 const profileCache = require("./profile-cache.cjs");
 
 let service = null;
@@ -168,6 +168,15 @@ function init() {
       const tasks = JSON.parse(JSON.stringify(memCfg.get("auto.tasks") || {}));
       if (migrateTaskTimes(tasks)) memCfg.set({ "auto.tasks": tasks }, { local: false });
       service.index.setMeta("mem_sched_rhythm_v2", "done");
+    }
+  } catch { /* 迁移失败不阻塞启动 */ }
+  // 一次性迁移：「显示的页签」旧默认 5 项 → 新默认 8 项（2026-10-20，仅「检索与索引」收进配置·界面）。
+  // 只搬恰好等于旧默认的写盘值，用户自选过的清单不动；meta 闸门保证整轮只跑一次。
+  try {
+    if (service.index.getMeta("mem_ui_tabs_v2") !== "done") {
+      const nextTabs = migrateUiTabs(memCfg.get("ui.tabs"));
+      if (nextTabs) memCfg.set({ "ui.tabs": nextTabs }, { local: false });
+      service.index.setMeta("mem_ui_tabs_v2", "done");
     }
   } catch { /* 迁移失败不阻塞启动 */ }
   access = new AgentAccess({

@@ -44,6 +44,11 @@ export function moduleEnabled(key: string): boolean {
   return !caps || caps.modules.includes(key);
 }
 
+/** 命令模式：desktop（无 caps）返回 undefined，容器按服务端声明返回 read/write/deny */
+export function commandMode(cmd: string): CommandMode | undefined {
+  return caps?.commands[cmd]?.mode;
+}
+
 /** deny 命令的拦截文案：命中返回原因（调用层直接抛），未命中返回 null */
 export function denyReason(cmd: string): string | null {
   const c = caps?.commands[cmd];

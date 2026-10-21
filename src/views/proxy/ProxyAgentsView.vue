@@ -9,6 +9,7 @@ import type { ProxyChannelView, ProxyAccount, ProxyChannelId, ProxyPoolStrategy,
 import { useAppStore } from "../../stores/app";
 import { fmtInt, fmtK, fmtDate, fmtAgo, fmtCredits, ACCOUNT_STATUS, SOURCE_NAMES, channelName, fmtBalance, fmtPkgTotal, fmtPkgUsed, pkgFallbackName, balanceUnit, isQoderChannel, isClineChannel, costTierName, checkinLabels, todayStr } from "./format";
 import { coalesceAsync } from "../../utils/timing";
+import { commandMode } from "../../api/caps";
 import { solveCaptcha, cancelCaptcha, CaptchaCancelledError } from "../../utils/aliyunCaptcha";
 
 const app = useAppStore();
@@ -23,6 +24,15 @@ function togglePkg(id: string) {
   if (next.has(id)) next.delete(id);
   else next.add(id);
   expandedIds.value = next;
+}
+/** 整行点击切换展开：有套餐明细的账号行，点行内任意空白（副行 / 余额 / 到期等）即展开收起，不必点中箭头。
+ *  行内交互元素（按钮 / 输入框 / 重命名 / UID / 备注 / 状态标签）经 closest 统一豁免，
+ *  新增按钮无需逐个 .stop，天然不误触 */
+function onRowClick(e: MouseEvent, acc: ProxyAccount) {
+  if (!acc.packages || !acc.packages.length) return;
+  const t = e.target as HTMLElement | null;
+  if (t && t.closest("button, input, .acc-name, .status-tag, .acc-uid, .acc-note")) return;
+  togglePkg(acc.id);
 }
 /** 已用占比（进度条宽度 %）：total<=0 或「不限」时不画条（模板那端已用 v-if 拦住） */
 function pkgUsedPct(pkg: { used: number; total: number }): number {
@@ -146,6 +156,10 @@ const SMS_ONLY_CHANNELS: ProxyChannelId[] = ["autoclaw"];
 // 与 NO_OAUTH_CHANNELS 同一分工：渠道能力的展示层开关，判定口径在各自适配器
 const NO_CHECKIN_CHANNELS: ProxyChannelId[] = ["catpaw", "cline_free", "cline_pass"];
 function addTabAllowed(key: AddMethod, channel: ProxyChannelId = activeChannel.value): boolean {
+  // 容器形态：服务端 deny 的入口直接隐藏，避免用户点了才看到错误文案
+  if (key === "oauth" && commandMode("proxy_oauth_begin") === "deny") return false;
+  if (key === "file" && commandMode("proxy_account_import_file") === "deny") return false;
+  if (key === "local" && (commandMode("proxy_scan") === "deny" || commandMode("proxy_scan_import") === "deny")) return false;
   if (key === "oauth" && NO_OAUTH_CHANNELS.includes(channel)) return false;
   // 手机验证码页签只给 AutoClaw 国内版；它自身也没有 OAuth 页签可放
   if (key === "sms") return SMS_ONLY_CHANNELS.includes(channel);
@@ -160,6 +174,9 @@ function addTabAllowed(key: AddMethod, channel: ProxyChannelId = activeChannel.v
 function allowedMethods(channel: ProxyChannelId): AddMethod[] {
   return (["oauth", "sms", "local", "file", "paste"] as AddMethod[]).filter((key) => addTabAllowed(key, channel));
 }
+
+// 容器形态（OAuth 被服务端 deny）：添加弹窗只保留粘贴 JSON，并给出号池同步引导
+const containerForm = computed(() => commandMode("proxy_oauth_begin") === "deny");
 
 // 渠道允许的添加方式（分段控件按渠道过滤）
 const METHOD_TABS = computed(
@@ -231,7 +248,7 @@ const OAUTH_HELP: Record<string, { title: string; desc: string }> = {
 // 粘贴 JSON 的字段示例（placeholder 用，随渠道切换 token 字段名提示）
 const pastePlaceholder = computed(() => {
   if (addChannel.value === "zcode") {
-    return `zcode 支持三种形态：\n① 轻量：{ "zcodeJwtToken": "…", "codingPlanKey": "apiKey.secret（选填）", "provider": "zai" }\n② 快照：{ "credentials": {…}, "config": {…} }（整份凭据，含切号快照）\n③ zcode-account-switcher 导出文件的 accounts 数组条目`;
+    return `zcode 支持三种形态：\n① 轻量：{ "zcodeJwtToken": "…", "codingPlanKey": "apiKey.secret（选填）", "provider": "zai" }\n② 快照：{ "credentials": {…}, "config": {…} }（整份凭据，含切号快照）\n③ ZCode 账号切换工具的导出文件 accounts 数组条目`;
   }
   if (addChannel.value === "catpaw") {
     // CatPaw 的凭据是桌面端会话 Cookie 里的 X-Passport-Token 值 + 独立 user-uid（不在 token 里）
@@ -271,36 +288,46 @@ watch(activeChannel, () => {
   selectedIds.value = new Set();
 });
 
-/** 导出选中账号为 JSON 文件：仅元数据，不含凭据（凭据仅本机 DPAPI 加密保管，不外发） */
-function exportSelected() {
+/** 导出选中账号为 JSON 文件：**含明文凭据**（token/refreshToken 由主进程解密后回传），
+ *  供用户在其它软件里直接使用；落盘仍是浏览器下载那条链路（与旧的元数据导出一致） */
+const exportOpen = ref(false);
+const exportBusy = ref(false);
+async function doExport() {
+  if (exportBusy.value) return;
   const rows = activeChannelAccounts.value.filter((a) => selectedIds.value.has(a.id));
-  if (!rows.length) return;
-  const payload = {
-    format: "agenthub-accounts",
-    exportedAt: new Date().toISOString(),
-    channel: activeChannel.value,
-    accounts: rows.map((a) => ({
-      id: a.id,
-      channel: a.channel,
-      uid: a.uid,
-      name: a.name,
-      note: a.note || "",
-      source: a.source,
-      status: a.status,
-      credits: a.credits,
-      creditsAt: a.creditsAt,
-      expiresAt: a.expiresAt,
-      createdAt: a.createdAt,
-    })),
-  };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `agenthub-accounts-${activeChannel.value}-${todayStr()}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
-  toast(`已导出 ${rows.length} 个账号（仅元数据，不含凭据）`);
+  if (!rows.length) {
+    exportOpen.value = false;
+    return;
+  }
+  exportBusy.value = true;
+  try {
+    const r = await api.proxyAccountExportPlain(rows.map((a) => a.id));
+    if (r.ok === false) throw new Error(r.message || "导出失败");
+    const accounts = r.accounts || [];
+    if (!accounts.length) throw new Error("选中账号都已不存在");
+    const payload = {
+      // 格式名与元数据导出（agenthub-accounts，故意不含 token）刻意区分开：
+      // 灌号侧对旧格式是按「元数据包」直接拒绝的，新格式不能撞名
+      format: "agenthub-credentials",
+      exportedAt: new Date().toISOString(),
+      channel: activeChannel.value,
+      accounts,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `agenthub-credentials-${activeChannel.value}-${todayStr()}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    const miss = (r.missing || []).length;
+    toast(`已导出 ${accounts.length} 个账号的明文凭据${miss ? `（${miss} 个已不存在，已跳过）` : ""}，请妥善保管`, "info");
+    exportOpen.value = false;
+  } catch (e) {
+    toast(String((e as Error)?.message || e), "err");
+  } finally {
+    exportBusy.value = false;
+  }
 }
 
 /** 批量删除：主进程逐个走单删链路（墓碑先行，经 WebDAV 传播到其他设备） */
@@ -413,7 +440,9 @@ async function refreshCurrentChannel() {
   }
 }
 
-// ===== 每日签到（三渠道不同形态：Trae ug 签到 / WB 中国区 daily-checkin / 国际版无签到只有加油包） =====
+// ===== 每日签到（各渠道形态不同：Trae ug 签到 / WB 中国区 daily-checkin /
+//        国际版走「trial 加油包 + 每日活跃保活三件事」—— 上游没有签到体系，
+//        每日奖励的判定挂在活跃上报/免费模型对话/网页会话上，见 server 侧 dailyActivity） =====
 
 function checkinTagCls(r: ProxyCheckinRow) {
   if (!r.ok) return r.needCaptcha || r.deviceBurned ? "tag-warn" : "tag-err";
@@ -705,10 +734,18 @@ function fmtTs(ts: number) {
 // ===== ZCode 独立人机校验（过码）=====
 const solvingCaptchaId = ref<string>("");
 
+/** 最近错误是否仍然“有效”：账号在上次报错后有过成功调用（lastUsed 更新），
+ *  说明那是一条历史错误，不应再标红/弹窗误导——6004 模型级冷却结束后最容易撞见
+ *  “客户端已恢复、号池卡片还挂着旧 429”的观感。 */
+function hasFreshError(acc?: ProxyAccount | null): boolean {
+  if (!acc || !acc.lastError) return false;
+  return !acc.lastUsed || acc.lastError.at >= acc.lastUsed;
+}
+
 /** 判断该账号当前是否因 3007/人机校验而报错或需过码 */
 function isNeedCaptcha(acc?: ProxyAccount | null): boolean {
   if (!acc) return false;
-  const msg = String(acc.lastError?.message || acc.coolReason || "");
+  const msg = String((hasFreshError(acc) ? acc.lastError?.message : "") || acc.coolReason || "");
   return acc.channel === "zcode" && (/人机校验|验证码|3007|captcha|verify/i.test(msg));
 }
 
@@ -1546,10 +1583,10 @@ onUnmounted(() => {
               <button class="btn btn-sm" @click="openStrategy(ch)">调度策略</button>
             </el-tooltip>
             <button class="btn btn-sm" @click="openAdd(ch)">添加账号</button>
-            <!-- 多选后出现的批量操作：导出（仅元数据）与批量删除（二次确认） -->
+            <!-- 多选后出现的批量操作：导出凭据（明文，二次确认）与批量删除（二次确认） -->
             <template v-if="selectedCount">
-              <el-tooltip content="把选中账号导出为 JSON 文件（仅元数据，不含凭据）" placement="top">
-                <button class="btn btn-sm" @click="exportSelected">导出</button>
+              <el-tooltip content="把选中账号导出为 JSON 文件（含明文 token/refreshToken，可直接用于其他软件）" placement="top">
+                <button class="btn btn-sm" @click="exportOpen = true">导出</button>
               </el-tooltip>
               <el-tooltip content="删除选中的账号（本地加密凭据一并删除，删除会经 WebDAV 同步传播到其他设备）" placement="top">
                 <button class="btn btn-sm danger" :disabled="batchDelBusy" @click="batchDelOpen = true">批量删除</button>
@@ -1679,11 +1716,21 @@ onUnmounted(() => {
               <template v-if="loading && !ch.accounts.length">
                 <tr v-for="n in 4" :key="'sk-' + n">
                   <td class="sel-col"><div class="skeleton" style="height: 14px; width: 14px; margin: 0 auto"></div></td>
-                  <td><div class="skeleton" style="height: 20px; width: 120px"></div></td>
-                  <td><div class="skeleton" style="height: 18px; width: 50px"></div></td>
-                  <td><div class="skeleton" style="height: 18px; width: 70px"></div></td>
-                  <td><div class="skeleton" style="height: 18px; width: 80px"></div></td>
-                  <td><div class="skeleton" style="height: 18px; width: 90px"></div></td>
+                  <td>
+                    <div class="skeleton" style="height: 20px; width: 120px; margin: 0 auto"></div>
+                  </td>
+                  <td>
+                    <div class="skeleton" style="height: 18px; width: 50px; margin: 0 auto"></div>
+                  </td>
+                  <td>
+                    <div class="skeleton" style="height: 18px; width: 70px; margin: 0 auto"></div>
+                  </td>
+                  <td>
+                    <div class="skeleton" style="height: 18px; width: 80px; margin: 0 auto"></div>
+                  </td>
+                  <td>
+                    <div class="skeleton" style="height: 18px; width: 90px; margin: 0 auto"></div>
+                  </td>
                   <td style="text-align: right"><div class="skeleton" style="height: 20px; width: 140px; margin-left: auto"></div></td>
                 </tr>
               </template>
@@ -1694,7 +1741,7 @@ onUnmounted(() => {
               </tr>
               <template v-else>
                 <template v-for="(acc, i) in ch.accounts" :key="acc.id">
-                <tr :style="{ '--i': i }">
+                <tr :style="{ '--i': i }" @click="onRowClick($event, acc)">
                   <td class="sel-col">
                     <input type="checkbox" :checked="selectedIds.has(acc.id)" @change="toggleSelect(acc.id)" />
                   </td>
@@ -1705,7 +1752,9 @@ onUnmounted(() => {
                       placement="top"
                     >
                       <button class="pkg-caret" :class="{ open: expandedIds.has(acc.id) }" @click="togglePkg(acc.id)">
-                        <i class="ph ph-caret-right" />
+                        <!-- inline SVG 代替 icon font：字形光栅化按整物理像素吸附（中心差只有 ±0.5 物理px 两个台阶），
+                             SVG 几何真居中且位置连续，任意 DPI 下都与 checkbox 同线 -->
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M9 5 L15 12 L9 19" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
                       </button>
                     </el-tooltip>
                     <el-tooltip v-if="renamingId !== acc.id" :content="acc.name + '（点击重命名）'" placement="top">
@@ -1750,11 +1799,11 @@ onUnmounted(() => {
                   </td>
                   <td>
                     <!-- 状态标签：使用 pill 样式 -->
-                    <el-tooltip :content="acc.lastError ? '点击查看最近一次上游错误' : ''" :disabled="!acc.lastError" placement="top">
+                    <el-tooltip :content="hasFreshError(acc) ? '点击查看最近一次上游错误' : ''" :disabled="!hasFreshError(acc)" placement="top">
                       <span
                         class="pill status-tag"
-                        :class="[isNeedCaptcha(acc) ? 'warn' : acc.status === 'online' ? 'ok' : acc.status === 'cooling' ? 'warn' : acc.status === 'disabled' ? 'blue' : 'err', { 'has-err': !!acc.lastError }]"
-                        @click="acc.lastError && (errRow = acc)"
+                        :class="[isNeedCaptcha(acc) ? 'warn' : acc.status === 'online' ? 'ok' : acc.status === 'cooling' ? 'warn' : acc.status === 'disabled' ? 'blue' : 'err', { 'has-err': hasFreshError(acc) }]"
+                        @click="hasFreshError(acc) && (errRow = acc)"
                       >
                         {{ isNeedCaptcha(acc) ? "需过码" : (ACCOUNT_STATUS[acc.status]?.text || acc.status) }}
                       </span>
@@ -1934,6 +1983,11 @@ onUnmounted(() => {
             >
               <i class="ph" :class="t.icon"></i>{{ t.label }}
             </button>
+          </div>
+
+          <!-- 容器形态的可行路径：OAuth/本机扫描/文件选择都被服务端禁用，先把话说清楚 -->
+          <div v-if="containerForm" class="add-msg">
+            容器形态推荐：设置 → 号池同步（WebDAV/S3）；也可粘贴含 token/refreshToken 的凭据 JSON，或调用管理 API <code>/api/accounts/import</code>。桌面端号池「导出」按钮的产物已含明文凭据（<code>format=agenthub-credentials</code>），可以直接拿来灌号。
           </div>
 
           <!-- 方式内容：各面板共用固定高度，切换时弹窗不跳高度 -->
@@ -2127,6 +2181,24 @@ onUnmounted(() => {
           <div class="p-actions">
             <button class="btn" @click="delOpen = false">取消</button>
             <button class="btn btn-primary danger-solid" @click="doDelete">删除</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 导出凭据确认（明文凭据落盘不可撤回，先让用户过目） -->
+      <div v-if="exportOpen" class="p-mask" @click.self="exportOpen = false">
+        <div class="p-dlg glass">
+          <div class="p-title">导出账号凭据</div>
+          <div class="set-desc">
+            将把选中的 {{ selectedCount }} 个账号导出为一个 JSON 文件，其中
+            <b>token / refreshToken 是明文</b>，可直接粘贴到其他软件使用。<br />
+            文件一旦落盘就无法撤回，请勿放进网盘、聊天记录或代码仓库等会被他人看到的地方。
+          </div>
+          <div class="p-actions">
+            <button class="btn" @click="exportOpen = false">取消</button>
+            <button class="btn btn-primary" :disabled="exportBusy" @click="doExport">
+              {{ exportBusy ? "导出中…" : "导出明文凭据" }}
+            </button>
           </div>
         </div>
       </div>
@@ -3320,24 +3392,51 @@ onUnmounted(() => {
   word-break: break-all;
   user-select: all;
 }
-/* ===== 列表布局：账号两行式 + 数字列右对齐 ===== */
+
+/* ===== 列表布局：账号两行式 + 列值居中 ===== */
+/* th 全站已强制居中（global.css），这里覆盖 td 默认左对齐；td.num 单列保持同优先级，
+   压过全局 .table td.num 的右对齐（对齐用量统计页 .tbl-c 的配方）。
+   操作列不参与：td 内联 text-align: right 优先级更高，保持右对齐 */
+.pool-tbl td,
 .pool-tbl td.num {
-  text-align: right;
+  text-align: center;
+}
+
+/* 操作列定宽：auto 布局下容器超宽时剩余空间会被按钮组最多的操作列吸走（撑到近 1/3 表宽），
+   定宽后它收缩到按钮组实际宽度，富余回流给账号等列；内容超出（更多按钮的渠道）时仍可自动撑开 */
+.pool-tbl th:last-child {
+  width: 340px;
 }
 /* 积分包展开：账号行下的只读明细表（数据来自 poolView 附的 packages） */
 .pkg-caret {
   border: none;
   background: none;
   cursor: pointer;
-  color: var(--text-3);
-  padding: 0 4px 0 0;
-  font-size: 12px;
+  color: var(--text-2);
+  padding: 0;
   transition: transform 0.15s;
-  display: inline-block;
+  /* 脱离文本流钉在单元格最左、垂直居中：原先 inline-block 跟随列值居中，箭头会单独一行悬在账号名上方 */
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  /* 固定方形热区 + flex 居中，与 checkbox / 各列值同处一条 td 中线 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+}
+.pkg-caret svg {
+  display: block;
+  /* 像素校准（1.25 DPI 实测）：SVG 墨迹包围盒中心比自绘 checkbox 方块中心低 0.5 物理px，
+     上移 0.4 CSS（= 0.5 物理）对齐；SVG 渲染位置连续，该位移精确生效 */
+  transform: translateY(-0.4px);
 }
 .pkg-caret.open {
-  transform: rotate(90deg);
-  color: var(--text-1);
+  transform: translateY(-50%) rotate(90deg);
+  /* var(--text-1) 全项目未定义（颜色一直失效回退继承），展开高亮用主文本色 */
+  color: var(--text);
 }
 .pkg-row > .pkg-cell {
   padding: 0 0 8px 26px;
@@ -3381,16 +3480,53 @@ onUnmounted(() => {
   text-align: center;
 }
 .sel-col input[type="checkbox"] {
-  vertical-align: middle;
+  /* 自绘替换原生：原生控件自绘的可见边界随 DPI 有 ±0.5 物理px 的量化漂移，
+     与 SVG 箭头无法稳定同线；矢量自绘后方块边界 = 盒边界，中心精确锚定 td 中心 */
+  appearance: none;
+  display: block;
+  margin: 0 auto;
+  width: 13px;
+  height: 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--bg-2, rgba(127, 127, 127, 0.08));
   cursor: pointer;
-  accent-color: var(--accent);
+  position: relative;
+}
+.sel-col input[type="checkbox"]:hover {
+  border-color: var(--accent-line);
+}
+.sel-col input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+/* 对勾：border 旋转 45° 的 L 形，随方块几何居中 */
+.sel-col input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 4px;
+  height: 8px;
+  border: solid #fff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: translate(-50%, -60%) rotate(45deg);
+}
+.sel-col input[type="checkbox"]:focus-visible {
+  outline: 1px solid var(--accent-line);
+  outline-offset: 1px;
 }
 .acc-cell {
+  position: relative;
   line-height: 1.3;
+  /* 列宽建议值：账号列给足展示空间，压缩操作列的富余占比（auto 布局下的分配 hint） */
+  width: 280px;
 }
 .acc-name {
   display: block;
-  max-width: 220px;
+  /* 列值居中配套：280px 限宽块在 td 里水平居中，避免「块靠左、文本居中」的错位 */
+  margin-inline: auto;
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3406,12 +3542,22 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 5px;
+  /* flex 不吃 text-align：列值居中时副行内容同步居中；margin-inline 让限宽块跟随居中 */
+  justify-content: center;
   margin-top: 2px;
-  /* 副行限宽锚定 .acc-name 的 220px：账号列宽度由名称行决定，备注再长也不撑列 */
-  max-width: 220px;
+  margin-inline: auto;
+  /* 副行限宽锚定 .acc-name 的 280px：账号列宽度由名称行决定，备注再长也不撑列 */
+  max-width: 280px;
   min-width: 0;
   font-size: 10.5px;
   color: var(--text-3);
+}
+/* 展开箭头是绝对定位在单元格左内边距里的（热区 20px，比 td 的 12px 内边距多出 8px）。
+   账号名/副行占满整列时文字从内容盒左边缘起排，首字会被箭头压住、左侧点击也会被箭头吃掉。
+   给「有箭头」的行左右对称内缩 12px：居中不变，只把文字让出箭头热区（无箭头的行完全不受影响）。 */
+.acc-cell:has(.pkg-caret) .acc-name,
+.acc-cell:has(.pkg-caret) .acc-sub {
+  padding-inline: 12px;
 }
 .acc-sub i {
   font-style: normal;

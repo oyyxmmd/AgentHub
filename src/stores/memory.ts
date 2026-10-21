@@ -1,6 +1,6 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
@@ -110,7 +110,7 @@ export const useMemoryStore = defineStore("memory", {
         this.root = env.root || "";
         this.loaded = true;
         this.loadError = "";
-        // 页签显隐白名单：app 侧据此过滤横条；配置里没这个键的（含后端还没加 ui.tabs 时）按默认 5 个渲染
+        // 页签显隐白名单：app 侧据此过滤横条；配置里没这个键的（含后端还没加 ui.tabs 时）按默认 8 个渲染
         try {
           const app = useAppStore();
           const tabs = (this.config?.ui?.tabs as unknown) || [];

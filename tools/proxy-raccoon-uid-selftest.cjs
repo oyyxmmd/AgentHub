@@ -35,7 +35,7 @@ const jwt = (payload) => [b64u({ alg: "RS256", typ: "JWT" }), b64u(payload), "si
 const RACCOON_ISS = "xiaohuanxiong.com/iam";
 const tokenFor = (sub, sid) => jwt({ sid, ver: 0, iss: RACCOON_ISS, sub, aud: ["xiaohuanxiong.com"], exp: 1794578621, nbf: 1791986616, iat: 1791986621, jti: "ak-" + sid.slice(4) });
 
-// 旧实现（照抄改前的代码），用于反向对照：证明旧行为确实是坏的
+// 旧实现（沿用改前的代码），用于反向对照：证明旧行为确实是坏的
 const oldTokenUid = (token) => {
   const p = String(token || "").trim().split(".");
   if (p.length < 2) return "";

@@ -1,4 +1,4 @@
-// 反代网关 · AutoClaw 模型路由与目录（参照实现 providers/autoclaw/models.rs + catalog.rs）
+// 反代网关 · AutoClaw 模型路由与目录（协议事实：模型 + 目录实测）
 //
 // 两个模型标识必须分清：X-Request-Model 头 = 完整路由 ID（带通道前缀，前缀决定计费通道），
 // body.model = 剥掉路由前缀后的模型 ID。只发对一个，上游要么选错计费通道要么认不出模型。
@@ -61,7 +61,7 @@ function matchCatalogEntry(catalogModels, raw) {
 
 /**
  * 解析客户端请求的模型名 → { routeModelId, bodyModelId }。
- * 解析顺序（参照实现 resolve_model_route 的 AgentHub 简化版，目录优先）：
+ * 解析顺序（resolve_model_route 的简化版，目录优先）：
  *   1. 空/纯空白 → 默认路由 zai_auto，body 同名；
  *   2. catalog 条目命中（id/name/routeId）→ 用条目的 routeId，body 用剥前缀 id；
  *   3. 以已知前缀开头 → 整串当路由 ID（大小写原样），body 剥前缀；

@@ -1,5 +1,5 @@
-// CatPaw 入站消息归一化（移植来源：参照实现 catpaw/messages.rs，上游为
-// catpaw-upstream-messages.mjs 与 proxy-chat-utils.mjs）。**纯函数：不发网络、不读盘。**
+// CatPaw 入站消息归一化（协议依据：官方客户端实测，上游为
+// 官方客户端的消息组装逻辑）。**纯函数：不发网络、不读盘。**
 //
 // 上游 round/turn 不接受 OpenAI 的 messages，只接受它自己的消息块数组：
 //   user:      { type:"user",      messageId, content:[text | image_url], finished }
@@ -8,7 +8,7 @@
 // 两条不属于 messages 的东西被抽离成 round 请求体的独立字段：
 //   system 消息 → systemPromptContext.systemPromptOverride；developer 消息 → rulesMessage。
 //
-// 归一化规则总览（改前先读参照实现）：
+// 归一化规则总览（改前先读上游实现）：
 //   1. system/developer 抽离成独立字段；**位置不限**——上游 round 只认「一条前置 systemPrompt」，
 //      所以对话中间出现的指令按出现顺序并入对应字段（丢位置、不丢内容）。客户端把 system 放在
 //      对话中间是合法 OpenAI 形态（Claude 系实测 messages[2]=system）；早期这里报 400，而
@@ -111,7 +111,7 @@ function normalizeTool(message, index) {
   const rawId = message.tool_call_id ?? message.toolCallId;
   const id = typeof rawId === "string" && rawId.trim() ? rawId : "";
   if (!id) throw CatPawError.badRequest(`messages[${index}] tool_call_id 缺失`);
-  // 这里**是** trim 过的（与 id 不同，照抄原实现）
+  // 这里**是** trim 过的（与 id 不同，与上游一致）
   const name = typeof message.name === "string" && message.name.trim() ? message.name.trim() : undefined;
   const result = toolResultContent(message, index);
   const block = { type: "tool_result", toolCallId: id };

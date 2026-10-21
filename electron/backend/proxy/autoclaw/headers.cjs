@@ -1,4 +1,4 @@
-// 反代网关 · AutoClaw 两域请求头（参照实现 refresh.rs signed_auth_headers + adapter.rs brandHeaders）
+// 反代网关 · AutoClaw 两域请求头（协议事实：signed_auth_headers + brandHeaders）
 //
 // LLM 对话域与 userapi 域是两个站点，头集合刻意不一致，三处最易踩：
 //   ① X-Authorization（LLM 域认证头）不是 Authorization；userapi 域用小写 authorization。
@@ -18,7 +18,7 @@ function authSign(appId, appKey, nowMs) {
   };
 }
 
-/** 平台值：恒不发 "linux"（LLM 域）——非 Windows 宿主回落 win，与参照实现 platform_tm 同口径 */
+/** 平台值：恒不发 "linux"（LLM 域）——非 Windows 宿主回落 win，与 platform_tm 同口径 */
 function llmPlatformTm() {
   return process.platform === "darwin" ? "mac" : "win";
 }
@@ -35,7 +35,7 @@ function llmHeaders(cfg, token, routeModelId, sessionHeaders) {
     "x-version": cfg.llmVersion || "1.17.8",
     "x-lang": "zh-CN",
     "x-channel": "official",
-    // 参照实现 brandHeaders 的原样字面量：小写 x + 下划线，值固定
+    // brandHeaders 的原样字面量：小写 x + 下划线，值固定
     x_trace_id: "autoclaw-desktop",
     "x-authorization": `Bearer ${token}`,
     "x-request-id": crypto.randomUUID(),

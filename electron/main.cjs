@@ -13,6 +13,17 @@ const { crashReporter } = require("electron");
 // 也要写同一份取证日志——child-process-gone 不覆盖 node 子进程，那边必须自行落痕
 const __crashlog = require("./backend/crashlog.cjs");
 let __crashCount = 0;
+// 顶层 require 链完成前，任何未捕获异常都意味着模块图不完整：后续 whenReady/建窗不会执行，
+// 继续活着只会变成「无窗口僵尸」。启动阶段用它区分「真崩溃」与「可降级的运行时异常」。
+let bootPhase = "requires";
+const MB = 1024 * 1024;
+function memUsage() {
+  const m = process.memoryUsage();
+  return `rss=${Math.round(m.rss / MB)}MB heap=${Math.round(m.heapUsed / MB)}MB ext=${Math.round(m.external / MB)}MB`;
+}
+function crashLogFile() {
+  return path.join(process.env.APPDATA || app.getPath("appData"), "AgentHub", "logs", "crash.log");
+}
 function __crashLog(kind, detail) {
   if (__crashCount > 50) return;
   __crashCount++;
@@ -25,7 +36,7 @@ function __describe(e) {
 try { crashReporter.start({ uploadToServer: false, submitURL: "" }); } catch { /* 无 crashReporter 则仅失去 dump 能力 */ }
 // 启动留痕：放在 whenReady 里，确保 app.setName 之后再取 userData（否则会落到错误目录）
 app.whenReady().then(() => {
-  try { __crashLog("boot", `v${app.getVersion()} electron=${process.versions.electron} node=${process.versions.node}`); } catch { /* 忽略 */ }
+  try { __crashLog("boot", `v${app.getVersion()} electron=${process.versions.electron} node=${process.versions.node} ${memUsage()}`); } catch { /* 忽略 */ }
   // 休眠唤醒守卫：注册 powerMonitor 的 suspend/resume，供各周期任务判断「是否刚唤醒」
   // （避免唤醒瞬间签到 + 额度刷新 + 记忆中枢任务集中爆发，见 backend/wakeGuard.cjs）。
   // 事件同时写入 crash.log——Windows Modern Standby 是否派发 resume 尚无定论，
@@ -36,9 +47,23 @@ app.whenReady().then(() => {
   } catch (e) { __crashLog("wake-guard-failed", __describe(e)); }
 });
 // 捕获而非退出：托盘常驻的反代网关被别的工具依赖，宁可降级活着也要把根因留痕（每次运行最多记 50 条）
-process.on("uncaughtException", (e) => __crashLog("uncaughtException", __describe(e)));
+process.on("uncaughtException", (e) => {
+  __crashLog("uncaughtException", __describe(e));
+  // 启动阶段（顶层 require）失败时后续 whenReady/建窗都不会执行：明确弹窗并退出，
+  // 避免用户看到「双击没反应/一闪而过」却拿不到任何信息。
+  if (bootPhase === "requires") {
+    try {
+      require("electron").dialog.showErrorBox("AgentHub 启动失败", `原生组件加载失败：${(e && e.message) || e}\n日志：${crashLogFile()}`);
+    } catch { /* 无 GUI 时只退出 */ }
+    app.exit(1);
+  }
+});
 process.on("unhandledRejection", (r) => __crashLog("unhandledRejection", __describe(r)));
-process.on("exit", (code) => __crashLog("exit", `code=${code} uptime=${Math.round(process.uptime())}s`));
+process.on("exit", (code) => {
+  let sync = "n/a";
+  try { sync = require("./backend/webdav.cjs").syncBusyTag() || "idle"; } catch { /* 模块未加载 */ }
+  __crashLog("exit", `code=${code} uptime=${Math.round(process.uptime())}s ${memUsage()} sync=${sync}`);
+});
 app.on("child-process-gone", (_e, d) => __crashLog("child-process-gone", __describe(d)));
 app.on("render-process-gone", (_e, _wc, d) => __crashLog("render-process-gone", __describe(d)));
 app.on("gpu-process-gone", (_e, d) => __crashLog("gpu-process-gone", __describe(d)));
@@ -53,6 +78,32 @@ app.on("browser-window-created", (_e, win) => {
   wc.on("unresponsive", () => { let u = ""; try { u = String(wc.getURL()).slice(0, 200); } catch { /* 已销毁 */ } __crashLog("render-unresponsive", `url=${u}`); });
   wc.on("responsive", () => __crashLog("render-responsive", ""));
 });
+// 内存高水位留痕（issue #146 猜想 3）：只在 RSS 超过 1.5GB 且继续增长 512MB 时记一条，
+// 避免占满 __crashCount 配额；正常 ASCII 路径零开销。
+let memWarnAt = 0;
+const memTimer = setInterval(() => {
+  const rss = process.memoryUsage().rss;
+  if (rss < 1536 * MB || rss - memWarnAt < 512 * MB) return;
+  memWarnAt = rss;
+  __crashLog("memory-high", memUsage());
+}, 5 * 60 * 1000);
+memTimer.unref?.();
+// 同步卡死留痕（issue #146 猜想 2）：正常一次远端同步最长约 90s（30s×重试），
+// 持锁超过 10 分钟即疑似卡死；同一标签每 15 分钟最多记一条。
+let stallTag = "";
+let stallAt = 0;
+const stallTimer = setInterval(() => {
+  let wd;
+  try { wd = require("./backend/webdav.cjs"); } catch { return; }
+  const tag = wd.syncBusyTag();
+  const held = wd.syncHeldMs();
+  if (!tag || held < 10 * 60 * 1000) { stallTag = ""; stallAt = 0; return; }
+  if (tag === stallTag && Date.now() - stallAt < 15 * 60 * 1000) return;
+  stallTag = tag;
+  stallAt = Date.now();
+  __crashLog("sync-stall", `tag=${tag} held=${Math.round(held / 1000)}s`);
+}, 60 * 1000);
+stallTimer.unref?.();
 // ===== 闪退取证结束 =====
 
 const config = require("./backend/config.cjs");
@@ -74,6 +125,8 @@ const shortcut = require("./backend/shortcut.cjs");
 // 轻量模式：关窗决策（纯逻辑，可自测）+ 窗口几何持久化（销毁窗口后重建要回到原位）
 const windowMode = require("./backend/window-mode.cjs");
 const windowState = require("./backend/window-state.cjs");
+// 顶层 require 链完成：此后的未捕获异常可以降级记录，不再按「启动失败」弹窗退出
+bootPhase = "ready";
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL || "http://localhost:1420";
 
@@ -441,20 +494,13 @@ function fmtTime(iso) {
 function buildTrayMenu() {
   const cfg = config.loadConfig();
   const running = remotesync.isRunning();
-  const p = remotesync.progress();
   // 板块开关（issue #91）：关闭板块的托盘入口一并隐藏，避免绕过 UI 触发已停用模块
   const on = (k) => {
     const m = (cfg.modules || {})[k];
     return !m || m.enabled !== false;
   };
-  const statusText = running
-    ? `同步中…（${p.stageLabel}）`
-    : remotesync.configured(cfg)
-      ? `上次同步 ${fmtTime(remotesync.loadRemoteState().lastSyncAt) || "—"}`
-      : "未配置 WebDAV";
   const usageToday = on("sync") ? usageTodaySummary() : null;
   const items = [];
-  if (on("skills")) items.push({ label: `技能仓库：${statusText}`, enabled: false });
   if (on("sync")) items.push({ label: usageToday != null ? `今日用量 ${formatNum(usageToday)} token` : "今日用量 —", enabled: false });
   if (items.length) items.push({ type: "separator" });
   const st = updater.getStatus();
@@ -554,7 +600,7 @@ function registerModuleToggle() {
           c2.memory = { ...(c2.memory || {}), enabled };
           config.saveConfig(c2);
         } catch { /* 双写失败时迁移仍以旧字段为准，行为退化为旧版一致 */ }
-        if (enabled) await memory.boot().catch(() => {});
+        if (enabled) await memory.boot().catch((e) => __crashLog("memory-boot-failed", __describe(e)));
         else await memory.shutdown().catch(() => {});
       }
       // 渲染层各页订阅该事件刷新（左栏灰态即时生效、统计数字停止轮询）
@@ -801,6 +847,22 @@ if (!gotLock) {
   app.whenReady().then(() => {
     // 建窗前先应用主题，避免深色配置下标题栏先白后黑闪烁
     const bootCfg = config.loadConfig();
+    // 同步配置留痕（issue #146 猜想 1）：崩溃日志里一眼能看出崩时有没有配 WebDAV、
+    // 各模块是否在跑远端同步；只记有无，不落任何账号密码。
+    try {
+      const usageBoot = usageConfig.loadConfig();
+      // 与各引擎的 configured() 同口径：usage/memory 只要求 endpoint；skills/pool 还要账号密码。
+      const hasEndpoint = (w) => !!(w && String(w.endpoint || "").trim());
+      const hasAuth = (w) => !!(w && w.endpoint && w.username && w.password);
+      __crashLog(
+        "sync-config",
+        `usage=${hasEndpoint(usageBoot.webdav) ? "yes" : "no"} skills=${hasAuth(bootCfg.webdav) ? "yes" : "no"} ` +
+          `memory=${hasEndpoint(config.moduleWebdav("memory")) ? "yes" : "no"} pool=${hasAuth(config.moduleWebdav("proxy")) ? "yes" : "no"} ` +
+          `usageMode=${usageBoot.mode || "auto"}`,
+      );
+    } catch (e) {
+      __crashLog("sync-config-failed", __describe(e));
+    }
     applyNativeTheme(bootCfg.theme);
     // 四大板块启用开关（issue #91）：关闭的板块后台完全不运行（不装定时器/监听/服务/库）
     const on = (k) => {
@@ -827,7 +889,7 @@ if (!gotLock) {
     if (on("proxy")) proxy.boot().catch((e) => __crashLog("proxy-boot-failed", __describe(e)));
     // 记忆中枢：仓库初始化 + 本地 HTTP API（供 MCP 桥转发）+ 目录监听；失败只影响本模块
     //（boot 内部有 modules.memory.enabled 短路，无需在此判断）
-    memory.boot().catch(() => {});
+    memory.boot().catch((e) => __crashLog("memory-boot-failed", __describe(e)));
     createWindow();
     createTray();
     createTrayPanel();
@@ -862,6 +924,11 @@ if (!gotLock) {
     // 初始化链（建库 / 注册 IPC / 建窗建托盘 / 起各调度器）任何一步抛错都记下来；
     // 原先这里没有 catch，抛错 = unhandledRejection = 主进程静默退出
     __crashLog("whenReady-failed", __describe(e));
+    // 没有窗口时继续活着就是「无窗口僵尸」；明确告知原因并退出。已有窗口则弹窗提示后保留。
+    try {
+      require("electron").dialog.showErrorBox("AgentHub 启动异常", `初始化失败：${(e && e.message) || e}\n日志：${crashLogFile()}`);
+    } catch { /* 无 GUI */ }
+    if (!mainWindow) app.exit(1);
   });
 
   app.on("before-quit", (e) => {

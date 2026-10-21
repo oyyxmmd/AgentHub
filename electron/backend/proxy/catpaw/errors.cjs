@@ -1,4 +1,4 @@
-// CatPaw 协议层错误（移植来源：参照实现 catpaw/models.rs 的 CatPawError）。
+// CatPaw 协议层错误（协议依据：官方客户端实测，CatPawError 语义）。
 // 与通用 Error 的差别：上游失败时除了文案还要回报 `event(status, failReason, failCode, unifyCode)`，
 // 两个业务码来自上游错误体的 code / unifyCode，上游侧排障靠它们。
 //
@@ -27,7 +27,7 @@ class CatPawError extends Error {
     return new CatPawError(502, message);
   }
 
-  /** 上游 HTTP 错误：4xx 原样、其余折成 502（照抄参照实现的归一规则）。
+  /** 上游 HTTP 错误：4xx 原样、其余折成 502（对齐上游的归一规则）。
    *  401 交给通用分类器走刷新/换号；403/404 等保留原状态码便于排障 */
   static http(status, message, extra = {}) {
     const mapped = status >= 400 && status < 500 ? Number(status) : 502;

@@ -238,7 +238,7 @@ async function main() {
   await T("T19 预刷新窗口：lobster 用默认 24h（凭据独立，不与客户端共用文件）", () => {
     // raccoon 因与桌面端共用 auth.json 而必须把窗口压到 300s 防抢刷；
     // lobster 走独立回环 OAuth（AgentHub 持自己那份凭据），不存在共用文件问题，
-    // 故沿用默认 24h。此断言锁住「不要照抄 raccoon 的 300s」。
+    // 故沿用默认 24h。此断言锁住「不要沿用 raccoon 的 300s」。
     assert.strictEqual(ad.refreshWindowSec, undefined, "lobster 不应设 refreshWindowSec（走默认 24h）");
     // access token 实测 30 天有效，24h 窗口不会每轮都触发刷新
     const dec = require("../electron/backend/proxy/util.cjs").jwtDecode("x.eyJleHAiOjQxMDI0NDQ4MDB9.y");

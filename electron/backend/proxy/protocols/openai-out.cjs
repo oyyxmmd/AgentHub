@@ -25,7 +25,7 @@ const REASON_BATCH_MS = 120;
  */
 function create(ctx) {
   const { res, reqId, requestedModel, wantStream } = ctx;
-  // 断连只停写、不中止上游：上游继续消费到 EOF 才能把 usage 记全（方案 §2.2）。
+  // 断连只停写、不中止上游：上游继续消费到 EOF 才能把 usage 记全。
   // 判据是 res 的 close 而不是 req 的——Node 18+ 下请求体读完后 req close 就可能先触发
   let clientGone = false;
   res.on("close", () => { clientGone = true; });
@@ -117,7 +117,7 @@ function create(ctx) {
       return true;
     },
 
-    /** 静默期保活字节（防中间层回收，方案 §2.2 联调坑） */
+    /** 静默期保活字节（防中间层回收，联调坑） */
     keepAlive() {
       if (wantStream) write(": keep-alive\n\n");
     },

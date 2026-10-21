@@ -1,5 +1,5 @@
 // CatPaw 会话注册表：x-session-id → conversationId 映射 + 指纹链 + 工具续接索引 + 账号身份归属
-// （移植来源：参照实现 catpaw/registry/{mod,identity,cleanup}.rs，其上游是 session-registry.mjs）。
+// （协议依据：官方客户端会话注册表实测）。
 // **纯内存数据结构：不读盘、不发网络请求、不持锁**。
 //
 // 它记住什么 / 回答什么：

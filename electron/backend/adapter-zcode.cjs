@@ -162,4 +162,4 @@ function extract(dir, deviceId, deviceName, since) {
   return out;
 }
 
-module.exports = { id: ID, name: NAME, detect, validate, getDeviceId, extract, normalizeModel, providerName };
+module.exports = { id: ID, name: NAME, detect, validate, getDeviceId, extract, normalizeModel, providerName, providerByModel };

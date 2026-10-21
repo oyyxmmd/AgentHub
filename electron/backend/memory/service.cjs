@@ -1,6 +1,6 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
@@ -1679,7 +1679,7 @@ class MemoryService {
   }
 
   /**
-   * 记忆体检（2026-10-16 借鉴 causal-memory 的 drift/bias_audit 本地化）：纯 SQL 统计，不用 LLM。
+   * 记忆体检（2026-10-16 本地化 drift/bias_audit）：纯 SQL 统计，不用 LLM。
    * 五项：僵尸记忆 / 检索趋势 / 分布 / 演化链 / 回收站。任一段异常只让该段为空，不抛。
    * 输出两份：完整报告（调度任务产出，落 mem_meta 供前端/IPC 取）；摘要进 memory_status。
    */

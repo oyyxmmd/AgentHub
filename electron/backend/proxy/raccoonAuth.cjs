@@ -83,7 +83,7 @@ function writeTokens({ accessToken, refreshToken, officeIdentity } = {}) {
   if (accessToken) next.access_token = String(accessToken);
   if (refreshToken) next.refresh_token = String(refreshToken);
   if (officeIdentity) next.office_identity = String(officeIdentity);
-  // 临时文件带进程号（对齐参考 credentials.rs）：双方同时刷新不互踩
+  // 临时文件带进程号（对齐上游）：双方同时刷新不互踩
   // （固定名会让并发写一方把另一方的半成品 rename 走）
   const tmp = `${file}.agenthub-${process.pid}.tmp`;
   try {

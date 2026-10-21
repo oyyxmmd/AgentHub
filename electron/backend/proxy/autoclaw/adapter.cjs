@@ -34,7 +34,7 @@ function makeAutoClaw(channel, deps) {
   const { fetchStream, pumpSse, httpJson, rules, util, deviceIds, firstByteBudgetMs } = deps;
   const cfg = () => (rules.get("headers.json") || {})[channel] || {};
 
-  // ===== 进程级凭证缓存（方案 §7：刷新结果不落库不落文件，只进缓存）=====
+  // ===== 进程级凭证缓存（刷新结果不落库不落文件，只进缓存）=====
   // baseToken 是缓存建立时的库内 token 指纹：库被更新（重登/手动改 token）即失效回落库值，
   // 避免「缓存遮蔽新登录态」。key 用账号 id。
   const credCache = new Map(); // accountId -> { token, refreshToken, expiresAt, baseToken }
@@ -221,7 +221,7 @@ function makeAutoClaw(channel, deps) {
             emit({ type: "error", status: 502, code: chunk.error.code, message: msg });
             return;
           }
-          // 参照实现 sse_model_rewrite：响应帧 model 回写为客户端请求名（chunk 里是路由 ID，会暴露内部命名）
+          // 上游 sse_model_rewrite：响应帧 model 回写为客户端请求名（chunk 里是路由 ID，会暴露内部命名）
           if (chunk.model) chunk.model = String(model || "");
           const choice = Array.isArray(chunk.choices) && chunk.choices[0];
           if (choice) {
@@ -286,7 +286,15 @@ function makeAutoClaw(channel, deps) {
       const c = cfg();
       const { token } = credentialsOf(account, secrets);
       if (!token) return { ok: false, authError: true, message: "该账号没有凭据" };
-      return checkinMod.checkin(userapiEnv(c, token, account));
+      const env = userapiEnv(c, token, account);
+      const r = await checkinMod.checkin(env);
+      // 签到（含「今天已签到」的幂等结果）后触发一次「登录活跃」，让活动福利入账：
+      // 这类活动没有领取接口，只有 user-info 能触发（见 checkin.cjs 的 triggerLoginActive）。
+      // 失败静默——附加收益，绝不改签到结论
+      if (r && r.ok) {
+        try { await checkinMod.triggerLoginActive(env); } catch { /* 附加收益，失败不影响签到 */ }
+      }
+      return r;
     },
 
     /** 签到状态探测（只读 task-list） */

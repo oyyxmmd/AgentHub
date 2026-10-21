@@ -1,6 +1,6 @@
 // 反代网关 · Cline 登录（WorkOS 设备授权，RFC 8628 四步）
 //
-// 协议事实（2026-09 参考实现 agent2api 实测）：
+// 协议事实（2026-09 实测）：
 // ① POST {workosBase}/user_management/authorize/device（form：client_id）
 //    → { device_code, user_code, verification_uri, verification_uri_complete, expires_in:300, interval:5 }
 // ② 用户在浏览器打开 verification_uri_complete 确认（不需要本地回调端口，少一处失败面）

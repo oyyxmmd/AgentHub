@@ -330,7 +330,7 @@ function create(ctx) {
     /**
      * 失败收尾。写头之前回 Messages 形状的错误体；已写头就只能塞进流里（客户端得拿到终止事件）。
      * type 的口径与 openai-out 不同：Anthropic 认的是 ERROR_TYPE_BY_STATUS 那套按状态码定的枚举，
-     * 调度侧传来的 OpenAI 形 type/code 在这里一律不用（照抄会让客户端读不出错误类别）。
+     * 调度侧传来的 OpenAI 形 type/code 在这里一律不用（直接沿用会让客户端读不出错误类别）。
      */
     endErr(status, message) {
       const type = ERROR_TYPE_BY_STATUS[Number(status)] || "api_error";

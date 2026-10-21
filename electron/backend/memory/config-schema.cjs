@@ -1,6 +1,6 @@
 /**
  * AgentHub · 记忆中枢（Memory Hub）
- * Copyright (c) 2026 沐辉 (HUIdada1)
+ * Copyright (c) 2026 沐晖 (HUIdada1)
  * https://github.com/HUIdada1/AgentHub
  * 本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
  */
@@ -198,7 +198,9 @@ const SCHEMA = {
   // ===== 界面 =====
   "ui.pageSize":        { type: "number", def: 50, min: 10, max: 500, label: "列表每页条数", group: "界面", hot: true, tier: "basic" },
   "ui.defaultTab":      { type: "enum", def: "dashboard", options: ["dashboard", "browse", "projects", "profile", "agents", "index", "auto", "import", "sync"], label: "默认页签", group: "界面", hot: true, tier: "advanced" },
-  "ui.tabs":            { type: "multiselect", options: ["dashboard", "browse", "projects", "profile", "agents", "index", "auto", "import", "sync"], def: ["dashboard", "browse", "projects", "auto", "sync"], label: "显示的页签", group: "界面", hot: true, tier: "advanced" },
+  // 2026-10-20 起默认展示 8 个页签：仅「检索与索引」（排障场景）收进配置·界面，可勾选找回。
+  // 曾把旧默认 5 项写盘的存量配置由 migrateUiTabs 一次性搬过来，用户自选过的清单不动
+  "ui.tabs":            { type: "multiselect", options: ["dashboard", "browse", "projects", "profile", "agents", "index", "auto", "import", "sync"], def: ["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync"], label: "显示的页签", group: "界面", hot: true, tier: "advanced" },
   "ui.realtimeRefresh": { type: "boolean", def: true, label: "浏览页实时刷新", group: "界面", hot: true, tier: "basic" },
 };
 
@@ -244,6 +246,20 @@ function migrateTaskTimes(tasks) {
     }
   }
   return changed;
+}
+
+/**
+ * 「显示的页签」默认集的一次性迁移（旧默认 5 项 → 新默认 8 项，2026-10-20）。
+ * 配置页保存会把 ui.tabs 整个数组落盘，只改 seed 默认值救不回已写盘的存量配置；
+ * 又不能一刀切全搬 —— 用户自行勾选过的清单（含 9 项全开、或任何与旧默认不同的组合/顺序）
+ * 是刻意选择，必须保留。所以只迁移「恰好逐位等于旧默认 5 项」的值。
+ * 幂等：值已是新默认（8 项）不可能再命中旧清单。命中返回新默认数组，否则返回 null。
+ */
+function migrateUiTabs(tabs) {
+  if (!Array.isArray(tabs)) return null;
+  const OLD = ["dashboard", "browse", "projects", "auto", "sync"];
+  if (tabs.length !== OLD.length || tabs.some((v, i) => v !== OLD[i])) return null;
+  return ["dashboard", "browse", "projects", "profile", "agents", "auto", "import", "sync"];
 }
 
 function flattenDefaults() {
@@ -309,4 +325,4 @@ function validateValue(meta, value) {
   }
 }
 
-module.exports = { SCHEMA, defaultConfig, flattenDefaults, validateValue, EFFORTS, API_FORMATS, migrateTaskTimes, TASK_DEFAULT_TIMES };
+module.exports = { SCHEMA, defaultConfig, flattenDefaults, validateValue, EFFORTS, API_FORMATS, migrateTaskTimes, migrateUiTabs, TASK_DEFAULT_TIMES };

@@ -1,6 +1,6 @@
 <!--
   AgentHub · 记忆中枢（Memory Hub）
-  Copyright (c) 2026 沐辉 (HUIdada1)
+  Copyright (c) 2026 沐晖 (HUIdada1)
   https://github.com/HUIdada1/AgentHub
   本文件为开源项目 AgentHub 的组成部分，作者保留署名权；依据开源协议使用时禁止删除本声明。
 -->
@@ -530,7 +530,7 @@ function modelsForRoute(r: Routing) {
 
 /**
  * 任务级路由统一保存口。后端 saveSources 对 routing/taskEffort 是整键替换，所以每次带全量；
- * routing 以 sources().routing 的原始条目为基底增量改（预览行的 tags 可能来自默认映射，不能照抄固化）。
+ * routing 以 sources().routing 的原始条目为基底增量改（预览行的 tags 可能来自默认映射，不能直接固化）。
  */
 async function saveRouting(task: string, patch: { providerId?: string; modelId?: string; tags?: string[]; effort?: string }) {
   const routes: RouteEntry[] = (sources.value.routing || []).map((r) => ({ ...r }));

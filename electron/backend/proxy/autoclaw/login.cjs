@@ -1,4 +1,4 @@
-// 反代网关 · AutoClaw 登录协议（参照实现 providers/autoclaw/login.rs + oauth.rs）
+// 反代网关 · AutoClaw 登录协议（协议事实：登录 + oauth 实测）
 //
 // 国内版 = 手机验证码两跳（send-code / agent-login/）；国际版 = OAuth 三跳
 // （captcha-config → zai-oauth-url 带 ali_captcha_verify_param → 浏览器登录 → zai-oauth-login）。
@@ -8,7 +8,7 @@
 
 const headersMod = require("./headers.cjs");
 
-/** 上游错误码 → 用户可读文案（参照实现 login.rs/oauth.rs 错误表） */
+/** 上游错误码 → 用户可读文案（登录 / oauth 错误表） */
 const LOGIN_ERR_MESSAGES = {
   400001: "请求参数有误，请检查手机号与验证码格式后重试",
   630101: "获取验证码过于频繁，请稍后再试",
@@ -187,7 +187,7 @@ async function oauthExchange(env) {
   };
 }
 
-/** best-effort 邮箱回填（user-profile 的 source_id 固定 autotyper——参照实现同款）。失败返回空串 */
+/** best-effort 邮箱回填（user-profile 的 source_id 固定 autotyper）。失败返回空串 */
 async function fetchUserEmail(env) {
   const { cfg, httpJson } = env;
   try {

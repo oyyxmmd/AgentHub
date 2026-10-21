@@ -8,14 +8,17 @@
 
 ---
 
-## > **本 Fork 的修改**（相对上游 [HUIdada1/AgentHub](https://github.com/HUIdada1/AgentHub)）
+## 本 Fork 的修改
+
+相对上游 [HUIdada1/AgentHub](https://github.com/HUIdada1/AgentHub)，当前已合并上游 `v1.81.0`。
 
 | 修改 | 说明 |
 | --- | --- |
-| **WorkBuddy CN 积分任务自动化** | 参考 [Buddy Switch](https://github.com/NextAgentX/trae-workbuddy-switch) 接入四类成长任务：**猫猫旅行**（状态机自动派猫/领奖）、**夜猫子**（23:00–08:00 窗口内自动补事件领奖）、**活跃地图**（对话事件连发上报 + 连登奖励链：礼包/补偿/补签/兑换/抽奖）、**开学季**（任务链 + 转盘）。每类独立开关（配置 · 反代网关 · 定时），15 分钟自动调度 + 号池页手动执行，执行记录在「任务日志」弹窗可查，落盘持久化，正常态静默幂等 |
-| **Trae SOLO CN OAuth 登录修复** | 对齐 Buddy Switch 的 Rust 实现：读本机官方客户端 icube 设备身份（DeviceID/MachineID/EC P-256 公钥）、SOLO 安装包版本三处同值（授权 URL + 兑换体）、`Result.AccessToken` 信封解析、四变体 × 多域兑换链、回调参数反复 percent-decode、完整请求/响应诊断日志（`[trae-oauth]`） |
-| **Trae 模型目录完整拉取** | `get_detail_param` 按 `function` 键逐键拉取合并（`solo_work_lite` + `solo_agent` 并集，修复只回 1 个模型的问题），条目记录来源键，出站 `functionForModel` 优先回查 catalog 条目 |
+| **WorkBuddy CN 积分任务自动化** | 参考 [Buddy Switch](https://github.com/NextAgentX/trae-workbuddy-switch) 接入四类成长任务：**猫猫旅行**（状态机自动派猫/领奖）、**夜猫子**（23:00–08:00 窗口内自动补事件领奖）、**活跃地图**（对话事件连发上报 + 连登奖励链）、**开学季**（任务链 + 转盘）。每类独立开关（配置 · 反代网关 · 定时），15 分钟自动调度 + 号池页手动执行，执行记录在「任务日志」弹窗可查 |
+| **Trae SOLO CN OAuth 登录修复** | 对齐 Buddy Switch 的 Rust 实现：读本机官方客户端 icube 设备身份、SOLO 安装包版本三处同值、`Result.AccessToken` 信封解析、四变体 × 多域兑换链、回调参数反复 percent-decode、完整请求/响应诊断日志 |
+| **Trae 模型目录完整拉取** | `get_detail_param` 按 `function` 键逐键拉取合并（`solo_work_lite` + `solo_agent` 并集），并合并上游对内部条目、占位模板、下线模型的过滤 |
 | **macOS（Apple Silicon）支持** | electron-builder dmg/zip 目标（仅 arm64、跳过签名），`build/icon.icns` 由 logo 生成；首次打开需右键「打开」绕过 Gatekeeper 或 `xattr -cr /Applications/AgentHub.app` |
+| **上游 v1.75–v1.81 合并** | 吸收同 body 重试串行化、流中空闲超时不罚号、WorkBuddy 6004 冷却修正、Trae 4001/超长输入分类、CodeBuddy/TraeCode 身份句改写、网络代理出口池等功能 |
 
 ---
 
@@ -24,13 +27,13 @@
 | 板块 | 一句话 |
 | --- | --- |
 | **技能仓库** | 把散落在各工具的 Skill 收进中央库，一处维护、一键分发（软链接挂载） |
-| **用量统计** | 汇总 20 个数据源的 token 用量与费用，按天/项目/模型看趋势 |
+| **用量统计** | 汇总多个数据源的 token 用量与费用，按天/项目/模型看趋势 |
 | **反代网关** | 把已登录的订阅额度包成 OpenAI 兼容 API（`http://127.0.0.1:9527/v1`），给任何客户端用；号池五态管理、自动换号、冷却、多机 WebDAV 同步 |
 | **记忆中枢** | 本地 Markdown 记忆库 + MCP 服务，让 Agent 记住项目与偏好 |
 
-**反代网关渠道**：Trae SOLO CN / WorkBuddy CN / WorkBuddy AI / 商汤小浣熊 / LobsterAI（有道龙虾）/ ZCode（智谱）/ Qoder CN / Qoder International / ModelScope（魔搭）/ CatPaw（美团）——号池、签到、策略各渠道独立；添加账号支持 OAuth 登录、本机客户端导入、JSON/ZIP 文件、粘贴 JSON 四种方式。
+**反代网关渠道**：Trae SOLO CN / WorkBuddy CN / WorkBuddy AI / 商汤小浣熊 / LobsterAI / ZCode / Qoder CN / Qoder International / ModelScope / CatPaw 等。添加账号支持 OAuth 登录、本机客户端导入、JSON/ZIP 文件、粘贴 JSON 四种方式。
 
-> Qoder 渠道依赖本机安装的客户端（签名由客户端内置 wasm 生成）；每日领 Credits 同理。Trae 不支持「切到 IDE」（登录态为设备绑定的加密信封）。
+> Qoder 渠道依赖本机安装的客户端；每日领 Credits 同理。Trae 不支持「切到 IDE」（登录态为设备绑定的加密信封）。
 
 ---
 

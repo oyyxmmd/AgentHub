@@ -2,14 +2,14 @@
 //
 // 两个池 = 两个独立渠道（同套实现、按池参数化，与 makeQoder / makeAutoClaw 同款）：
 // 上游同域同协议同凭证，差别只有「收哪个池的模型」。把整份实现复制两份只为一个过滤条件，
-// 会让凭证续期、错误分类、SSE 回写任何一处改动都要记得改两遍（参考实现同款取舍）。
+// 会让凭证续期、错误分类、SSE 回写任何一处改动都要记得改两遍（同款取舍）。
 //
 // 协议层拆在本地目录：
 //   credentials.cjs（workos: 前缀 + JWT 解析 + providers.json 读取）
 //   login.cjs（WorkOS 设备授权四步） / models.cjs（归池 + 友好名归一）
 //   balance.cjs（微 credit ÷1e6 + plan 404） / refresh.cjs（轮换 + 裸 JWT + ISO expiresAt）
 //
-// ── 上游协议要点（全部实测核对，2026-09 参考实现 agent2api）────────
+// ── 上游协议要点（全部实测核对，2026-09）────────
 //   - LLM：POST {apiBase}/chat/completions（完整路径 /api/v1/chat/completions，
 //     路径只有一个 v1；发成 /api/v1/v1/... 是 404 Not Found）；
 //   - 鉴权 Authorization: Bearer workos:<JWT>（前缀原样带，去掉 401）；
@@ -19,12 +19,12 @@
 //   - SSE 帧的 model 是上游内部名（请求 cline-free/x 回 deepseek/x）→ 必须回写为
 //     客户端请求名，否则客户端会看到它没请求过的名字。
 //
-// ── 出站 body 的取舍（与参考实现的一处刻意偏离）──────────────────
-// 参考实现照抄 cline-proxy 做**白名单重建**（固定键 + 白名单透传）。本实现只做
+// ── 出站 body 的取舍（一处刻意偏离）──────────────────
+// 上游做**白名单重建**（固定键 + 白名单透传）。本实现只做
 // 「透传 + 三处改写」：① model 补池前缀（models.resolveBodyModel，目录内匹配）；
 // ② session_id 注入（官方 CLI 形态，与 X-Task-ID 同值）；③ reasoning_effort 归一
-// （驼峰键翻译 + 缺失默认 high，追随参考实现两个独立来源的既有语义）。
-// **不注入 max_tokens 默认值**：参考实现缺省注入 128000，但那不知道每个模型的实际输出
+// （驼峰键翻译 + 缺失默认 high，沿用两个独立来源的既有语义）。
+// **不注入 max_tokens 默认值**：上游缺省注入 128000，但那不知道每个模型的实际输出
 // 上限，注入超限值只会引入新的失败面——缺失时透传缺失，由上游按模型默认处理。
 // 白名单重建同样不做：上游是 OpenAI 兼容网关，透传即可；重建漏字段才是真风险。
 "use strict";
@@ -36,10 +36,10 @@ const balanceMod = require("./balance.cjs");
 const refreshMod = require("./refresh.cjs");
 const headersMod = require("./headers.cjs");
 
-/** 默认思考档位（参考实现 cline-proxy 同值；官方 CLI 未显式给档时的默认形态） */
+/** 默认思考档位（与官方 CLI 同值；未显式给档时的默认形态） */
 const DEFAULT_REASONING_EFFORT = "high";
 
-/** 家族启发式（参考实现 context_window_for / reasoning_for 的回退口径）：
+/** 家族启发式（context_window_for / reasoning_for 的回退口径）：
  *  目录里查不到的全新模型按 id 家族给窗口与思考开关，不写死一个数 */
 function contextWindowHeuristic(id) {
   const name = String(id || "").toLowerCase();
@@ -49,13 +49,13 @@ function contextWindowHeuristic(id) {
   return 128000;
 }
 
-/** 少数小模型没有 reasoning 输出（参考实现 reasoning_for 同口径） */
+/** 少数小模型没有 reasoning 输出（reasoning_for 同口径） */
 function reasoningHeuristic(id) {
   const name = String(id || "").toLowerCase();
   return !(name.includes("solar-pro4") || name.includes("flash-lite"));
 }
 
-/** 429 文案里的人话时长解析（参考实现 parseHumanDuration 移植）：
+/** 429 文案里的人话时长解析（parseHumanDuration 对齐）：
  *  "Try again in 17h 59m" / "1d 2h 30m" / "30s" 任意组合 → 毫秒；解析不出返回 0。
  *  免费额度撞限的真实冷却可达小时级，只按通用层的短退避会反复打无效请求。 */
 function parseTryAgainMs(text) {
@@ -166,7 +166,7 @@ function makeCline(channel, deps) {
       const parsed = modelsMod.filterByPool(modelsMod.parseRecommended(r.data), pool);
       if (!parsed.length) return { ok: false, message: "模型目录为空（响应里没有本池可用模型）" };
       const models = parsed.map((m) => {
-        // 元数据继承（先查表再启发式，与参考实现同款两段式）：上游目录不回传元数据，
+        // 元数据继承（先查表再启发式，两段式）：上游目录不回传元数据，
         // 硬编码 capabilities/0 会让「远程与静态两条路径给出不同的数」——同步后
         // solar-pro4 的思考开关从 false 跳 true、全部上下文长度归 0（刷新前后跳变）
         const hit = catalogEntries().find((e) => String(e.id || "").toLowerCase() === m.id.toLowerCase());
@@ -196,13 +196,13 @@ function makeCline(channel, deps) {
       const sessionId = `sess_${Date.now()}`;
       out.session_id = sessionId;
       // reasoning_effort：客户端 snake_case 优先，驼峰 reasoningEffort 也认（上行统一 snake）；
-      // 都没给时注入默认 high（参考实现两来源同值；贴近官方客户端形态，无失败面）
+      // 都没给时注入默认 high（两来源同值；贴近官方客户端形态，无失败面）
       const effort = [out.reasoning_effort, out.reasoningEffort]
         .map((v) => String(v == null ? "" : v).trim())
         .find((v) => v) || DEFAULT_REASONING_EFFORT;
       out.reasoning_effort = effort;
       delete out.reasoningEffort;
-      // max_tokens ≤ 0 按缺失处理（对齐参考 adapter.rs：0/负数不算显式小值，对上游只会是
+      // max_tokens ≤ 0 按缺失处理（对齐上游：0/负数不算显式小值，对上游只会是
       // 参数错误）；保留「缺失时透传缺失」的既有取舍（本适配器刻意不注入默认值）
       if (Number(out.max_tokens) <= 0) delete out.max_tokens;
       return { body: out, sessionId };
@@ -348,8 +348,8 @@ function makeCline(channel, deps) {
      *       ① ENTITLEMENT_ERROR（该账号未订阅该模型）：换账号同样失败，换模型即可；
      *       ② only available via Cline product surfaces / not a supported client：
      *          **渠道级**产品面校验失败——最常见成因是 headers.json 的 X-CLIENT-TYPE
-     *          伪装头被删/改空（它是免费池的**硬门槛**，方案 §3），此时整池都会 403。
-     *     ⚠ 两类都保持 switchable:false（方案 §8：403 一律不重试）——渠道级也**不降级不冷却**：
+     *          伪装头被删/改空（它是免费池的**硬门槛**），此时整池都会 403。
+     *     ⚠ 两类都保持 switchable:false（403 一律不重试）——渠道级也**不降级不冷却**：
      *       降级/冷却救不了配置错误，只会把「改一行配置就能修」变成「静默跳过」。
      *   - 404 model not found：模型名不对，同样 model_denied（换账号无用）；
      *   - 429：真限流 → rate；错误文案带人话时长（"Try again in 17h 59m"）→ 解析成

@@ -215,7 +215,7 @@ export interface BillingConfig {
   remotePricing: RemotePricingConfig; // 远程价格源自动拉取（来源 remote）
 }
 
-/** 远程价格源（参考 sub2api pricing.remote_url/hash_url；三层来源中优先级居中：手动 > 远程 > 内置） */
+/** 远程价格源（pricing.remote_url/hash_url；三层来源中优先级居中：手动 > 远程 > 内置） */
 export interface RemotePricingConfig {
   enabled: boolean;
   url: string; // 价格表 JSON 地址（LiteLLM 兼容格式）

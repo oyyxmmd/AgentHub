@@ -211,13 +211,14 @@ export type WebDavEvent = { event: "webdav"; stage: string; detail: string; pct?
 
 // ===== 全局设置弹窗：左下角设置按钮打开的三个模块（弹窗左列按钮切换） =====
 
-export type SettingsTab = "general" | "webdav" | "data" | "timing";
+export type SettingsTab = "general" | "webdav" | "data" | "timing" | "feedback";
 
 export const SETTINGS_TABS: { key: SettingsTab; name: string; icon: string; desc: string }[] = [
   { key: "general", name: "通用", icon: "ph-sliders-horizontal", desc: "外观 · 模块顺序 · 更新" },
   { key: "webdav", name: "WebDAV 同步", icon: "ph-cloud", desc: "统一服务器 · 号池同步" },
   { key: "timing", name: "同步时间", icon: "ph-clock-countdown", desc: "各板块自动同步 / 刷新周期" },
   { key: "data", name: "数据与备份", icon: "ph-database", desc: "备份压缩包 · 缓存目录" },
+  { key: "feedback", name: "反馈与需求", icon: "ph-chat-circle-dots", desc: "问题反馈 · 功能建议" },
 ];
 
 // ===== 应用配置：框架（主题 / 模块顺序）+ 技能仓库 + 更新 =====
@@ -732,6 +733,9 @@ export interface ProxyStatsRange {
 
 /** 富字段聚合行：TOP 排行与各 Key 用量共用（tokens = prompt + completion，缓存 token 是 prompt 的子集） */
 export interface ProxyStatsAggRow {
+  /** 分组身份 id：channel/model 为值本身，key/account 为 key_id/account_id——
+   *  名字可改且可能撞名，前端列表 key 必须绑它而不是 name */
+  id: string;
   name: string;
   req: number;
   ok: number;
@@ -829,6 +833,54 @@ export interface ProxyOpLogRow {
 export interface ProxyOpLogList {
   rows: ProxyOpLogRow[];
   total: number;
+}
+
+// ===== 反代网关 · 网络代理（出口池；netproxy.json）=====
+
+/** 一次连通性测试的结果（落进条目 lastTest，也在测试接口直接返回） */
+export interface ProxyNetProxyTest {
+  success: boolean;
+  /** 目标站点返回的状态码（连不上为 null） */
+  status: number | null;
+  /** 出口 IP（附加信息，拿不到为空串） */
+  ip: string;
+  durationMs: number;
+  /** 失败原因（成功为空串） */
+  error: string;
+  /** 测试时刻（仅落盘的 lastTest 有） */
+  at?: number;
+}
+
+export interface ProxyNetProxyItem {
+  id: string;
+  name: string;
+  protocol: "http" | "socks5";
+  host: string;
+  port: number;
+  username: string;
+  /** 密码只回「有没有」，明文永不出后端 */
+  hasPassword: boolean;
+  enabled: boolean;
+  lastTest: ProxyNetProxyTest | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 出口策略：off 直连 · fixed 固定一条 · rotate 轮询启用条目 */
+export type ProxyNetProxyMode = "off" | "fixed" | "rotate";
+
+export interface ProxyNetProxyList {
+  ok: boolean;
+  mode: ProxyNetProxyMode;
+  fixedId: string;
+  settings: {
+    testUrl: string;
+    timeoutMs: number;
+    /** 默认值（「恢复默认」回填用） */
+    defaultTestUrl: string;
+    defaultTimeoutMs: number;
+  };
+  items: ProxyNetProxyItem[];
 }
 
 export interface ModelCustomEntry {
@@ -1131,6 +1183,8 @@ export const MODULES: ModuleDef[] = [
       { id: "poolsync", name: "号池同步" },
       { id: "ccswitch", name: "生态接入" },
       { id: "proxylog", name: "日志" },
+      // 出口池：网关向上游转发时的出网代理（直连 / 固定 / 轮询），排在「日志」右侧
+      { id: "netproxy", name: "网络代理" },
     ],
   },
   {

@@ -1,6 +1,6 @@
 // 反代网关 · ZCode 本机文件与 enc:v1 加密（zcode 渠道的地基模块）
 //
-// 事实基线（本机实测 + 示例项目 zcode-account-switcher / zcode-switch 双重互证）：
+// 事实基线（本机实测 + 官方账号切换实现双重互证）：
 //   · 登录态由 ~/.zcode/v2/credentials.json 承载：平铺 map，值为 enc:v1 密文。
 //     关键键：zcodejwttoken（billing/claim/start-plan 对话的 Bearer，payload 无 exp）、
 //     oauth:active_provider（zai/bigmodel）、oauth:{p}:access_token / refresh_token / user_info、

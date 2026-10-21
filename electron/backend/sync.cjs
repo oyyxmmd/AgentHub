@@ -627,7 +627,9 @@ async function run(cfg, opts = {}) {
   if (remoteRun && !webdav.tryBeginSync("usage")) throw new Error("其他模块的远端同步正在进行，本轮已跳过");
   state = { running: true, cancelled: false, stage: "extract", percent: 0, message: "准备抽取", lastSyncAt: state.lastSyncAt || null, localOnly: false, backupOnly: false, restoring: false };
   currentAbort = new AbortController();
-  webdav.setActiveSignal(currentAbort.signal);
+  // 只有真正走远端时才占用全局取消信号：本地模式会与远端同步并发（它不拿全局锁），
+  // 原先无条件设置会覆盖对方的 signal，本地结束再写 null，远端在途请求因此失去取消能力。
+  if (remoteRun) webdav.setActiveSignal(currentAbort.signal);
 
   try {
     // 本地模式：未配置 WebDAV 或强制备份（opts.mode=backup）时，仅做本机抽取与备份打包，
@@ -686,8 +688,11 @@ async function run(cfg, opts = {}) {
     if (onFinish) onFinish(false, msg);
     return { ok: false, error: msg };
   } finally {
-    if (remoteRun) webdav.endSync();
-    webdav.setActiveSignal(null);
+    // 本地模式没有占用全局锁/取消信号，不能在这里清掉远端同步的信号
+    if (remoteRun) {
+      webdav.endSync();
+      webdav.setActiveSignal(null);
+    }
     currentAbort = null;
   }
 }

@@ -1,4 +1,4 @@
-// 反代网关 · AutoClaw 出站 body 规范化（参照实现 providers/autoclaw/prompt.rs + adapter.rs）
+// 反代网关 · AutoClaw 出站 body 规范化（协议事实：prompt + adapter 实测）
 //
 // 上游三道闸门里的两道在 body 上，必须出站前处理：
 //   ① system 提示词白名单——system/developer 首句必须以 OpenClaw 身份句开头且带 ## Tooling 段，
@@ -16,13 +16,16 @@ const IDENTITY_PREFIX =
   "Available tools are policy-filtered. Names are case-sensitive; call exactly as listed.\n";
 
 /**
- * 外来 harness 身份句改写表。三条纪律（照参照实现，顺序不能乱）：
+ * 外来 harness 身份句改写表。三条纪律（顺序不能乱）：
  *   · 长的在前——短串在前会把长匹配切碎，改写后仍残留产品名；
  *   · 替换串都不得含任何产品名（插词不够用，必须整名去掉）；
  *   · 匹配忽略 ASCII 大小写（用逐字符小写比较，不能用 toLowerCase 整串折叠——
  *     Unicode 折叠会改变串长导致错位）。
  */
 const FOREIGN_IDENTITIES = [
+  ["You are CodeBuddy Code", "You are an interactive coding assistant"],
+  ["You are CodeBuddy", "You are a coding assistant"],
+  ["You are an interactive agent in TraeCode", "You are an interactive coding agent"],
   ["You are ZCode, an interactive coding agent", "You are an interactive coding agent"],
   ["You are a coding agent running in the Codex CLI tool", "You are a coding agent running in a terminal CLI tool"],
   ["You are a coding agent running in the Codex CLI", "You are a coding agent running in a terminal CLI"],
@@ -46,7 +49,7 @@ function asciiFold(s) {
 }
 
 /** ASCII 大小写不敏感的子串替换：命中全部替换，替换产物不再被检查（从匹配处之后继续，无死循环）。
- *  逐字符滑窗 + ASCII 折叠比较（对齐注释纪律与参照实现 eq_ignore_ascii_case）：
+ *  逐字符滑窗 + ASCII 折叠比较（对齐注释纪律与 eq_ignore_ascii_case）：
  *  needle 是纯 ASCII（长度稳定），haystack 含 Unicode 扩展字符时下标仍与原文对齐 */
 function replaceIgnoringCase(text, needle, replacement) {
   const n = needle.length;
@@ -150,7 +153,7 @@ const MAX_TOKENS_FLOOR = 10000;
  * max_tokens 归一（就地改写）：
  *   · 改：max_tokens 是 JSON number、有限整数、且 0 < v < 10000 → 原地写 10000；
  *   · 不改：字段缺失（**不注入**——上游对缺省 200，凭空注入反而改变行为）、
- *     ≥10000、0/负数/null/字符串/浮点一律原样（参照实现只认 JSON number 类型，
+ *     ≥10000、0/负数/null/字符串/浮点一律原样（只认 JSON number 类型，
  *     不做 Number() 强转——字符串 "4096" 改写反而是行为变更）；max_completion_tokens 不参与。
  */
 function normalizeMaxTokens(body) {

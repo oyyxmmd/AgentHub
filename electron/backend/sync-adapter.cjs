@@ -21,8 +21,9 @@ const traeSoloCn = require("./adapter-trae-solo-cn.cjs");
 const traeSolo = require("./adapter-trae-solo.cjs");
 const opensquilla = require("./adapter-opensquilla.cjs");
 const grok = require("./adapter-grok.cjs");
+const autoclaw = require("./adapter-autoclaw.cjs");
 
-const sources = [zcode, raccoon, mimo, codex, dsh, workbuddy, workbuddyAi, reasonix, codebuddy, qoder, qoderCn, antigravity, antigravityIde, antigravityLegacy, trae, traeCn, traeSolo, traeSoloCn, opensquilla, grok];
+const sources = [zcode, raccoon, mimo, codex, dsh, workbuddy, workbuddyAi, reasonix, codebuddy, qoder, qoderCn, antigravity, antigravityIde, antigravityLegacy, trae, traeCn, traeSolo, traeSoloCn, opensquilla, grok, autoclaw];
 
 function byId(id) {
   return sources.find((s) => s.id === id);

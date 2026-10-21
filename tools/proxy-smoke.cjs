@@ -87,7 +87,7 @@ async function main() {
   }, { id: "acc1", uid: "u1" });
   assert(tb.config_name === "DeepSeek-V4-Flash" && tb.model === "DeepSeek-V4-Flash", "模型映射（config_name/model 同值）");
   assert(tb.stream === true && tb.function === "solo_work_lite" && tb.workspace_id === "e04cdd" && tb.mode === "FunctionCall", "必填注入");
-  // function 字段按模型分发（参考项目实证：部分模型仅在 solo_agent 下可用）
+  // function 字段按模型分发（实测：部分模型仅在 solo_agent 下可用）
   const tAgent = trae.rewriteBody("glm-5.3-flash", { model: "glm-5.3-flash", messages: [{ role: "user", content: "x" }] }, { id: "acc1", uid: "u1" });
   assert(tAgent.function === "solo_agent", "function 分发：glm-5.3-flash → solo_agent");
   assert(Array.isArray(tb.messages[0].content) && tb.messages[0].content[0].type === "text", "内容数组化");
@@ -128,7 +128,7 @@ async function main() {
   );
   assert(wh["user-agent"].includes("WorkBuddy"), "UA 伪装");
   assert(typeof wbody.prompt_cache_key === "string" && wbody.prompt_cache_key.startsWith("agenthub-"), "prompt_cache_key 注入");
-  // deepseek thinking（参考项目 thinking.go：开思考必须显式 enabled + 默认档，否则无思维链）
+  // deepseek thinking（开思考必须显式 enabled + 默认档，否则无思维链）
   const wDeep = wb.rewriteBody("deepseek-v3.2", { model: "deepseek-v3.2", messages: [{ role: "user", content: "hi" }] });
   assert(wDeep.thinking && wDeep.thinking.type === "enabled" && wDeep.reasoning_effort === "high", "deepseek thinking 注入");
   // 连续同角色合并不丢多模态 part（修复：压扁数组会丢 image_url）
@@ -140,7 +140,7 @@ async function main() {
     ],
   });
   assert(wMulti.messages.length === 2 && Array.isArray(wMulti.messages[0].content) && wMulti.messages[0].content.some((p) => p.type === "image_url"), "合并不丢多模态 part");
-  // 工具结果组重排（参考项目 repackToolResultBlocks）：夹在 tool_calls 与 tool 结果之间的消息挪到组后
+  // 工具结果组重排（repackToolResultBlocks）：夹在 tool_calls 与 tool 结果之间的消息挪到组后
   const wPack = wb.rewriteBody("gpt-5", {
     model: "gpt-5",
     messages: [
@@ -265,7 +265,7 @@ async function main() {
       assert(ad.models().length === 0, `${id} 不得继承 CN 静态兜底（无目录时清单为空）`);
     }
     // headers() 必须**不含** Authorization：签名由 chat() 内 wasm 现场产出，
-    // 静态头里出现 Authorization 即为「照抄 WB 静态头组」的错误实现
+    // 静态头里出现 Authorization 即为「直接套用 WB 静态头组」的错误实现
     const h = ad.headers();
     assert(!("authorization" in h) && !("Authorization" in h), `${id} headers() 不含 Authorization（签名下沉 chat()）`);
     assert(typeof h["user-agent"] === "string" && h.accept === "text/event-stream", `${id} headers() 基础头正确`);
@@ -441,7 +441,7 @@ async function main() {
   sc.feed('event: output\ndata: {"response":"he');
   sc.feed('llo"}\n\n: keep-alive\n\nevent: done\ndata: {}\n\n');
   assert(events.length === 2 && events[0][0] === "output", "SSE 分块重组 + keep-alive 跳过");
-  // 紧凑流兼容（参考项目 wb_sse 实证）：无空行分隔的连续 data: 也应逐条产出，不等 EOF
+  // 紧凑流兼容（wb_sse 实证）：无空行分隔的连续 data: 也应逐条产出，不等 EOF
   const compact = [];
   const sc2 = new util.SseScanner((ev, data) => compact.push([ev, data]));
   sc2.feed('data: {"a":1}\ndata: {"b":2}\ndata: [DONE]\n');
@@ -529,6 +529,12 @@ async function main() {
         if (url.includes("/misconfig")) {
           // 4001 模型配置为空：验证不罚号（账号保持 online）
           res.end('event: error\ndata: {"code":4001,"message":"model config is empty"}\n\n');
+          return;
+        }
+        if (url.includes("/toolarge")) {
+          // 流内「输入过大」：码写成 4001（模型不可用），真实原因是 prompt 超限。
+          // 判据必须让「过大」优先于码，否则会被当成通道问题换号重撞、并把账号记成故障。
+          res.end('event: error\ndata: {"code":4001,"message":"prompt is too long: 262144 tokens > 200000 maximum context length"}\n\n');
           return;
         }
         if (auth.includes("bad-token")) {
@@ -656,8 +662,20 @@ async function main() {
   rules.reload("headers.json");
   const misCfg = store.addAccount({ channel: "trae", uid: "mis", name: "配置错号", token: "mis-token", source: "paste", expiresAt: Date.now() + 7200000 });
   rr = await call({ model: "deepseek-v4-flash", stream: false, messages: [{ role: "user", content: "hi" }] });
-  assert(rr.status === 502, "4001 按上游错误收尾: " + rr.status);
+  // 状态 404 而非 502：4001 的语义是「该模型在当前 function 通道不可用」（实测
+  // trae 的实测映射表 [4008→429, 4001→404, 20101→502] 逐条钉住）。
+  // 报 502 会让客户端以为上游故障并盲目重试同一个必死的模型；404 才让客户端换模型。
+  // 「不罚号」仍然是这条用例的主体：账号不进冷却、status 保持 online。
+  assert(rr.status === 404, "4001 按上游错误收尾（模型在本通道不可用 → 404）: " + rr.status);
   assert(store.getAccount(misCfg).status === "online", "4001 不罚号（账号保持 online）");
+  // 10.4b-2 流内「输入过大」：码是 4001、文案是 too long → 必须归输入过大（413、零动作、
+  // 不换号重撞、不罚号）。同一份超大 body 换任何账号都同错，判错就会顺着换号链把整池逐个罚掉。
+  headersCfg.trae.chatUrl = "http://127.0.0.1:19530/trae/toolarge";
+  fs.writeFileSync(headersPath, JSON.stringify(headersCfg, null, 2));
+  rules.reload("headers.json");
+  rr = await call({ model: "deepseek-v4-flash", stream: false, messages: [{ role: "user", content: "hi" }] });
+  assert(rr.status === 413, "输入过大按 413 收尾: " + rr.status);
+  assert(store.getAccount(misCfg).status === "online", "输入过大不罚号（账号保持 online）");
   // 10.4b 的夹具账号用完即回收：它 creditsAt=0（未知余额）不参与零余额跳过，
   // 留在池里会让 10.5~10.7 的调度断言撞上 pickAccount 的 100ms 防惊群让位，结果随节奏漂移
   store.removeAccount(misCfg);
@@ -687,7 +705,7 @@ async function main() {
   store.removeAccount(srvAcc);
   await new Promise((r) => setTimeout(r, 2000)); // 渠道降级（streak1=2×800ms）过期再进 10.4d，不串节奏
 
-  // 10.4d 无明示重置时间的 429：同号退避 1s 重试一次就地消化（参考项目 RetrySame 语义）。
+  // 10.4d 无明示重置时间的 429：同号退避 1s 重试一次就地消化（RetrySame 语义）。
   // 单号池场景下这一跳决定 429 是就地消化还是直接抛给客户端
   const rateAcc = store.addAccount({ channel: "trae", uid: "rate1", name: "短限流号", token: "rate-token", source: "paste", expiresAt: Date.now() + 7200000 });
   headersCfg.trae.chatUrl = "http://127.0.0.1:19530/trae/flaky429";

@@ -11,7 +11,7 @@ const LOCAL_DEVICE = "f454fb59-a1b2-4c3d-9e8f-1234567890ab";
 // 软件更新演示状态：有状态流转，浏览器里可预览「检查 → 下载 → 重启安装」完整链路
 let mockUpdateStatus: any = {
   status: "available", isPortable: false, currentVersion: "1.0.0", latestVersion: "1.8.0",
-  percent: 0, notes: "演示环境：新增应用内自动更新（安装版）\n便携版支持手动更新提示", message: "",
+  percent: 0, notes: "演示环境：新增应用内自动更新（安装版）", message: "",
 };
 
 const models = [

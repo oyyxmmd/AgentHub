@@ -10,7 +10,7 @@ let _db = null;
 
 // 当前 schema 版本。旧库（user_version=0）首次打开时迁移到该版本；
 // 未来变更表结构时：SCHEMA_VERSION+1，并在 init() 的迁移块中追加对应 ALTER/重建步骤
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 /** 合法时间戳窗口下限（2020-01-01）：早于它的 startedAt 视为源端垃圾数据 */
 const MIN_VALID_TS = 1577836800000;
@@ -21,6 +21,32 @@ const MAX_FUTURE_MS = 48 * 60 * 60 * 1000;
  * 防止未来垃圾时间戳把增量锚点拉高导致该源数据永久漏采（2026-09-10 审计 H2/N3） */
 function isValidTs(ts) {
   return Number.isFinite(ts) && ts > MIN_VALID_TS && ts <= Date.now() + MAX_FUTURE_MS;
+}
+
+// ===== 只读聚合查询缓存 =====
+// 背景（2026-10-19 真实库 93MB / 13.2 万行实测）：总览一次加载的 5 个 IPC 里，
+// getSummary ~224ms / getHeatmap ~280ms / getDeviceBreakdowns ~250ms，其中约七成是
+// v_record_cost 视图的「逐行相关子查询价格匹配」（13 万次重复求值，SQLite 对该形态无跨行缓存）。
+// 这些聚合在同一份数据不变期间结果恒定，而用量数据只在同步落库 / 改价 / 改别名 /
+// 删设备 / 清缓存这几个写路径变化——按「写即整体失效」做内存缓存，语义零变化。
+// 缓存无 TTL：失效唯一条件是写路径；别给数据新鲜度加猜出来的过期时间。
+const _aggCache = new Map(); // key(JSON 串) -> 结果对象
+
+/** 读取缓存的聚合结果：命中返回深拷贝（调用方拿到自己的副本，改坏不影响下一位读者） */
+function _cached(key, compute) {
+  if (_aggCache.has(key)) {
+    return structuredClone(_aggCache.get(key));
+  }
+  const v = compute();
+  _aggCache.set(key, structuredClone(v));
+  return v;
+}
+
+/** 全量失效：任何写入（记录 / 价格 / 别名 / 设备删除 / 清缓存）后调用。
+ *  全量清比按键精细失效更稳：写路径多且分散（增量合并、备份还原、号池刷新…），
+ *  漏掉一处精细失效就是脏缓存 bug；清掉的代价只是下轮聚合重算一次。 */
+function _invalidateAggCache() {
+  _aggCache.clear();
 }
 
 /** 获取（惰性打开）单例连接 */
@@ -60,6 +86,9 @@ function close() {
   try { _db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch { /* 库异常时也要继续关闭，交由还原流程回滚 */ }
   try { _db.close(); } catch { /* 坏连接同样要置空单例，避免残留坏句柄 */ }
   _db = null;
+  // 关闭意味着库文件可能被替换（备份还原 / 数据目录迁移）：缓存全部作废，
+  // 否则重开后的第一轮查询会拿到旧库的结果（脏缓存）
+  _invalidateAggCache();
 }
 
 /** 记录成本视图：按「记录发生时刻生效的最优匹配价」动态计费（价格修改后历史自动重算）
@@ -234,6 +263,16 @@ function init(db) {
       db.exec("DROP VIEW IF EXISTS v_record_cost");
       db.exec(RECORD_COST_VIEW_SQL);
     }
+    // 7 → 8：AutoClaw 源输入口径修正。该源首版适配器把 usage_json 的 input（新鲜输入，与
+    //        cacheRead 互斥）直接写进 input_tokens，漏了整份缓存读，于是命中率 cache_read/input
+    //        超 100%、计费净输入 input - cache_read 为负、总量少算。存量行补入缓存读即与全系统
+    //        锚点「input_tokens 含 cache_read_tokens」一致（适配器已同步修正，重扫时同 id 覆盖）。
+    //        守卫 cache_read_tokens > input_tokens 只命中旧口径行（新口径下 input ≥ cache_read 恒成立），
+    //        即使本块被意外重复执行也不会二次累加。
+    if (current < 8) {
+      db.exec(`UPDATE usage_record SET input_tokens = input_tokens + cache_read_tokens
+                WHERE source = 'autoclaw' AND cache_read_tokens > input_tokens`);
+    }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }
 
@@ -361,6 +400,9 @@ function insertRecords(records) {
     db.exec("ROLLBACK");
     throw e;
   }
+  // 新记录落库：总览/趋势/热力图的聚合结果全部失效（只在实际写入了行时才失效，
+  // 空轮同步不触发，避免无意义的缓存抖动）
+  if (written > 0) _invalidateAggCache();
   return written;
 }
 
@@ -402,6 +444,8 @@ function upsertDevice(deviceId, deviceName, source, lastSyncAt) {
     get().prepare(
       "UPDATE usage_record SET device_name = ? WHERE device_id = ?"
     ).run(deviceName, deviceId);
+    // 设备名变了：breakdowns 的展示名来自 device_meta，聚合缓存需要失效
+    _invalidateAggCache();
   }
 }
 
@@ -484,6 +528,30 @@ function todayStartMs() {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
 }
 
+/** 本地日期键（YYYY-MM-DD）→ 当天零点 epoch ms。
+ *  非法/越界输入返回 null（调用方按「无该日期」处理，不猜值）。
+ *  用本地 Date 构造而非 UTC：与 SQL 里的 date(..., 'localtime') 同一时区口径，
+ *  跨 DST 时 new Date(y, m, d) 给出的是当地钟表零点，正是「这一天」的边界。 */
+function localDayStartMs(day) {
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(day || "").trim());
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  // Date 对 2026-2-31 这类溢出会进位到下月：回读校验能拦住它
+  if (d.getFullYear() !== Number(m[1]) || d.getMonth() !== Number(m[2]) - 1 || d.getDate() !== Number(m[3])) return null;
+  return d.getTime();
+}
+
+/** 日期范围 [startDate, endDate]（含端点，本地时区）→ 毫秒边界 [fromMs, toMsExclusive)。
+ *  任一端非法返回 null。这是「函数包住列」谓词的索引可走替代：
+ *  date(started_at/1000,'unixepoch','localtime') >= ? 对每行求值，索引完全用不上；
+ *  started_at >= ? AND started_at < ? 直接命中 idx_record_cover 的 started_at 序。 */
+function localDayRangeMs(startDate, endDate) {
+  const from = localDayStartMs(startDate);
+  const to = localDayStartMs(endDate);
+  if (from == null || to == null) return null;
+  return { fromMs: from, toMsExclusive: to + 86400000 };
+}
+
 /** 口径后缀：完整口径额外加 reasoning_tokens */
 function extraExpr(mode) {
   return mode === "full" ? " + reasoning_tokens" : "";
@@ -523,6 +591,8 @@ function savePrice(entry, updatedBy = "") {
     // 计费价格 LWW 时钟（与行内 updated_at 解耦：删除操作也要推进时钟，否则删光后被远端旧价覆盖）
     setMeta("prices_local_updated", String(Date.now()));
     db.exec("COMMIT");
+    // 价格变化直接改写 v_record_cost 的费用匹配，聚合缓存整体失效
+    _invalidateAggCache();
   } catch (e) {
     db.exec("ROLLBACK");
     throw e;
@@ -535,6 +605,7 @@ function deleteModelPrices(providerId, modelId) {
     "DELETE FROM model_price WHERE model_id = ? AND COALESCE(provider_id, '') = COALESCE(?, '')"
   ).run(modelId, providerId || null);
   setMeta("prices_local_updated", String(Date.now()));
+  _invalidateAggCache();
 }
 
 // ---- 模型别名 CRUD（归并计费）----
@@ -559,6 +630,8 @@ function addAlias(alias, targetModelId) {
   ).run(a, t);
   // 归并影响全部历史费用，与改价同一条 LWW 时钟：多设备同步时后改的一方生效
   setMeta("prices_local_updated", String(Date.now()));
+  // 别名归并直接改写 v_record_cost 的 model_id 归并结果，聚合缓存整体失效
+  _invalidateAggCache();
   const billable = `(${QUOTA_SOURCES_SQL})`;
   const affected = db.prepare(
     `SELECT COUNT(*) AS c FROM usage_record WHERE model_id = ? AND (input_tokens + output_tokens + reasoning_tokens) > 0 AND ${billable}`
@@ -573,6 +646,7 @@ function addAlias(alias, targetModelId) {
 function removeAlias(alias) {
   get().prepare("DELETE FROM model_alias WHERE alias = ?").run(String(alias || "").trim());
   setMeta("prices_local_updated", String(Date.now()));
+  _invalidateAggCache();
 }
 
 function priceRow(row) {
@@ -691,6 +765,8 @@ function replacePrices(prices, clockMs, aliases) {
     }
     setMeta("prices_local_updated", String(Math.floor(Number(clockMs) || Date.now())));
     db.exec("COMMIT");
+    // 价格与别名整表替换：v_record_cost 匹配结果全变，聚合缓存整体失效
+    _invalidateAggCache();
   } catch (e) {
     db.exec("ROLLBACK");
     throw e;
@@ -736,6 +812,9 @@ function applyRemotePricing(entries) {
     }
     setMeta("prices_local_updated", String(now));
     db.exec("COMMIT");
+    // 远程价格段开/关影响 v_record_cost 匹配，聚合缓存整体失效
+    // （全部同价跳过时白清一次，代价只是下轮重算）
+    _invalidateAggCache();
   } catch (e) {
     db.exec("ROLLBACK");
     throw e;
@@ -756,6 +835,16 @@ function whereSql(clauses) {
 }
 
 function getSummary(mode, targetDeviceId = null, source = null) {
+  // 聚合结果缓存：同一 (mode, device, source) 在数据未变期间直接复用。
+  // getSummary 是总览首屏最重的一条（真实库实测 ~224ms，含视图文本聚合与费用聚合两段），
+  // 而它的调用频率远高于数据变化频率（切 tab / 切设备 / 跨天重拉都会进）。
+  // 键含当天零点：汇总里有「今日 / 本月 / 上月同期」等随日期滑动的窗口，跨天即使零写入
+  // 结果也应重算（否则「今日用量」会一直挂着昨天的值），加日期让跨天自然失效。
+  const cacheKey = JSON.stringify(["summary", mode, targetDeviceId ?? null, source ?? null, todayStartMs()]);
+  return _cached(cacheKey, () => _getSummaryImpl(mode, targetDeviceId, source));
+}
+
+function _getSummaryImpl(mode, targetDeviceId = null, source = null) {
   const db = get();
   const extra = extraExpr(mode);
   const selectedScope = recordScope(source, targetDeviceId);
@@ -893,6 +982,12 @@ function getDevices(localDeviceId, mode, source = null) {
 }
 
 function getDeviceBreakdowns(localDeviceId, mode, targetDeviceId = null, source = null) {
+  // 同 getSummary：设备分视图是总览第二重的聚合（实测 ~250ms），数据不变期间结果恒定
+  const cacheKey = JSON.stringify(["deviceBreakdowns", localDeviceId ?? null, mode, targetDeviceId ?? null, source ?? null]);
+  return _cached(cacheKey, () => _getDeviceBreakdownsImpl(localDeviceId, mode, targetDeviceId, source));
+}
+
+function _getDeviceBreakdownsImpl(localDeviceId, mode, targetDeviceId = null, source = null) {
   const extra = extraExpr(mode);
   const sourceJoin = source ? " AND r.source = ?" : "";
   const filter = targetDeviceId ? " WHERE d.device_id = ?" : "";
@@ -941,6 +1036,18 @@ function getDeviceBreakdowns(localDeviceId, mode, targetDeviceId = null, source 
 }
 
 function getTrend(mode, days, targetDeviceId = null, source = null, day = null) {
+  // 近 N 天模式（day=null）缓存：days 的取值集小（7/30/90…），缓存键空间有限。
+  // 键含当天零点：窗口起点是「现在 − N 天」的滑动窗口，跨天即使零写入边界也会前移，
+  // 加日期让跨天自然失效（同一天内的亚天级滑动差异可忽略，与前端按天展示的口径一致）。
+  // 单日模式（day 非空）不缓存——它是用户点某一天的交互查询，实时性优先且量小（实测 ~6ms）。
+  if (day == null) {
+    const cacheKey = JSON.stringify(["trend", mode, days, targetDeviceId ?? null, source ?? null, todayStartMs()]);
+    return _cached(cacheKey, () => _getTrendImpl(mode, days, targetDeviceId, source, null));
+  }
+  return _getTrendImpl(mode, days, targetDeviceId, source, day);
+}
+
+function _getTrendImpl(mode, days, targetDeviceId = null, source = null, day = null) {
   const extra = extraExpr(mode);
   const scope = recordScope(source, targetDeviceId);
   // day 存在时为「单日模式」：按该天 0-23 时分桶，前端展示该天每小时趋势；忽略 days
@@ -948,10 +1055,20 @@ function getTrend(mode, days, targetDeviceId = null, source = null, day = null) 
   const bucketExpr = byHour
     ? "strftime('%H', started_at/1000, 'unixepoch', 'localtime')"
     : "date(started_at/1000, 'unixepoch', 'localtime')";
+  // 单日模式的范围过滤用毫秒边界（与 getHeatmap 同一优化）：date()=? 形态对每行求值，
+  // 全表逐行算函数；started_at >= dayStart AND < nextDayStart 直接走索引。
+  // 非法日期回退旧谓词，保持行为兼容（宁可慢也不能空集）。
+  const dayStart = byHour ? localDayStartMs(day) : null;
   const clauses = byHour
-    ? ["date(started_at/1000, 'unixepoch', 'localtime') = ?", ...scope.clauses]
+    ? dayStart != null
+      ? ["started_at >= ?", "started_at < ?", ...scope.clauses]
+      : ["date(started_at/1000, 'unixepoch', 'localtime') = ?", ...scope.clauses]
     : ["started_at >= ?", ...scope.clauses];
-  const params = byHour ? [day, ...scope.params] : [nowMs() - days * 86400000, ...scope.params];
+  const params = byHour
+    ? dayStart != null
+      ? [dayStart, dayStart + 86400000, ...scope.params]
+      : [day, ...scope.params]
+    : [nowMs() - days * 86400000, ...scope.params];
   const detail = get().prepare(
     `SELECT ${bucketExpr} AS bucket, model_id AS model,
             SUM(input_tokens + output_tokens${extra} + COALESCE(credits, 0)) AS total,
@@ -1006,14 +1123,31 @@ function getTrend(mode, days, targetDeviceId = null, source = null, day = null) 
 }
 
 function getHeatmap(mode, startDate, endDate, targetDeviceId = null, source = null) {
+  // 同 getSummary 的缓存策略：键含日期窗口与范围参数；窗口参数由前端每次以「今天」为锚
+  // 生成，日期一变键自然不同（不存在跨天拿旧窗口的问题）
+  const cacheKey = JSON.stringify(["heatmap", mode, startDate, endDate, targetDeviceId ?? null, source ?? null]);
+  return _cached(cacheKey, () => _getHeatmapImpl(mode, startDate, endDate, targetDeviceId, source));
+}
+
+function _getHeatmapImpl(mode, startDate, endDate, targetDeviceId = null, source = null) {
   const extra = extraExpr(mode);
   const scope = recordScope(source, targetDeviceId);
-  const clauses = [
-    "date(started_at/1000, 'unixepoch', 'localtime') >= ?",
-    "date(started_at/1000, 'unixepoch', 'localtime') <= ?",
-    ...scope.clauses,
-  ];
-  const params = [startDate, endDate, ...scope.params];
+  // 日期范围用毫秒边界过滤（localDayRangeMs），让谓词直接作用于 started_at 裸列——
+  // 索引（idx_record_cover 以 started_at 为序）可走，全表 13 万行不再逐行求 date() 函数。
+  // 原先的 date(started_at/1000,'unixepoch','localtime') >= ? 形态把列包在函数里，
+  // SQLite 只能全表扫；GROUP BY 里的 date() 只作用于已过滤行，保留不动。
+  // 非法日期输入（解析失败）回退到旧谓词形态，宁可慢也不能把查询变成空集。
+  const range = localDayRangeMs(startDate, endDate);
+  const clauses = range
+    ? ["started_at >= ?", "started_at < ?", ...scope.clauses]
+    : [
+        "date(started_at/1000, 'unixepoch', 'localtime') >= ?",
+        "date(started_at/1000, 'unixepoch', 'localtime') <= ?",
+        ...scope.clauses,
+      ];
+  const params = range
+    ? [range.fromMs, range.toMsExclusive, ...scope.params]
+    : [startDate, endDate, ...scope.params];
   const rows = get().prepare(
     `SELECT date(started_at/1000, 'unixepoch', 'localtime') AS date,
             SUM(input_tokens + output_tokens${extra} + COALESCE(credits, 0)) AS total,
@@ -1268,6 +1402,8 @@ function deleteDeviceData(deviceId) {
     db.prepare("DELETE FROM device_meta WHERE device_id = ?").run(deviceId);
     db.prepare("DELETE FROM meta WHERE key LIKE ? ESCAPE '\\'").run(escapeLike(`merged:${deviceId}:`) + "%");
     db.exec("COMMIT");
+    // 该设备的明细与元数据没了：breakdowns/summary 聚合直接变，缓存整体失效
+    _invalidateAggCache();
   } catch (e) {
     db.exec("ROLLBACK");
     throw e;
@@ -1288,6 +1424,8 @@ function clearLocalCache(localDeviceId) {
     db.prepare("DELETE FROM device_meta WHERE device_id != ?").run(localDeviceId ?? "");
     db.prepare("DELETE FROM meta WHERE key LIKE 'uploaded:%' OR key LIKE 'merged:%'").run();
     db.exec("COMMIT");
+    // 明细清空：全部聚合结果作废
+    _invalidateAggCache();
   } catch (e) {
     db.exec("ROLLBACK");
     throw e;

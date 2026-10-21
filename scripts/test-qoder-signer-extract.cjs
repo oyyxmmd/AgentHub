@@ -1,4 +1,4 @@
-// Qoder 签名器结构提取自测（issue #119）
+// Qoder 签名器结构提取自测（issue #119 / #147）
 // 运行：node scripts/test-qoder-signer-extract.cjs
 // 只测纯函数（pickByStructure / patchText）——不读客户端、不加载 wasm、不联网。
 //
@@ -6,8 +6,13 @@
 // 但真正失配的往往不是「结构彻底变了」，而是引号类型、容器字段数量这类无关语义的细节。
 // 本闸用**构造的最小结构**覆盖这些宽容路径，另有一条：本机装了 Qoder 时，
 // 对真实 obf 的提取结果必须与基线逐字一致（防止放宽正则反而把已知结构带偏）。
+// #147 追加：末尾 worker 启动入口必须被中和——不中和会在 import 时 process.exit（应用闪退）。
 "use strict";
 const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { pathToFileURL } = require("node:url");
 const signer = require("../electron/backend/proxy/qoderSigner.cjs");
 
 let pass = 0;
@@ -20,6 +25,27 @@ function ok(cond, msg, got) {
     failed++;
     console.log("  \u2717", msg, got !== undefined ? `→ got ${JSON.stringify(got).slice(0, 200)}` : "");
   }
+}
+
+/** 子进程 import 补丁并 initGlue：worker 入口没中和干净，进程会在 1.2s 内 exit */
+function smokeImport(patched, tag) {
+  const file = path.join(os.tmpdir(), `agenthub-signer-smoke-${tag}-${process.pid}.mjs`);
+  fs.writeFileSync(file, patched, "utf8");
+  const code = [
+    "try {",
+    "  const m = await import(process.argv[1]);",
+    "  await m.initGlue();",
+    "  await new Promise((r) => setTimeout(r, 1200));",
+    '  console.log("SIGNER-OK");',
+    "  process.exit(0);",
+    "} catch (e) {",
+    '  console.error("SIGNER-ERR", e && (e.stack || e.message));',
+    "  process.exit(8);",
+    "}",
+  ].join("\n");
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", code, pathToFileURL(file).href], { timeout: 20000, encoding: "utf8" });
+  try { fs.unlinkSync(file); } catch { /* 清理失败不影响断言 */ }
+  return r;
 }
 
 /**
@@ -103,7 +129,58 @@ console.log("\n[6] 真的缺特征时，仍如实抛错并带诊断");
   ok(err && /通用提取缺/.test(err.message), "错误消息仍说明缺了什么", err && err.message.slice(0, 120));
 }
 
-console.log("\n[7] 真实客户端（本机装了才跑）：提取结果必须与基线逐字一致");
+console.log("\n[7] 末尾 worker 启动入口必须被中和（三种现网收尾形态，issue #147 闪退）");
+{
+  // 最小可提取结构 + 假 wasm init：只验证「末尾入口被裁掉、模块仍能 import」。
+  const base = [
+    'var W1="AGFzbQEAAAA";',
+    "var G1={ok:1};",
+    "function I1(){}",
+    "function P1(){}",
+    "function S1(){}",
+    "var Z1;",
+    "function er(a,b){}",
+    "er(G1,{ProfileEncryptor:()=>P1,QoderContext:()=>G1,default:()=>I1,initSync:()=>S1});",
+  ];
+  const shapes = {
+    "env": [
+      "function parse(){}",
+      "function main(){process.exit(1)}",
+      "function fail(){}",
+      'process.env.QODERCLI_RUNTIME_PACKAGING="worker_mjs",parse(process.argv),main().catch(e=>{fail(e)});',
+    ],
+    "async-call": [
+      "function main(){process.exit(1)}",
+      "async function q(){process.env.QODERCLI_RUNTIME_PACKAGING=\"worker_mjs\";try{await main()}catch(e){}}",
+      "var SD=()=>{};",
+      "SD(),q(async()=>{return {}});",
+    ],
+    "sites-ternary": [
+      "function main(){process.exit(1)}",
+      "function runSites(){process.exit(1)}",
+      "function j0r(fn){process.env.QODERCLI_RUNTIME_PACKAGING=\"worker_mjs\";return main()}",
+      "var AQ=()=>{};",
+      'AQ(),"sites"===process.argv[2]?Promise.resolve().then(()=>runSites()):j0r(async()=>{return {}});',
+    ],
+  };
+  for (const [tag, tail] of Object.entries(shapes)) {
+    const text = base.concat(tail).join("\n");
+    const hit = signer.findWorkerBootstrap(text);
+    ok(!!hit && hit.kind === "invocation", `${tag}：能定位末尾启动入口`, hit);
+    let patched = "";
+    try {
+      patched = signer.patchText(text);
+    } catch (e) {
+      patched = "ERR:" + e.message;
+    }
+    const leftover = signer.findWorkerBootstrap(patched);
+    ok(!leftover || leftover.kind !== "invocation", `${tag}：补丁里不再有会启动 worker 的入口`, leftover);
+    const r = smokeImport(patched, tag);
+    ok(r.status === 0 && /SIGNER-OK/.test(String(r.stdout || "")), `${tag}：子进程 import + initGlue 后不退出`, { status: r.status, stderr: String(r.stderr || "").slice(-200) });
+  }
+}
+
+console.log("\n[8] 真实客户端（本机装了才跑）：提取结果必须与基线逐字一致");
 {
   const loc = signer.locate("qoder_intl") || signer.locate("qoder");
   if (!loc) {
