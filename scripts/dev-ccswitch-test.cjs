@@ -88,8 +88,8 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   r = ccswitch.register({ appType: "claude", apiKey: "sk-test-456", model: "deepseek-v4-flash", port: 9527 });
   assert.strictEqual(r.action, "updated", "重复注册应为 updated");
 
-  // 4) 注册 codex
-  r = ccswitch.register({ appType: "codex", apiKey: "sk-test-123", model: "deepseek-v4-flash", port: 9527 });
+  // 4) 注册 codex：显式窗口来自 AgentHub 当前选中模型，不能再写死 CC Switch 的旧兜底值
+  r = ccswitch.register({ appType: "codex", apiKey: "sk-test-123", model: "deepseek-v4-flash", contextWindow: 1000000, port: 9527 });
   assert.strictEqual(r.clone, undefined); // 防呆：register 不返回无关字段
   assert.strictEqual(r.ok, true, "register codex 应 ok");
   assert.strictEqual(r.action, "inserted", "codex 首次应为 inserted");
@@ -161,12 +161,56 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.strictEqual(metaC.apiFormat, "openai_chat", "claude 上游格式须为 openai_chat");
   assert.strictEqual(metaC.commonConfigEnabled, true, "claude 须并入用户通用配置，否则切换后全局配置丢失");
   assert.strictEqual(metaC.apiKeyField, "ANTHROPIC_AUTH_TOKEN", "claude 须声明鉴权字段，避免表单回写 API_KEY");
+  // 1M 档：CC Switch 这条路径与直连共用同一套 env 键（util 里的常量与纯函数），
+  // 两处各留一份字面量就会出现"直连生效、CC Switch 不生效"这类只在一条路径上复现的问题。
+  {
+    const r1 = ccswitch.register({ appType: "claude", apiKey: "sk-test-1m", model: "deepseek-v4-flash", tiers: { sonnet: "glm-5.3", opus: "", haiku: "kimi-k3", subagent: "" }, contextWindow: 1000000, port: 9527 });
+    assert.strictEqual(r1.ok, true, "claude 1M 注册应 ok: " + JSON.stringify(r1));
+    const db1 = new Database(dbFile);
+    const row1 = db1.prepare("SELECT settings_config FROM providers WHERE id = ? AND app_type = ?").get("agenthub-gateway-claude", "claude");
+    db1.close();
+    const e1 = JSON.parse(row1.settings_config).env;
+    assert.strictEqual(e1.ANTHROPIC_MODEL, "deepseek-v4-flash[1m]", "1M 档默认模型带 [1m] 后缀");
+    assert.strictEqual(e1.ANTHROPIC_DEFAULT_SONNET_MODEL, "glm-5.3[1m]", "1M 档四档模型同样带后缀");
+    assert.ok(String(e1.ANTHROPIC_BETAS || "").includes("context-1m-2025-08-07"), "1M 档必须写 ANTHROPIC_BETAS（缺它上游不认）");
+    assert.strictEqual(e1.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, "glm-5.3", "展示名不带 [1m]");
+    // 降回 200K：后缀与 beta 都要摘掉，否则真实 200K 的模型在 200K 之后直接 400
+    ccswitch.register({ appType: "claude", apiKey: "sk-test-456", model: "deepseek-v4-flash", tiers: { sonnet: "glm-5.3", opus: "", haiku: "kimi-k3", subagent: "sub_agent_x" }, contextWindow: 200000, port: 9527 });
+    const db2 = new Database(dbFile);
+    const row2 = db2.prepare("SELECT settings_config FROM providers WHERE id = ? AND app_type = ?").get("agenthub-gateway-claude", "claude");
+    db2.close();
+    const e2 = JSON.parse(row2.settings_config).env;
+    assert.strictEqual(e2.ANTHROPIC_MODEL, "deepseek-v4-flash", "降回 200K 时摘掉 [1m]");
+    assert.strictEqual(e2.ANTHROPIC_BETAS, undefined, "降回 200K 时不写 ANTHROPIC_BETAS（空串也不是好选择）");
+  }
   const cdx = JSON.parse(codexRow.settings_config);
   assert.strictEqual(cdx.auth.OPENAI_API_KEY, "sk-test-123", "codex auth");
   assert.strictEqual(cdx.modelCatalog.models[0].model, "deepseek-v4-flash", "codex 模型目录应含网关模型");
-  assert.strictEqual(cdx.modelCatalog.models[0].contextWindow, 300000, "codex 模型目录上下文窗口");
-  assert.deepStrictEqual(cdx.modelCatalog.models[0].reasoningLevels, ["low", "high", "max"], "codex 模型目录可选推理档位");
-  assert.strictEqual(cdx.modelCatalog.models[0].defaultReasoningLevel, "high", "codex 模型目录默认推理档位");
+  assert.strictEqual(cdx.modelCatalog.models[0].contextWindow, 1000000, "codex 模型目录应写入选中模型的真实 1M 窗口");
+  // 档位表补上 medium，否则默认档不在列表里时客户端会回落「模板默认档仍在列表则用它，否则取最高档」
+  assert.deepStrictEqual(cdx.modelCatalog.models[0].reasoningLevels, ["low", "medium", "high", "xhigh"], "codex 模型目录可选推理档位");
+  assert.strictEqual(cdx.modelCatalog.models[0].defaultReasoningLevel, "high", "未指定档时的默认保持 high（不静默改版）");
+  assert.ok(cdx.config.includes('model_reasoning_effort = "high"'), "codex toml 顶层也写默认档");
+  // 指定默认思考强度：三处必须一起变，缺任何一处都表现为"设了但没生效"
+  {
+    ccswitch.register({ appType: "codex", apiKey: "sk-test-eff", model: "deepseek-v4-flash", contextWindow: 1000000, reasoningEffort: "xhigh", port: 9527 });
+    const dbe = new Database(dbFile);
+    const rowe = dbe.prepare("SELECT settings_config FROM providers WHERE id = ? AND app_type = ?").get("agenthub-gateway-codex", "codex");
+    dbe.close();
+    const ce = JSON.parse(rowe.settings_config);
+    assert.strictEqual(ce.modelCatalog.models[0].defaultReasoningLevel, "xhigh", "指定档写入模型目录默认档");
+    assert.ok(ce.modelCatalog.models[0].reasoningLevels.includes("xhigh"), "档位表必须包含指定档，否则客户端静默降档");
+    assert.ok(ce.config.includes('model_reasoning_effort = "xhigh"'), "toml 顶层同步指定档");
+    // 非法值不写入、且不静默兜成某个档（兜底会让"填错了"看起来像"生效了"）
+    ccswitch.register({ appType: "codex", apiKey: "sk-test-eff", model: "deepseek-v4-flash", contextWindow: 1000000, reasoningEffort: "ultra", port: 9527 });
+    const dbe2 = new Database(dbFile);
+    const rowe2 = dbe2.prepare("SELECT settings_config FROM providers WHERE id = ? AND app_type = ?").get("agenthub-gateway-codex", "codex");
+    dbe2.close();
+    assert.strictEqual(JSON.parse(rowe2.settings_config).modelCatalog.models[0].defaultReasoningLevel, "high",
+      "非法档回落到既有默认 high，而不是被当成合法值");
+    // 恢复终态：后续断言仍按第一把 Key 与 high 档检查
+    ccswitch.register({ appType: "codex", apiKey: "sk-test-123", model: "deepseek-v4-flash", contextWindow: 1000000, port: 9527 });
+  }
   assert.ok(cdx.config.includes('model_provider = "custom"'), "codex toml: model_provider");
   assert.ok(cdx.config.includes('model = "deepseek-v4-flash"'), "codex toml: model");
   assert.ok(cdx.config.includes('[model_providers.custom]'), "codex toml: custom 段");
@@ -187,6 +231,23 @@ const ccswitch = require("../electron/backend/proxy/ccswitch.cjs");
   assert.strictEqual(metaX.codexChatReasoning.effortValueMode, "passthrough", "effort 档位按原值透传网关");
   console.log("✓ claude 条目 env 嵌套 + apiFormat=openai_chat");
   console.log("✓ codex 条目 auth + 指定 toml + apiFormat=openai_chat + 思考能力已开启");
+
+  // 未知窗口写 0 而不是猜一个数：CC Switch 的 modelCatalog 是客户端唯一的带外声明，
+  // 拿它做溢出判定。写 0 时症状是 Codex 用回退元数据跑（可见、可查），
+  // 猜错则是长会话被静默截断且毫无提示指向这个字段。独立注册一个条目断言以免与上面的真值互相遮蔽。
+  r = ccswitch.register({ appType: "codex", apiKey: "sk-test-unknown", model: "unknown-window", port: 9527 });
+  assert.strictEqual(r.ok, true, "unknown-window 注册应 ok: " + JSON.stringify(r));
+  {
+    const dbu = new Database(dbFile);
+    const row = dbu.prepare("SELECT settings_config FROM providers WHERE id = ? AND app_type = ?")
+      .get("agenthub-gateway-codex", "codex");
+    dbu.close();
+    assert.strictEqual(JSON.parse(row.settings_config).modelCatalog.models[0].contextWindow, 0,
+      "未声明窗口时写 0（未知），不凭空按 300K 收口");
+  }
+  // 恢复可读终态：后续断言仍按 1M 模型与第一把 Key 检查
+  r = ccswitch.register({ appType: "codex", apiKey: "sk-test-123", model: "deepseek-v4-flash", contextWindow: 1000000, port: 9527 });
+  assert.strictEqual(r.ok, true, "恢复 codex 真值条目应 ok");
 
   // claude-desktop 条目内容：proxy 模型映射模式
   // 模型不写 env（Desktop 只认 CC Switch 网关里的角色路由），全放 meta.claudeDesktopModelRoutes；

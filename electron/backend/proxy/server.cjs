@@ -84,15 +84,36 @@ function emitRequestThrottled() {
   }, 2000);
 }
 
-/** 渠道选择：提供商前缀直达 → 单源强制 → per-model 覆盖 → 打分（健康度×余额）/ 指定渠道优先。
+/** 渠道选择（方案 §6.2）：提供商前缀直达 → 自定义提供商优先 → 单源强制 → per-model 覆盖 →
+ *  打分（健康度×余额）/ 指定渠道优先。
  *  关闭的渠道（上游启闭）不参与：modelOwners 已过滤（单源 → 空 → 400），
  *  key.route 指到关闭渠道按 auto 走（钉死的渠道被关后不能把请求带进死胡同） */
 function resolveChannel(key, model, settings) {
+  const builtinAllowed = settings.preferBuiltin === true;
+  // 模型级代理名：显式声明"发到这家供应商的某一行模型"，优先于内置归属。
+  const proxyHit = provider.findByProxyModel(model);
+  if (proxyHit) return { channel: proxyHit, proxyModel: true };
   // `slug/model` 前缀直达提供商。这里只交出渠道，不改模型名——上游真名由适配器的 upstreamFor
   // 剥前缀再映射，与内置适配器「收到客户端模型名、自己改写」的契约一致，调度层不需要第二套命名口径。
   const slug = provider.parseModelRef(model);
   if (slug) return { channel: slug };
+
+  // 内置优先关闭：内置渠道完全不参与自动路由。此时自定义提供商可以认领与内置同名的裸名，
+  // 唯一最高优先者胜出；同级歧义仍不猜。
+  if (!builtinAllowed) {
+    const custom = settings.allowBareProviderModel === false
+      ? null
+      : provider.findUniqueByBareModel(model, { includeBuiltinOwned: true });
+    if (custom) return { channel: custom };
+    // 指定渠道若是自定义提供商，保留"未知模型透传试错"语义；指定内置渠道则忽略。
+    if (key.route !== "auto" && !adapters.ADAPTERS[key.route] && adapters.channelOn(key.route, settings)) {
+      return { channel: key.route };
+    }
+    return { channel: null, unknownModel: true };
+  }
+
   const owners = adapters.modelOwners(model, settings);
+  const pinned = key.route !== "auto" && adapters.channelOn(key.route, settings);
   if (owners.length === 1) return { channel: owners[0] }; // 模型仅存在于单渠道目录 → 强制
   if (key.route !== "auto" && adapters.channelOn(key.route, settings)) {
     // 虚拟统一名不能透传给未配置映射的渠道；非虚拟模型保留「指定渠道透传试错」的既有语义。
@@ -112,9 +133,9 @@ function resolveChannel(key, model, settings) {
     if (adapters.channelOn(settings.fixedChannel, settings)) return { channel: settings.fixedChannel };
     return { channel: null, disabledChannel: settings.fixedChannel };
   }
-  // 裸名兜底（提供商通路的可选项）：没有任何内置渠道拥有该模型时，才允许它唯一命中某个提供商，
-  // 两个提供商都有 gpt-4o 时不猜（见 provider.findUniqueByBareModel）。开关关掉即回到
-  // 「提供商的模型必须写 slug/model」这一种形态；默认放开，因为多数客户端的配置里不带前缀。
+  // 裸名兜底（提供商通路的可选项）：没有任何内置渠道拥有该模型时，才允许它唯一胜出某家提供商，
+  // 两家都有 gpt-4o 且同级时不猜（见 provider.findUniqueByBareModel）。默认放开，
+  // 因为多数客户端的配置里不带前缀；关闭后只接受显式 slug/model（内置优先开启时才有内置兜底）。
   const sole = settings.allowBareProviderModel === false ? null : provider.findUniqueByBareModel(model);
   if (sole) return { channel: sole };
   return { channel: null, unknownModel: true };
@@ -758,6 +779,16 @@ async function handleChat(req, res, settings, surface, convNotes) {
     // 文案区分「渠道被上游启闭关闭」与「模型真不存在」（issue #90）：
     // 前者在合并目录里查得到、只是所有归属渠道都被关/空池，给出可操作指引
     const cat = adapters.mergedModels(settings).find((m) => String(m.id).toLowerCase() === actualModel.toLowerCase());
+    if (cat && settings.preferBuiltin !== true && !resolvedMain.disabledChannel) {
+      record({ status: 400, error: "builtin priority off" });
+      return sink.endErr(
+        400,
+        `模型 "${actualModel}" 只由内置渠道提供，但「内置优先」当前未开启。` +
+        `请在反代网关 → 自定义提供商页开启内置优先，或改用自定义提供商的模型。`,
+        "invalid_request_error",
+        "builtin_priority_off"
+      );
+    }
     if (resolvedMain.disabledChannel || cat) {
       const owners = (resolvedMain.disabledChannel ? [resolvedMain.disabledChannel] : (cat.sources || []))
         .filter((c, i, arr) => arr.indexOf(c) === i);
@@ -1563,7 +1594,7 @@ function status() {
   };
 }
 
-module.exports = { start, stop, stopAsync, drainAndStop, status, channelHealthSnapshot, classifyUpstream,
+module.exports = { start, stop, stopAsync, drainAndStop, status, channelHealthSnapshot, classifyUpstream, resolveChannel,
   // 成本感知路由纯函数（tools/proxy-cost-route-selftest.cjs / proxy-empty-pool-route-selftest.cjs 行为断言用）
   channelScore, costFirstScore, tierGroups, cmpByOrder, routeOrderOf, pickByOrder, routeUsable,
   // 故障转移规模纯函数（tools/proxy-failover-selftest.cjs 边界断言用）

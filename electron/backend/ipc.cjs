@@ -79,6 +79,11 @@ function refreshConfigCache() {
   cfg = null;
 }
 
+// 任何一处 saveConfig 落盘（含 proxy 等模块直接调 config.saveConfig 的读改写路径）
+// 都要作废本模块的快照——否则「后端刚改完，前端 load_config 仍读到旧值」。
+// 订阅方向是 config.cjs publish → 这里 subscribe，不反向 require，避免循环依赖。
+config.onConfigChanged(refreshConfigCache);
+
 /** 应用主题同步到原生窗口框架（标题栏/边框）颜色；主题变化时调用 */
 function applyNativeTheme(nativeTheme, cfgObj) {
   const theme = cfgObj && cfgObj.theme;

@@ -65,6 +65,13 @@ function normalizeBaseUrl(raw) {
     }
   }
   p = p.replace(/\/+$/, "");
+  // OpenCode Go 的旧地址 `/zen/go` 只提供目录，Chat 实际在 `/inference/go/openai`。
+  // 用户在面板里按旧地址填过一次就长期打不通（表现为“连接错误”），写入侧统一迁移到
+  // 官方 Chat 根；真正的端点拼接在 adapters.cjs 里由同一个主机/路径判据完成。
+  if (u.hostname.toLowerCase() === "opencode.ai") {
+    const path = p.toLowerCase();
+    if (path === "/zen/go" || path === "/inference/go") p = "/inference/go/openai";
+  }
   u.pathname = p + (p ? "/" : "");
   return { ok: true, url: u.toString().replace(/\/$/, ""), domain: u.hostname };
 }
@@ -96,11 +103,14 @@ function normalizeModels(raw) {
     seenModels.add(key);
     const aliases = normalizeAliases(e.aliases, model, seenModels, seenAliases);
     if (aliases.error) return { ok: false, message: aliases.error };
+    const proxyModel = String(e.proxyModel || "").trim().slice(0, 128);
+    if (proxyModel.includes("/")) return { ok: false, message: `模型 "${model}" 的代理模型名不能含 /` };
     const reasoning = normalizeReasoning(e.reasoning);
     out.push({
       model,
       upstream: String(e.upstream || model).trim() || model,
       ...(aliases.list.length ? { aliases: aliases.list } : {}),
+      ...(proxyModel ? { proxyModel } : {}),
       ...(reasoning ? { reasoning } : {}),
       name: e.name ? String(e.name).slice(0, 64) : undefined,
       rate: e.rate != null && !Number.isNaN(Number(e.rate)) ? Number(e.rate) : undefined,
@@ -108,6 +118,22 @@ function normalizeModels(raw) {
       contextLength: Number(e.contextLength) || undefined,
       maxOutputTokens: Number(e.maxOutputTokens) || undefined,
     });
+  }
+  // 代理模型名是"平台模型名 → 本供应商某个模型"的显式入口：同一供应商内必须全局唯一，
+  // 且不能与任何客户端模型名/别名撞车；否则请求到底该落哪一行无法解释。
+  const names = new Set();
+  for (const m of out) {
+    names.add(String(m.model).toLowerCase());
+    for (const a of m.aliases || []) names.add(String(a).toLowerCase());
+  }
+  const seenProxy = new Set();
+  for (const m of out) {
+    const pm = String(m.proxyModel || "").trim();
+    if (!pm) continue;
+    const key = pm.toLowerCase();
+    if (names.has(key)) return { ok: false, message: `模型 "${m.model}" 的代理模型名 "${pm}" 与本供应商的模型名/别名重复` };
+    if (seenProxy.has(key)) return { ok: false, message: `代理模型名 "${pm}" 在本供应商内重复` };
+    seenProxy.add(key);
   }
   return { ok: true, models: out };
 }
@@ -208,6 +234,10 @@ function validate(input, existing) {
       extraHeaders: headers.headers,
       extraBody: body.body,
       enabled,
+      // 供应商级旧字段不再写入；代理名已迁到 models[] 每一行，保存时清空旧列由 store 迁移兜底。
+      proxyModel: "",
+      // 归一交给 store.providerPriority：写入侧与读取侧同一口径，避免「面板显示 5、库里存 0」
+      priority: store.providerPriority(input.priority ?? (existing && existing.priority)),
       // 一律 round_robin：expire_first 按到期时间排序，提供商的 Key 没有到期概念（全 0），
       // 结果恒选第一把，多 Key 轮转形同不存在。本期界面不开放改策略（号池页只迭代内置渠道）
       poolStrategy: input.poolStrategy ?? (existing && existing.poolStrategy) ?? "round_robin",
@@ -309,17 +339,21 @@ function parseModelRef(model) {
   return row ? slug : null;
 }
 
-/** 裸名兜底（proxy.allowBareProviderModel）：只在**没有任何内置渠道拥有该模型**时调用，
- *  且要求恰好唯一命中一个提供商——两个提供商都有 gpt-4o 时不猜，交回上层的 unknown model 提示，
- *  让用户用 slug/model 写清楚。内置优先 + 歧义不猜，这两条合起来就是「不会静默遮蔽」的全部含义。
- *  别名与模型名同等参与：客户端拿别名打裸名也是同一个入口，同样只在无内置归属时才生效。 */
-function findUniqueByBareModel(model) {
+/** 裸名解析：返回该裸名归属的**唯一可胜出**的启用中提供商；别名与模型名同等参与。
+ *  includeBuiltinOwned=false 保留旧兜底语义：内置已拥有该裸名时不落到提供商。
+ *  includeBuiltinOwned=true 是「自定义提供商优先」：此时允许覆盖内置归属。
+ *
+ *  消歧口径（两级，都不许"随便挑一家"）：
+ *   ① 只有一家命中 → 直接给它；
+ *   ② 多家命中 → 比优先级，**唯一最高**的那家胜出；
+ *      同级（哪怕都并列最高）仍返回 null，由调用方落回常规路由。
+ *  为什么同级不按 rowid 兜底：那等于让「先建的那家赢」，用户改模型清单的顺序就换了条渠道，
+ *  行为不可预测也无法解释——优先级是显式消歧手段，同级歧义必须让人自己标。
+ */
+function findUniqueByBareModel(model, opts = {}) {
   const target = String(model || "").toLowerCase();
   if (!target || target.includes("/")) return null;
-  // 内置归属先判：裸名的「内置优先」原本靠调用方（server.resolveChannel）的调用顺序兜，
-  // 但判据放在这里才封得住——别名让同一个提供商可以声明任意多个裸名，
-  // 少一个调用点检查就是静默遮蔽。
-  if (adapters.modelOwners(model).length) return null;
+  if (opts.includeBuiltinOwned !== true && adapters.modelOwners(model).length) return null;
   const hits = [];
   for (const row of store.channelList()) {
     if (row.kind === "builtin") continue;
@@ -331,9 +365,39 @@ function findUniqueByBareModel(model) {
         if (Array.isArray(m.aliases)) names.push(...m.aliases);
       }
     }
-    if (names.some((n) => String(n).toLowerCase() === target)) hits.push(row.id);
+    if (names.some((n) => String(n).toLowerCase() === target)) {
+      hits.push({ id: row.id, priority: store.providerPriority(row.priority) });
+    }
   }
-  return hits.length === 1 ? hits[0] : null;
+  if (hits.length === 1) return hits[0].id;
+  if (hits.length > 1) {
+    const top = Math.max(...hits.map((h) => h.priority));
+    const winners = hits.filter((h) => h.priority === top);
+    return winners.length === 1 ? winners[0].id : null;
+  }
+  return null;
+}
+
+/** 代理模型名 → 唯一可胜出的启用中提供商。代理名定义在模型清单每一行，
+ *  同一供应商内由 normalizeModels 保证唯一；跨供应商同名按优先级消歧，同级不猜。 */
+function findByProxyModel(model) {
+  const target = String(model || "").trim().toLowerCase();
+  if (!target || target.includes("/")) return null;
+  const hits = [];
+  for (const row of store.channelList()) {
+    if (row.kind === "builtin") continue;
+    for (const m of row.models || []) {
+      const pm = String((m && typeof m === "object" && m.proxyModel) || "").trim().toLowerCase();
+      if (pm === target) hits.push({ id: row.id, priority: store.providerPriority(row.priority) });
+    }
+  }
+  if (hits.length === 1) return hits[0].id;
+  if (hits.length > 1) {
+    const top = Math.max(...hits.map((h) => h.priority));
+    const winners = hits.filter((h) => h.priority === top);
+    return winners.length === 1 ? winners[0].id : null;
+  }
+  return null;
 }
 
 // ===== 连通性探测 =====
@@ -401,6 +465,9 @@ async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, e
       secrets: { token: secret, refreshToken: "" },
       model: target,
       body: { model: target, messages: [{ role: "user", content: "ping" }], max_tokens: 16, stream: true },
+      // OpenCode Go 要求每个会话带 x-opencode-session；探测也按同一条真实请求路径走，
+      // 否则探测失败但真实请求成功会把人引向改错的排查方向。
+      meta: { conversationId: `agenthub-probe-${Date.now()}` },
       emit,
     });
   } catch (e) {
@@ -413,14 +480,289 @@ async function probe({ id, accountId, baseUrl, key, model, kind, extraHeaders, e
 }
 
 /** 拉上游自己的模型清单：用号池里第一把可用 Key（与探测不同，这里没有"当场输入"的 Key）。
- *  失败如实回错，由 UI 引导手填——真没有 /v1/models 的站是少数，替上游预判会拒掉有能力的那批。 */
-function fetchModels(id) {
+ *  失败如实回错，由 UI 引导手填——真没有 /v1/models 的站是少数，替上游预判会拒掉有能力的那批。
+ *  上游普遍只回模型 id（OpenCode Go 就是如此），再叠一层 models.dev 公开元数据补上下文/输出上限。 */
+async function fetchModels(id) {
   const provider = store.getProvider(id);
-  if (!provider) return Promise.resolve({ ok: false, message: `提供商 "${id}" 不存在` });
+  if (!provider) return { ok: false, message: `提供商 "${id}" 不存在` };
+  const vendor = vendorFor(provider.baseUrl);
   const row = store.accountRows(id).find((r) => r.status !== "disabled" && r.token_enc);
-  if (!row) return Promise.resolve({ ok: false, message: "该提供商还没有可用 Key，先添加一把" });
+  if (!row) {
+    // 官方厂商的模型清单是公开且稳定的：没 Key 时先给兜底目录，用户可先建模型再补 Key；
+    // 余额这类需要鉴权的查询仍然要求 Key，两者不混为一谈。
+    if (vendor && vendor.fallbackModels) {
+      // fallbackModels 允许字符串（只有官方名）或对象（官方名 + 可请求别名）。
+      // 管理页只需要 models（id 列表），完整条目由 modelEntries 带回，前端据此写 upstream/aliases。
+      return {
+        ok: true,
+        models: vendor.fallbackModels.map((m) => (typeof m === "string" ? m : m.model)),
+        modelEntries: Object.fromEntries(
+          vendor.fallbackModels
+            .filter((m) => typeof m === "object" && m && m.model)
+            .map((m) => [m.model, m]),
+        ),
+        metadata: {},
+        fallback: true,
+        message: "尚未添加 Key，已给出官方兜底模型清单",
+      };
+    }
+    return { ok: false, message: "该提供商还没有可用 Key，先添加一把" };
+  }
   const adapter = adapters.makeOpenaiCompat({ ...provider, models: [] });
-  return adapter.fetchModels(row, { token: config.decryptSecret(row.token_enc) || "", refreshToken: "" });
+  const r = await adapter.fetchModels(
+    row,
+    { token: config.decryptSecret(row.token_enc) || "", refreshToken: "" },
+    modelsUrlFor(provider.baseUrl),
+  );
+  if (!r || !r.ok) return r;
+  // 富化失败绝不把整次拉取判失败：拿不到就留空（未知），由用户手填。
+  const metadata = await enrichModelsWithPublicMeta(provider.baseUrl, r.models);
+  return { ...r, metadata, ...vendorModelEntries(vendor, r.models) };
+}
+
+// ===== 主流厂商适配：按 Base URL 识别官方端点差异 =====
+// 自定义提供商仍是 OpenAI 兼容语义；这里只收「同一能力在不同厂商的路径/字段不同」的差异，
+// 不把每家写成独立渠道。新增厂商优先补这张纯数据表，命中不了就走通用 OpenAI 兼容逻辑。
+//   modelsPath: 模型列表路径（相对 base_url）
+//   balancePath: 余额查询路径；null = 该厂商没有公开余额接口
+//   balanceCredits(data): 从官方返回体里取「可用余额」数值；取不到返回 null（不伪造 0）
+const VENDOR_PROFILES = [
+  {
+    id: "deepseek",
+    name: "DeepSeek",
+    host: "api.deepseek.com",
+    modelsPath: "/models",
+    balancePath: "/user/balance",
+    balanceCredits(data) {
+      const rows = Array.isArray(data && data.balance_infos) ? data.balance_infos : [];
+      // 官方可能同时返回 CNY + USD 两段；网关余额是单一数值，优先人民币，没有再取第一段
+      const row = rows.find((r) => String((r && r.currency) || "").toUpperCase() === "CNY") || rows[0];
+      const n = Number(row && row.total_balance);
+      return Number.isFinite(n) ? n : null;
+    },
+    balanceUnit: "CNY",
+    // 官方公开目录（2026-10-21 文档核对）：拉取失败时给可操作的兜底清单，不让用户对着空表猜模型名
+    fallbackModels: [
+      { model: "deepseek-flash", proxyModel: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash" },
+      "deepseek-v4-pro",
+    ],
+  },
+  {
+    id: "kimi",
+    name: "Kimi（Moonshot AI）",
+    host: "api.moonshot.cn",
+    modelsPath: "/models",
+    balancePath: "/v1/users/me/balance",
+    balanceCredits(data) {
+      const n = Number(data && data.data && data.data.available_balance);
+      return Number.isFinite(n) ? n : null;
+    },
+    balanceUnit: "CNY",
+    fallbackModels: ["kimi-k3", "kimi-k2.7-code-highspeed", "kimi-k2.6"],
+  },
+  {
+    id: "kimi_intl",
+    name: "Kimi（Moonshot AI 国际站）",
+    host: "api.moonshot.ai",
+    modelsPath: "/models",
+    balancePath: "/v1/users/me/balance",
+    balanceCredits(data) {
+      const n = Number(data && data.data && data.data.available_balance);
+      return Number.isFinite(n) ? n : null;
+    },
+    balanceUnit: "USD",
+    fallbackModels: ["kimi-k3", "kimi-k2.7-code-highspeed", "kimi-k2.6"],
+  },
+];
+
+function vendorFor(baseUrl) {
+  try {
+    const host = new URL(String(baseUrl || "")).hostname.toLowerCase();
+    return VENDOR_PROFILES.find((v) => v.host === host) || null;
+  } catch {
+    return null;
+  }
+}
+
+/** 官方目录条目 → 管理页映射。只带「官方名 + 已知历史别名」；不把用户请求的历史名
+ *  自动改写成官方名，避免用户误以为上游仍接受旧名。DeepSeek 官方现在叫 deepseek-flash，
+ *  deepseek-v4.1-flash 是文档里沿用的旧名/等价名，因此作为 alias 出现在同一行。 */
+function vendorModelEntries(vendor, models) {
+  if (!vendor || vendor.id !== "deepseek") return {};
+  const known = new Map();
+  for (const m of vendor.fallbackModels || []) {
+    if (typeof m === "object" && m && m.model) known.set(String(m.model).toLowerCase(), m);
+  }
+  const entries = {};
+  for (const id of Array.isArray(models) ? models : []) {
+    const hit = known.get(String(id).toLowerCase());
+    if (hit) entries[id] = hit;
+  }
+  return { modelEntries: entries };
+}
+
+/** 模型列表 URL：厂商表优先，通用 OpenAI 兼容沿用 adapters.compatUrl */
+function modelsUrlFor(baseUrl) {
+  const vendor = vendorFor(baseUrl);
+  const root = String(baseUrl).replace(/\/+$/, "");
+  if (!vendor) {
+    // 用户常把 base_url 填成 .../v1；compatUrl 会再补一次 /v1，拼出 /v1/v1/models。
+    // 归一化已在写入侧剥过标准尾缀，这里兜住历史脏值，保证只有一个版本段。
+    if (/\/v1$/i.test(root)) return `${root}/models`;
+    return adapters.compatUrl(baseUrl, "models");
+  }
+  return `${root}${vendor.modelsPath}`;
+}
+
+/** 查询一把 Key 的余额。只支持有公开余额接口的厂商；其余端点明确返回 unsupported，
+ *  不能拿 Key 去打一个不存在的余额路径再报「余额 0」。 */
+async function queryBalance({ id, accountId, baseUrl }) {
+  const vendor = vendorFor(baseUrl);
+  if (!vendor || !vendor.balancePath) {
+    return { ok: false, unsupported: true, message: "该端点没有公开余额查询接口（当前支持 DeepSeek / Kimi）" };
+  }
+  const provider = id ? store.getProvider(String(id)) : null;
+  if (!provider) return { ok: false, message: `提供商 "${id}" 不存在` };
+  const acc = accountId ? store.getAccount(String(accountId)) : null;
+  if (!acc || acc.channel !== provider.id) return { ok: false, message: "该 Key 不属于这个提供商" };
+  const secret = config.decryptSecret(acc.token_enc) || "";
+  if (!secret) return { ok: false, status: 401, message: "Key 无法解密，请重新填写" };
+  const url = `${String(baseUrl).replace(/\/+$/, "")}${vendor.balancePath}`;
+  const r = await adapters.httpJson(url, {
+    method: "GET",
+    headers: { authorization: `Bearer ${secret}`, accept: "application/json" },
+  }).catch((e) => ({ ok: false, status: 0, data: null, text: String((e && e.message) || e) }));
+  if (!r || !r.ok) {
+    return {
+      ok: false,
+      status: Number(r && r.status) || 0,
+      message: `余额查询失败：HTTP ${(r && r.status) || 0} ${String((r && r.text) || "").slice(0, 160)}`.trim(),
+    };
+  }
+  const credits = vendor.balanceCredits(r.data);
+  if (credits == null) return { ok: false, message: "余额接口返回里没有可识别的 available/total balance 字段" };
+  return { ok: true, vendor: vendor.id, credits, unit: vendor.balanceUnit || "", checkedAt: Date.now() };
+}
+
+/** 余额查询的执行核心（可注入 URL 基址，自测用假上游验证真实请求路径）。
+ *  与 queryBalance 分开是因为后者要按官方 hostname 识别厂商，假上游用 127.0.0.1 无法命中；
+ *  生产路径仍由 queryBalance 做「只支持已知厂商」的硬闸，测试路径只验证厂商路径与字段解析。 */
+async function queryBalanceWithVendor({ vendorId, baseUrl, token }) {
+  const vendor = VENDOR_PROFILES.find((v) => v.id === vendorId);
+  if (!vendor || !vendor.balancePath) return { ok: false, unsupported: true, message: "该端点没有公开余额查询接口" };
+  const url = `${String(baseUrl).replace(/\/+$/, "")}${vendor.balancePath}`;
+  const r = await adapters.httpJson(url, {
+    method: "GET",
+    headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+  }).catch((e) => ({ ok: false, status: 0, data: null, text: String((e && e.message) || e) }));
+  if (!r || !r.ok) {
+    return { ok: false, status: Number(r && r.status) || 0, message: `余额查询失败：HTTP ${(r && r.status) || 0}` };
+  }
+  const credits = vendor.balanceCredits(r.data);
+  if (credits == null) return { ok: false, message: "余额接口返回里没有可识别的 balance 字段" };
+  return { ok: true, vendor: vendor.id, credits, unit: vendor.balanceUnit || "", checkedAt: Date.now() };
+}
+
+// ===== 公开模型元数据（models.dev）：补上下文 / 输出上限 =====
+// 上游 /v1/models 只有 id，没有窗口；models.dev 是社区维护的公开目录（OpenCode 自己也用它），
+// 按模型 id 匹配。匹配不到、或各家声明冲突时留空——「上限类字段绝不编造默认值」是本仓库既有约定。
+const MODELS_DEV_URL = "https://models.dev/api.json";
+const MODELS_DEV_TTL_MS = 6 * 3600 * 1000;
+let modelsDevCache = { at: 0, index: null };
+
+/** 把 models.dev 原始目录铺成 模型id → 条目[] 的索引（同一 id 可能被多家声明） */
+function buildModelsDevIndex(catalog) {
+  const index = new Map();
+  for (const [pid, p] of Object.entries(catalog && typeof catalog === "object" ? catalog : {})) {
+    for (const [mid, m] of Object.entries((p && p.models) || {})) {
+      const key = String(mid).toLowerCase();
+      const limit = (m && m.limit) || {};
+      const entry = {
+        provider: pid,
+        id: String((m && m.id) || mid),
+        name: m && m.name ? String(m.name) : "",
+        contextLength: Number(limit.context) || 0,
+        maxOutputTokens: Number(limit.output) || 0,
+        capabilities: {
+          ...(m && m.attachment ? { images: true } : {}),
+          ...(m && m.reasoning ? { reasoning: true } : {}),
+          ...(m && m.tool_call ? { tools: true } : {}),
+        },
+      };
+      if (!index.has(key)) index.set(key, []);
+      index.get(key).push(entry);
+    }
+  }
+  return index;
+}
+
+/** 按上游地址推断 models.dev 的提供商 id（OpenCode Go 在目录里叫 opencode-go / opencode） */
+function modelsDevHintsFor(baseUrl) {
+  try {
+    const host = new URL(String(baseUrl || "")).hostname.toLowerCase();
+    if (host === "opencode.ai") return ["opencode-go", "opencode"];
+  } catch { /* 地址不合法时没有提示可用 */ }
+  return [];
+}
+
+/** 模型 id → 元数据。优先级：指定提供商的精确条目 → 去 `-free` 变体 → 全网一致声明。
+ *  多家声明不一致时返回 null（宁缺勿错），调用方按「未知」处理。 */
+function resolveModelsDevMeta(index, hints, modelId) {
+  if (!index || !modelId) return null;
+  const keys = [String(modelId).toLowerCase()];
+  const stripped = keys[0].replace(/-free$/i, "");
+  if (stripped && stripped !== keys[0]) keys.push(stripped);
+  for (const key of keys) {
+    const rows = index.get(key) || [];
+    if (!rows.length) continue;
+    for (const hint of hints || []) {
+      const hit = rows.find((r) => String(r.provider).toLowerCase() === String(hint).toLowerCase());
+      if (hit) return hit;
+    }
+    // 没有指定提供商时只在「全网声明一致」才采信：同名模型各家窗口可能不同，挑一个就是编造
+    const distinct = new Set(rows.map((r) => `${r.contextLength}/${r.maxOutputTokens}`));
+    if (distinct.size === 1) return rows[0];
+  }
+  return null;
+}
+
+async function loadModelsDevIndex(force) {
+  if (!force && modelsDevCache.index && Date.now() - modelsDevCache.at < MODELS_DEV_TTL_MS) {
+    return modelsDevCache.index;
+  }
+  const r = await adapters.httpJson(MODELS_DEV_URL, { method: "GET" });
+  if (!r || !r.ok || !r.data || typeof r.data !== "object") {
+    throw new Error(`models.dev 返回异常（HTTP ${(r && r.status) || 0}）`);
+  }
+  const index = buildModelsDevIndex(r.data);
+  modelsDevCache = { at: Date.now(), index };
+  return index;
+}
+
+/** 给上游模型清单补元数据：返回 { 模型id: {contextLength,maxOutputTokens,name,capabilities} }。
+ *  任何失败都只是少一层自动填充，不影响拉取本身（返回空对象）。 */
+async function enrichModelsWithPublicMeta(baseUrl, modelIds) {
+  const ids = (Array.isArray(modelIds) ? modelIds : []).map((m) => String(m || "")).filter(Boolean);
+  if (!ids.length) return {};
+  let index;
+  try {
+    index = await loadModelsDevIndex();
+  } catch {
+    return {};
+  }
+  const hints = modelsDevHintsFor(baseUrl);
+  const out = {};
+  for (const id of ids) {
+    const meta = resolveModelsDevMeta(index, hints, id);
+    if (!meta) continue;
+    out[id] = {
+      ...(meta.contextLength ? { contextLength: meta.contextLength } : {}),
+      ...(meta.maxOutputTokens ? { maxOutputTokens: meta.maxOutputTokens } : {}),
+      ...(meta.name ? { name: meta.name } : {}),
+      ...(Object.keys(meta.capabilities).length ? { capabilities: meta.capabilities } : {}),
+    };
+  }
+  return out;
 }
 
 module.exports = {
@@ -429,6 +771,7 @@ module.exports = {
   normalizeModels,
   parseModelRef,
   findUniqueByBareModel,
+  findByProxyModel,
   list,
   create,
   update,
@@ -437,4 +780,13 @@ module.exports = {
   removeKey,
   probe,
   fetchModels,
+  vendorFor,
+  modelsUrlFor,
+  queryBalance,
+  queryBalanceWithVendor,
+  vendorModelEntries,
+  VENDOR_PROFILES,
+  buildModelsDevIndex,
+  modelsDevHintsFor,
+  resolveModelsDevMeta,
 };

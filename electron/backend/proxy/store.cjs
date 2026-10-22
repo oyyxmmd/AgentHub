@@ -291,6 +291,7 @@ function open() {
   } catch { /* 已存在 */ }
   // 在线迁移：自定义提供商（同一张 agents 表扩列成「渠道表」，详见 migrateProviders 的注释）
   migrateProviders(db);
+  migrateProviderProxyModels(db);
   const ins = db.prepare("INSERT OR IGNORE INTO agents (id, display, domain, pool_strategy, cost_tier, updated_at) VALUES (?,?,?,?,?,?)");
   const updDisplay = db.prepare("UPDATE agents SET display = ? WHERE id = ?");
   // 存量行成本档回填：INSERT OR IGNORE 不触碰已存在的行，这里只给「从未标注过」的行补种子默认
@@ -317,10 +318,55 @@ function migrateProviders(d) {
     "extra_headers TEXT NOT NULL DEFAULT '{}'",
     "extra_body TEXT NOT NULL DEFAULT '{}'",
     "enabled INTEGER NOT NULL DEFAULT 1",
+    // 越大越优先（0 = 普通）。同名裸模型命中多家时只有唯一最高优先的那家胜出，
+    // 同级仍按「歧义不猜」回退——优先级用来消歧，不用来在同级里凭顺序静默选人。
+    "priority INTEGER NOT NULL DEFAULT 0",
+    // 代理统一模型名：客户端用这个名字请求时优先路由到本提供商，并改写成本商主模型上游。
+    // 不进全局模型目录——多家同名不冲突，也避免目录里出现一个只属于单一供应商的"虚拟模型"。
+    "proxy_model TEXT NOT NULL DEFAULT ''",
   ];
   for (const c of cols) {
     try { d.exec(`ALTER TABLE agents ADD COLUMN ${c}`); } catch { /* 已存在 */ }
   }
+}
+
+/** 一次性迁移：旧版「供应商级 proxy_model」→「模型清单第一行的模型级 proxyModel」。
+ *  迁移后清空旧列，避免两套字段同时存在时路由口径分叉。幂等：没有旧值就不动。 */
+function migrateProviderProxyModels(d) {
+  let rows;
+  try {
+    rows = d.prepare("SELECT id, models_json, proxy_model FROM agents WHERE proxy_model <> ''").all();
+  } catch {
+    return;
+  }
+  const clear = d.prepare("UPDATE agents SET proxy_model='' WHERE id=?");
+  const write = d.prepare("UPDATE agents SET models_json=?, proxy_model='' WHERE id=?");
+  for (const row of rows) {
+    const legacy = String(row.proxy_model || "").trim();
+    let models = [];
+    try {
+      const a = JSON.parse(row.models_json || "[]");
+      if (Array.isArray(a)) models = a;
+    } catch { /* 坏 JSON 不阻断启动；清值由下面 clear 负责，用户可在 UI 重填 */ }
+    if (legacy && models.length && !models.some((m) => m && typeof m === "object" && m.proxyModel)) {
+      models = models.map((m, i) => {
+        if (i !== 0) return m;
+        return typeof m === "string" ? { model: m, proxyModel: legacy } : { ...m, proxyModel: legacy };
+      });
+      write.run(JSON.stringify(models), row.id);
+    } else {
+      clear.run(row.id);
+    }
+  }
+}
+
+/** 提供商优先级归一：0~999 的整数，越大越优先。
+ *  上限刻意存在——优先级是给人手动标的量级差，999 以上纯属手滑；
+ *  非整数（1.5 / "abc" / NaN）一律落回 0（普通），不让一条脏值变成"最高优先"。
+ *  写入侧与读取侧共用它，保证「面板显示 5」与「库里存 5」是同一个口径。 */
+function providerPriority(v) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 999) : 0;
 }
 
 /** 流水保留期（天）：设置页 proxy.usageRetentionDays 可调，启动 GC 与统计页「清理」共用。
@@ -646,6 +692,8 @@ function providerChannelView(r) {
     models: parseModelsJson(r.models_json),
     extraHeaders: parseJsonMap(r.extra_headers, r.id, "extra_headers"),
     extraBody: parseJsonMap(r.extra_body, r.id, "extra_body"),
+    priority: providerPriority(r.priority),
+    proxyModel: String(r.proxy_model || "").trim(),
     updatedAt: r.updated_at || 0,
   };
 }
@@ -697,14 +745,19 @@ function isBuiltinChannel(id) { return BUILTIN_IDS.has(String(id)); }
  *  所以改完配置不必重启网关。 */
 function saveProvider(p) {
   open();
-  const now = Date.now();
+  // updated_at 是动态适配器实例缓存的键（adapters.compatAdapter 按 `${id}:${updatedAt}` 取实例）。
+  // 同一毫秒内连续保存（面板快速改两次、脚本测试）会让时间戳不前进，第二次配置改动就继续复用
+  // 旧实例——表现为「改完地址/模型仍打旧上游」。严格单调递增即可保证每次写入都换实例。
+  const prev = db.prepare("SELECT updated_at FROM agents WHERE id = ?").get(String(p.id));
+  const now = Math.max(Date.now(), Number((prev && prev.updated_at) || 0) + 1);
   db.prepare(
-    `INSERT INTO agents (id, display, domain, pool_strategy, updated_at, kind, base_url, models_json, extra_headers, extra_body, enabled)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    `INSERT INTO agents (id, display, domain, pool_strategy, updated_at, kind, base_url, models_json, extra_headers, extra_body, enabled, priority, proxy_model)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(id) DO UPDATE SET display=excluded.display, domain=excluded.domain,
        pool_strategy=excluded.pool_strategy, updated_at=excluded.updated_at, kind=excluded.kind,
        base_url=excluded.base_url, models_json=excluded.models_json,
-       extra_headers=excluded.extra_headers, extra_body=excluded.extra_body, enabled=excluded.enabled`
+       extra_headers=excluded.extra_headers, extra_body=excluded.extra_body, enabled=excluded.enabled,
+       priority=excluded.priority, proxy_model=excluded.proxy_model`
   ).run(
     String(p.id),
     String(p.display || p.id).slice(0, 64),
@@ -716,7 +769,9 @@ function saveProvider(p) {
     JSON.stringify(Array.isArray(p.models) ? p.models : []),
     JSON.stringify(p.extraHeaders && typeof p.extraHeaders === "object" ? p.extraHeaders : {}),
     JSON.stringify(p.extraBody && typeof p.extraBody === "object" ? p.extraBody : {}),
-    p.enabled === false ? 0 : 1
+    p.enabled === false ? 0 : 1,
+    providerPriority(p.priority),
+    String(p.proxyModel || "").trim().slice(0, 128)
   );
   invalidateChannels();
   return getProvider(p.id);
@@ -1687,6 +1742,7 @@ module.exports = {
   channelList, invalidateChannels,
   channelDisplay,
   listProviders, getProvider, saveProvider, deleteProvider, accountRows,
+  providerPriority,
   createKey, importKey, listKeys, findKeyBySecret, updateKey, deleteKey, keyTodayReq,
   validateKeyParams,
   listAgents, setPoolStrategy, setAgentCostTier,

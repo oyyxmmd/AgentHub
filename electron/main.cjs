@@ -260,12 +260,19 @@ function schedulePersistBounds() {
   }, 400);
 }
 
+/** 当前主界面缩放因子（窗口宽 / 设计基准宽，钳制 0.7~1.25）。
+ *  托盘面板也要用同一个值：Electron 的 zoom 是 per-origin 的（同 origin 的窗口共享一个
+ *  HostZoomMap），面板无法单独设缩放，只能按同一因子反算窗口物理尺寸。 */
+function currentZoomFactor() {
+  if (!mainWindow || mainWindow.isDestroyed()) return 1;
+  const [w] = mainWindow.getSize();
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, w / DESIGN_WIDTH));
+}
+
 function applyViewportZoom() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  const [w] = mainWindow.getSize();
-  const factor = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, w / DESIGN_WIDTH));
   try {
-    mainWindow.webContents.setZoomFactor(factor);
+    mainWindow.webContents.setZoomFactor(currentZoomFactor());
   } catch {
     /* 页面未就绪时调用可能失败，下个 resize / 加载事件会重试 */
   }
@@ -630,10 +637,29 @@ function focusSettingsUpdate() {
 
 let trayPanel = null;
 
+/** 托盘面板基准尺寸（CSS 像素）。窗口物理尺寸 = 基准 × 当前缩放因子：
+ *  面板与主界面同 origin，dev（http://localhost）下 Chromium 的 zoom 按 origin 传播，
+ *  面板会继承主界面的 zoomFactor，CSS 视口被压成 380/f（f=1.25 时只剩 304px），布局被挤压；
+ *  打包态（file://）不传播，面板保持 1。两条路径都必须显式对齐：先设面板缩放为 f，
+ *  再按 f 放大窗口，CSS 视口才恒为基准尺寸。 */
+const TRAY_BASE_W = 380;
+const TRAY_BASE_H = 540;
+
+/** 按当前缩放因子同步托盘窗口的缩放与尺寸（创建完成时与每次显示前各调一次） */
+function syncTrayPanelSize() {
+  if (!trayPanel || trayPanel.isDestroyed()) return;
+  try {
+    const f = currentZoomFactor();
+    trayPanel.webContents.setZoomFactor(f);
+    trayPanel.setSize(Math.round(TRAY_BASE_W * f), Math.round(TRAY_BASE_H * f));
+  } catch { /* 尺寸同步失败不该影响面板显示 */ }
+}
+
 function createTrayPanel() {
+  const factor = currentZoomFactor();
   trayPanel = new BrowserWindow({
-    width: 380,
-    height: 540,
+    width: Math.round(TRAY_BASE_W * factor),
+    height: Math.round(TRAY_BASE_H * factor),
     show: false,
     frame: false,
     resizable: false,
@@ -653,6 +679,8 @@ function createTrayPanel() {
     },
   });
   trayPanel.setAlwaysOnTop(true, "pop-up-menu");
+  // 页面加载完成后再对齐一次缩放与尺寸：setZoomFactor 在页面未就绪时可能不生效
+  trayPanel.webContents.on("did-finish-load", () => syncTrayPanelSize());
   // blur 延时确认：show()/focus() 竞态瞬间可能误报失焦，200ms 后仍未聚焦才隐藏
   trayPanel.on("blur", () => {
     if (!trayPanel || !trayPanel.isVisible()) return;
@@ -737,6 +765,9 @@ function toggleTrayPanel() {
     trayPanel.hide();
     return;
   }
+  // 面板是复用实例：主界面在两次弹出之间可能被缩放过，显示前按当前因子重算窗口尺寸，
+  // 否则会沿用创建时的旧尺寸导致 CSS 视口与缩放不匹配
+  syncTrayPanelSize();
   positionTrayPanel();
   trayPanel.show();
   // 透明窗口首次显示偶发位置重置，显示后再校准一次

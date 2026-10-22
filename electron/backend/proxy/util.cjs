@@ -513,6 +513,57 @@ function byteSafeHeaders(headers) {
   return out || headers;
 }
 
+// ===== 上下文窗口声明 → Claude 系客户端的表达方式（直连与 CC Switch 两条写入路径共用） =====
+
+/** 1M 档门槛：达到即视为「1M 模型」。客户端的分档只有 200K / 1M 两档，中间值（如 400K）
+ *  无法表达，按「够 1M 才算 1M」保守处理——宁可让客户端按 200K 保守截断，
+ *  也不谎报一个它并不支持的窗口（谎报的后果是客户端不压缩，直接把超限请求打到上游）。 */
+const CTX_1M_THRESHOLD = 1000000;
+
+/** Claude Code 的 1M 必须**两个都写**才生效：
+ *  ① 模型名带 `[1m]` 后缀 —— 客户端内部按 /\[1m\]/ 判定窗口，只它决定"允许写多长"；
+ *  ② ANTHROPIC_BETAS=context-1m-2025-08-07 —— 让请求真的带上 beta 头，上游才放开到 1M。
+ *  缺 ① 时内部上限仍是 200K（会话死在 197K，且不报错）；缺 ② 时上游直接拒。
+ *  两个条件都由客户端实现细节决定，不是公开契约，所以写入后必须回读校验（见 verifyClaude）。 */
+const CLAUDE_1M_BETA = "context-1m-2025-08-07";
+const CLAUDE_1M_SUFFIX = "[1m]";
+
+/** 模型名加上/去掉 `[1m]` 后缀。幂等：重复写入不会变成 `x[1m][1m]`。 */
+function with1m(model, on) {
+  const s = String(model || "").replace(/\[1m\]/gi, "");
+  return on && s ? `${s}${CLAUDE_1M_SUFFIX}` : s;
+}
+
+/** ANTHROPIC_BETAS 的合并/摘除：用户可能已经有别的 beta（如 interleaved-thinking），
+ *  整串覆盖会静默关掉他已有的能力，所以按逗号分段增删，只动我们这一个值。 */
+function mergeBetas(current, on) {
+  const parts = String(current || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s && s !== CLAUDE_1M_BETA);
+  if (on) parts.push(CLAUDE_1M_BETA);
+  return parts.join(",");
+}
+
+// ===== 客户端「默认思考强度」的档位词表 =====
+
+/** 能写进客户端**默认档**的取值，取 Codex 与 Claude Code 的交集。
+ *
+ *  为什么不用 EFFORT_LEVELS 全表：那张表还含 `off` / `minimal` / `max`。
+ *    · `off` 是"关掉思考"的语义开关，不是一个档位，写进 default 会被 Codex 当未知档；
+ *    · `minimal` Codex 不认（它的 supported_reasoning_levels 是 low/medium/high/xhigh）；
+ *    · `max` 只有 Claude 有，Codex 侧会被当成非法档。
+ *  只暴露交集，前端就不用为每个客户端裁剪选项，也不会出现"选了 max 但 Codex 里静默降级"。
+ *  `max` 留给模型页的 per-model 覆盖（那条路只影响网关请求，不写客户端配置）。 */
+const CLIENT_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"];
+
+/** 归一客户端默认档：空串 / 未识别 一律返回 ""（= 不指定，交给客户端自己的推荐档）。
+ *  千万不要在非法值时兜一个默认档——用户填错了却按 high 跑，比不设更难查。 */
+function normalizeClientEffort(v) {
+  const s = String(v == null ? "" : v).trim().toLowerCase();
+  return CLIENT_EFFORT_LEVELS.includes(s) ? s : "";
+}
+
 module.exports = {
   uuid, traceId, jwtDecode, dig, toMs, normalizeExpiryMs,
   isCompleteJson, parseRetryAfterHeaders, stableConvId, promptCacheKey,
@@ -520,4 +571,6 @@ module.exports = {
   SseScanner, stripEmptyDelta, hasConsumableDelta, chunk, DONE, Aggregator, openaiError, validateChatBody, normalizeRoles, estimateTokens,
   isInputTooLargeMsg, INPUT_TOO_LARGE_MARKERS,
   byteSafeHeaderValue, byteSafeHeaders,
+  CTX_1M_THRESHOLD, CLAUDE_1M_BETA, CLAUDE_1M_SUFFIX, with1m, mergeBetas,
+  CLIENT_EFFORT_LEVELS, normalizeClientEffort,
 };

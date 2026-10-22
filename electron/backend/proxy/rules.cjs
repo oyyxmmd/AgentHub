@@ -47,8 +47,11 @@ const DEFAULTS = {
     },
     workbuddy: {
       syncedAt: 0,
+      // 上限只在有据可查时写死：GLM-5.3 的 1000000 来自官方 v3/config 目录（adapters.cjs
+      // 合并视图的注释与 zcode 渠道声明三方一致），不是推测值。其余一律 0 = 未知，
+      // 由官方目录刷新覆盖——写死一个"看起来合理"的数会让 Codex 把长会话提前截断。
       models: ["claude-sonnet-4.5", "claude-opus-4.1", "gpt-5", "gpt-5-codex", "hy3-preview", "deepseek-v3.2"]
-        .map((id) => ({ id, name: id, rate: null, capabilities: {}, contextLength: 0, maxOutputTokens: 0 })),
+        .map((id) => ({ id, name: id, rate: null, capabilities: {}, contextLength: id === "glm-5.3" ? 1000000 : 0, maxOutputTokens: 0 })),
     },
     workbuddy_ai: {
       syncedAt: 0,
@@ -57,7 +60,7 @@ const DEFAULTS = {
         "default-model", "fast-model", "balanced-model", "primary-model", "deep-model", "kimi-k2.8-preview",
         "deepseek-v4.1-flash", "deepseek-v4.1-flash-sg", "gpt-6-astra", "hy4-preview-f", "hy4-preview", "hy3",
         "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gemini-3.5-flash", "glm-5.3", "glm-5.2",
-      ].map((id) => ({ id, name: id, rate: null, capabilities: {}, contextLength: 0, maxOutputTokens: 0 })),
+      ].map((id) => ({ id, name: id, rate: null, capabilities: {}, contextLength: id === "glm-5.3" ? 1000000 : 0, maxOutputTokens: 0 })),
     },
     // 商汤小浣熊：默认模型静态兜底（保证开箱即用；拉取 /model_catalog 后整段覆盖对应渠道）
     raccoon: {

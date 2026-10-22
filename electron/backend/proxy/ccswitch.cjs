@@ -28,6 +28,10 @@ const os = require("node:os");
 const path = require("node:path");
 const config = require("../config.cjs");
 const server = require("./server.cjs");
+const util = require("./util.cjs");
+
+/** 1M 档门槛与 beta 常量统一取自 util（与直连路径同一份，避免两处字面量漂移） */
+const { CTX_1M_THRESHOLD } = util;
 
 // 驱动与 store.cjs 一致：Node 22 内置 node:sqlite 优先，better-sqlite3 回退
 let Database = null;
@@ -218,7 +222,7 @@ function rotateBackups(dir, keep) {
 /** 组装条目的 settings_config / meta（字符串化后入库）。
  *  tiers：Claude 四档独立模型（{ sonnet, opus, haiku, subagent }，空串/缺省 = 跟随默认 model）。
  *  claude 条目分档写 env 五组键；claude-desktop 条目分档写 claudeDesktopModelRoutes（subagent 档即 fable）。 */
-function buildEntry(appType, { base, apiKey, model }, tiers) {
+function buildEntry(appType, { base, apiKey, model, contextWindow, reasoningEffort }, tiers) {
   const t = tiers && typeof tiers === "object" ? tiers : {};
   const tierOf = (k) => String(t[k] || "").trim() || String(model);
   if (appType === "claude") {
@@ -226,26 +230,33 @@ function buildEntry(appType, { base, apiKey, model }, tiers) {
     // claude-sonnet-5 等别名，再由 model_mapper 用这里的 *_MODEL 映射回真实模型。
     // *_MODEL_NAME 仅供展示，写别名会导致接管后上游收到错误模型名。
     // 四档独立配置（生态接入页可分别选择）：留空的档跟随默认模型
-    const upstream = String(model);
-    const sonnet = tierOf("sonnet");
-    const opus = tierOf("opus");
-    const haiku = tierOf("haiku");
-    const subagent = tierOf("subagent");
+    //
+    // 1M 档：模型名加 [1m] 后缀 + ANTHROPIC_BETAS，两者缺一客户端仍按 200K 截断
+    // （机制说明见 util.CLAUDE_1M_BETA）。后缀只进 *_MODEL（映射用），不进 *_MODEL_NAME（展示用）。
+    const use1m = Number(contextWindow) >= CTX_1M_THRESHOLD;
+    const upstream = util.with1m(model, use1m);
+    const sonnet = util.with1m(tierOf("sonnet"), use1m);
+    const opus = util.with1m(tierOf("opus"), use1m);
+    const haiku = util.with1m(tierOf("haiku"), use1m);
+    const subagent = util.with1m(tierOf("subagent"), use1m);
+    const display = (v) => String(v).replace(/\[1m\]/gi, "");
+    const env = {
+      ANTHROPIC_BASE_URL: base,
+      ANTHROPIC_AUTH_TOKEN: apiKey,
+      ANTHROPIC_MODEL: upstream,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: sonnet,
+      ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: display(sonnet),
+      ANTHROPIC_DEFAULT_OPUS_MODEL: opus,
+      ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: display(opus),
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: haiku,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: display(haiku),
+      CLAUDE_CODE_SUBAGENT_MODEL: subagent,
+    };
+    // 非 1M 档不写这个键（而不是写空串）：空串在客户端眼里是一个"已设置但无值"的 beta 列表，
+    // 行为不可预期；不写则完全回到默认。
+    if (use1m) env.ANTHROPIC_BETAS = util.mergeBetas("", true);
     return {
-      settings_config: {
-        env: {
-          ANTHROPIC_BASE_URL: base,
-          ANTHROPIC_AUTH_TOKEN: apiKey,
-          ANTHROPIC_MODEL: upstream,
-          ANTHROPIC_DEFAULT_SONNET_MODEL: sonnet,
-          ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: sonnet,
-          ANTHROPIC_DEFAULT_OPUS_MODEL: opus,
-          ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: opus,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: haiku,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: haiku,
-          CLAUDE_CODE_SUBAGENT_MODEL: subagent,
-        },
-      },
+      settings_config: { env },
       meta: {
         apiFormat: "openai_chat",
         commonConfigEnabled: true,
@@ -290,10 +301,14 @@ function buildEntry(appType, { base, apiKey, model }, tiers) {
   // wire_api 保持 "responses"（Codex 客户端侧语义），真正的 Chat 翻译由 meta.apiFormat 触发；
   // 这两者不矛盾——上游 Chat、客户端 Responses，正是 CC Switch 转换层存在的意义。
   const esc = String(model).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // 默认思考强度：未指定时保持原行为（high），避免改版把已在跑的用户静默换档。
+  // 指定了就三处一起写——toml 顶层、modelCatalog 的 defaultReasoningLevel、以及档位表里必须有它，
+  // 缺任何一处都表现为"设了但没生效"（catalog 会覆盖 toml 顶层，档位表缺项则静默降档）。
+  const effort = util.normalizeClientEffort(reasoningEffort) || "high";
   const toml = [
     'model_provider = "custom"',
     `model = "${esc}"`,
-    'model_reasoning_effort = "high"',
+    `model_reasoning_effort = "${effort}"`,
     "disable_response_storage = true",
     "",
     "[model_providers.custom]",
@@ -312,14 +327,20 @@ function buildEntry(appType, { base, apiKey, model }, tiers) {
       // 字段形态对照本机已跑通的 Buddy 条目（官方 Codex 配置结构 codex_catalog_model_specs）：
       // reasoningLevels 决定可选档位，defaultReasoningLevel 只在同时给了 reasoningLevels 时生效，
       // 否则回落「模板默认档仍在列表里则用模板默认，否则取最高档」。
+      // 已知窗口以 AgentHub 目录的真实能力为准（含用户在模型页的 per-model 覆盖）。
+      // 未知时不再凭空按 300000 收口：CC Switch 的 modelCatalog 是唯一带外声明，客户端直接拿它
+      // 做溢出判定。写一个"看起来合理"的数比留 0 更糟——留 0 时症状是 Codex 用回退元数据跑，
+      // 写错则是长会话被静默截断，且没有任何提示指向这个字段。手填（面板）优先于两者。
       modelCatalog: {
         models: [
           {
             model,
             displayName: model,
-            contextWindow: 300000,
-            reasoningLevels: ["low", "high", "max"],
-            defaultReasoningLevel: "high",
+            contextWindow: Number(contextWindow) > 0 ? Math.trunc(Number(contextWindow)) : 0,
+            // 档位表补上 medium：默认档若不是列表成员，客户端会回落「模板默认档仍在列表里则用它，
+            // 否则取最高档」，于是用户选的档被换掉且没有任何提示。
+            reasoningLevels: ["low", "medium", "high", "xhigh"],
+            defaultReasoningLevel: effort,
           },
         ],
       },
@@ -428,7 +449,7 @@ function status({ port } = {}) {
 
 /** 注册（upsert）固定 id 条目：备份 → 表自检 → UPDATE 优先，0 行则 INSERT。
  *  tiers：Claude 四档独立模型（生态接入页传入），空档回落默认 model */
-function register({ appType, apiKey, model, tiers, port } = {}) {
+function register({ appType, apiKey, model, tiers, port, contextWindow, reasoningEffort } = {}) {
   const t = String(appType || "");
   if (t !== "claude" && t !== "codex" && t !== "claude-desktop") return { ok: false, message: `未知应用类型 "${t}"` };
   const key = String(apiKey || "").trim();
@@ -466,7 +487,7 @@ function register({ appType, apiKey, model, tiers, port } = {}) {
 
     // 3) 组装并 upsert
     const base = `http://127.0.0.1:${port}`;
-    const entry = buildEntry(t, { base, apiKey: key, model: mdl }, tiers);
+    const entry = buildEntry(t, { base, apiKey: key, model: mdl, contextWindow, reasoningEffort }, tiers);
     const now = Date.now();
     const name = APP_NAMES[t];
     const settings = JSON.stringify(entry.settings_config);

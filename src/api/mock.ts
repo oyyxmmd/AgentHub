@@ -54,6 +54,9 @@ function defaultConfig(): AppConfig {
       routeStrategy: "smart",
       fixedChannel: "trae",
       routeOrder: "score",
+      preferProvider: false,
+      preferBuiltin: false,
+      allowBareProviderModel: true,
       rateLimitPerMin: 120,
       concurrency: 8,
     creditsRefreshMin: 30,
@@ -401,14 +404,14 @@ const PROXY_POOL = [
 const MOCK_PROXY_PROVIDERS: {
   id: string; display: string; domain: string; kind: string; enabled: boolean; baseUrl: string;
   models: unknown[]; extraHeaders: Record<string, string>; extraBody: Record<string, unknown>;
-  updatedAt: number; keyCount: number; onlineCount: number;
+  priority: number; updatedAt: number; keyCount: number; onlineCount: number;
   keys: { id: string; name: string; status: string; hasToken: boolean; coolUntil: number; coolReason: string; todayReq: number; lastUsed: number }[];
 }[] = [
   {
     id: "myrelay", display: "我的中转站", domain: "relay.example.com", kind: "openai_compat", enabled: true,
     baseUrl: "https://relay.example.com",
-    models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20", aliases: ["gpt-4o-turbo"], contextLength: 128000, reasoning: { supportedEfforts: ["low", "high"] } }, "deepseek-v3.2"],
-    extraHeaders: {}, extraBody: {}, updatedAt: NOW - 30 * 60000, keyCount: 2, onlineCount: 1,
+    models: [{ model: "gpt-4o", upstream: "gpt-4o-2024-11-20", aliases: ["gpt-4o-turbo"], proxyModel: "claude-sonnet-4.5", contextLength: 128000, reasoning: { supportedEfforts: ["low", "high"] } }, "deepseek-v3.2"],
+    extraHeaders: {}, extraBody: {}, priority: 9, updatedAt: NOW - 30 * 60000, keyCount: 2, onlineCount: 1,
     keys: [
       { id: "pk1", name: "主 Key", status: "online", hasToken: true, coolUntil: 0, coolReason: "", todayReq: 37, lastUsed: NOW - 3 * 60000 },
       { id: "pk2", name: "Key 2", status: "cooling", hasToken: true, coolUntil: NOW + 9 * 60000, coolReason: "上游 429 限流", todayReq: 12, lastUsed: NOW - 18 * 60000 },
@@ -417,19 +420,20 @@ const MOCK_PROXY_PROVIDERS: {
   {
     id: "office", display: "公司自建网关", domain: "llm.corp.example", kind: "openai_compat", enabled: false,
     baseUrl: "https://llm.corp.example/v1", models: ["qwen3-max"],
-    extraHeaders: { "X-Channel": "agenthub" }, extraBody: {}, updatedAt: NOW - 2 * 3600000, keyCount: 0, onlineCount: 0, keys: [],
+    extraHeaders: { "X-Channel": "agenthub" }, extraBody: {}, priority: 0, updatedAt: NOW - 2 * 3600000, keyCount: 0, onlineCount: 0, keys: [],
   },
 ];
 
-// 预览态的 Key 内容判重表（真机 addKey 按 Key 内容的 SHA-256 判重，不看名称）。
-// 刻意不进 provider 对象：那是 hasToken 脱敏视图，塞明文进去会与真机形状分叉
+/** 预览态的 Key 内容判重表（真机 addKey 按 Key 内容的 SHA-256 判重，不看名称）。
+ *  刻意不进 provider 对象：那是 hasToken 脱敏视图，塞明文进去会与真机形状分叉 */
 const MOCK_PROVIDER_SECRETS = new Map<string, Set<string>>();
 
 /** 真机的 create/update 只回渠道视图（keys / keyCount / onlineCount 是 list 才补的），这里保持同形 */
 function providerView(p: (typeof MOCK_PROXY_PROVIDERS)[number]) {
   return {
     id: p.id, display: p.display, domain: p.domain, kind: p.kind, enabled: p.enabled,
-    baseUrl: p.baseUrl, models: p.models, extraHeaders: p.extraHeaders, extraBody: p.extraBody, updatedAt: p.updatedAt,
+    baseUrl: p.baseUrl, models: p.models, extraHeaders: p.extraHeaders, extraBody: p.extraBody,
+    priority: p.priority, updatedAt: p.updatedAt,
   };
 }
 
@@ -1365,6 +1369,21 @@ export const mock = {
         localStorage.setItem(KEY, JSON.stringify(cfg));
         return { ok: true, channel: ch, accountId: accId };
       }
+      // 模型路由优先级总闸（预览）：写 mock 配置即生效，与后端读改写同一语义
+      case "proxy_prefer_provider_set": {
+        const cfg = read();
+        const enabled = !!args?.enabled;
+        cfg.proxy.preferProvider = enabled;
+        localStorage.setItem(KEY, JSON.stringify(cfg));
+        return { ok: true, enabled };
+      }
+      case "proxy_prefer_builtin_set": {
+        const cfg = read();
+        const enabled = !!args?.enabled;
+        cfg.proxy.preferBuiltin = enabled;
+        localStorage.setItem(KEY, JSON.stringify(cfg));
+        return { ok: true, enabled };
+      }
       // 渠道启闭（预览）：list 全量带 enabled；toggle 写 mock 配置即生效
       case "proxy_channel_list":
         return JSON.parse(JSON.stringify(PROXY_POOL)).map((c: Record<string, unknown>) => ({
@@ -1502,6 +1521,7 @@ export const mock = {
           id, display: String(args?.display || id), domain: "", kind: "openai_compat", enabled: args?.enabled !== false,
           baseUrl: String(args?.baseUrl || ""), models: (args?.models as unknown[]) || [],
           extraHeaders: (args?.extraHeaders as Record<string, string>) || {}, extraBody: (args?.extraBody as Record<string, unknown>) || {},
+          priority: Number(args?.priority) || 0,
           updatedAt: Date.now(),
           keys: keyRows, keyCount: keyRows.length, onlineCount: keyRows.length,
         };
@@ -1559,7 +1579,26 @@ export const mock = {
           : { ok: false, status: 404, ms: 880, message: "浏览器预览不代打上游，请在应用内测试" };
       }
       case "proxy_provider_fetch_models":
-        return { ok: true, models: ["gpt-4o", "gpt-4o-mini", "o3-pro"] };
+        return {
+          ok: true,
+          models: ["gpt-4o", "gpt-4o-mini", "o3-pro"],
+          metadata: {
+            "gpt-4o": { contextLength: 128000, maxOutputTokens: 16384, name: "GPT-4o" },
+            "gpt-4o-mini": { contextLength: 128000, maxOutputTokens: 16384, name: "GPT-4o mini" },
+          },
+          modelEntries: { "gpt-4o": { model: "gpt-4o", proxyModel: "claude-sonnet-4.5" } },
+        };
+      case "proxy_provider_balance": {
+        const provider = MOCK_PROXY_PROVIDERS.find((p) => p.id === args?.id);
+        if (!provider) return { ok: false, message: "提供商不存在" };
+        if (/deepseek\.com$/i.test(provider.baseUrl)) {
+          return { ok: true, vendor: "deepseek", credits: 88.66, unit: "CNY", checkedAt: Date.now() };
+        }
+        if (/moonshot\.(cn|ai)$/i.test(new URL(provider.baseUrl).hostname)) {
+          return { ok: true, vendor: "kimi", credits: 42.5, unit: "CNY", checkedAt: Date.now() };
+        }
+        return { ok: false, unsupported: true, message: "该端点没有公开余额查询接口（当前支持 DeepSeek / Kimi）" };
+      }
       // 切号：首调只做预检（对应真实后端 —— 一律回 needConfirm + probe，由前端弹确认框），
       // confirmAck 重调才回执行结果，预览下两条路径都可走通
       case "proxy_ide_switch":

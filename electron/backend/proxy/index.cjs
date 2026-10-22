@@ -1196,6 +1196,45 @@ function register(ipcMain) {
     return ok({ channel, ...rules[channel] });
   }));
 
+  // 模型路由优先级总闸（proxy.preferProvider）：裸模型名命中某家启用的自定义提供商时优先用它。
+  //
+  // 为什么是**独立 IPC**而不是设置页那样整份保存：托盘面板与主窗口「自定义提供商」页
+  // 都要能改它，而主窗口持有的是启动时的配置快照。若两边都走 save_config 整份提交，
+  // 后提交的一方会用旧快照把先提交的一方冲掉（开关「自己弹回来」）。
+  // 读改写收口在本 IPC：谁改谁先落盘，另一侧靠 config-changed 广播重拉快照对齐。
+  //
+  // 生效路径：server.resolveChannel 每请求读 settings.preferProvider（无内存缓存），
+  // 落盘即热生效，网关无需重启。
+  ipcMain.handle("proxy_prefer_provider_set", handle(({ enabled }) => {
+    const on = !!enabled;
+    try {
+      const cfg = config.loadConfig();
+      cfg.proxy.preferProvider = on;
+      config.saveConfig(cfg);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+    oplog.log("info", "网关配置", `模型路由优先级改为${on ? "自定义提供商优先（裸模型名命中自定义时优先用它）" : "按内置路由（自定义提供商不抢占裸模型名）"}`, {});
+    // 广播给主窗口：它的配置快照要重拉，否则下一次整份保存会把这里的值写回去
+    events.emit({ type: "config-changed" });
+    return ok({ enabled: on });
+  }));
+  // 内置优先总闸（proxy.preferBuiltin）：true = 允许内置渠道参与自动路由；
+  // false = 内置渠道完全不参与，只走自定义提供商。默认为 false，必须显式开启才会使用内置。
+  ipcMain.handle("proxy_prefer_builtin_set", handle(({ enabled }) => {
+    const on = !!enabled;
+    try {
+      const cfg = config.loadConfig();
+      cfg.proxy.preferBuiltin = on;
+      config.saveConfig(cfg);
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
+    oplog.log("info", "网关配置", `内置优先已${on ? "开启（允许内置渠道参与自动路由）" : "关闭（仅使用自定义提供商）"}`, {});
+    events.emit({ type: "config-changed" });
+    return ok({ enabled: on });
+  }));
+
   // 渠道指定账号（托盘面板「指定」点选）：accountId 为空 = 取消指定恢复策略调度。
   // 选号在 pool.pickAccount 内优先命中（server 每请求读 settings.pinnedAccount）——保存即热生效
   ipcMain.handle("proxy_pinned_account_set", handle(({ channel, accountId }) => {
@@ -1460,11 +1499,18 @@ function register(ipcMain) {
   // 由主进程解密——两条都不动号池（不 pickAccount、不写流水、不进冷却），探完好 Key 还是好的
   ipcMain.handle("proxy_provider_test", handle((input) => provider.probe(input)));
   ipcMain.handle("proxy_provider_fetch_models", handle(({ id }) => provider.fetchModels(id)));
+  ipcMain.handle("proxy_provider_balance", handle(({ id, accountId, baseUrl }) => provider.queryBalance({ id, accountId, baseUrl })));
 
   // ===== 生态接入：CC Switch =====
   ipcMain.handle("proxy_ccswitch_status", handle(() => ccswitch.status()));
-  ipcMain.handle("proxy_ccswitch_register", handle(({ appType, apiKey, model, tiers, port }) => {
-    const r = ccswitch.register({ appType, apiKey, model, tiers, port });
+  ipcMain.handle("proxy_ccswitch_register", handle(({ appType, apiKey, model, tiers, port, contextWindow, reasoningEffort }) => {
+    const selected = adapters.mergedModels(settings())
+      .find((m) => String(m.id).toLowerCase() === String(model || "").trim().toLowerCase());
+    const manual = Number(contextWindow);
+    const manualOk = Number.isFinite(manual) && manual > 0;
+    const r = ccswitch.register({ appType, apiKey, model, tiers, port,
+      contextWindow: manualOk ? manual : selected && selected.contextLength,
+      reasoningEffort });
     oplog.log(r && r.ok === false ? "error" : "info", "生态接入",
       r && r.ok ? `CC Switch 已注册（${String(appType || "")}，${r.action === "updated" ? "更新条目" : "新增条目"}）` : r && r.message || "注册失败",
       { target: String(appType || "") });
@@ -1474,8 +1520,19 @@ function register(ipcMain) {
   // ===== 生态接入：直连模式（不经 CC Switch，直接写客户端配置） =====
   // 预检 → needConfirm（展示目标文件/冲突/备份）→ 带 confirmAck 重调才落盘
   ipcMain.handle("proxy_direct_status", handle(({ port } = {}) => direct.status({ port })));
-  ipcMain.handle("proxy_direct_apply", handle(({ appType, apiKey, model, tiers, port, confirmAck }) => {
-    const r = direct.apply({ appType, apiKey, model, tiers, port, confirmAck: !!confirmAck });
+  ipcMain.handle("proxy_direct_apply", handle(({ appType, apiKey, model, tiers, port, confirmAck, contextWindow, reasoningEffort }) => {
+    const selected = adapters.mergedModels(settings())
+      .find((m) => String(m.id).toLowerCase() === String(model || "").trim().toLowerCase());
+    // 面板手填 > 目录声明：模型页的 per-model 覆盖已经并进 mergedModels 的 contextLength，
+    // 而面板这一路是「这次接入我明确知道真实窗口」的临时最高优先级（写入后持久到客户端配置）。
+    const manual = Number(contextWindow);
+    const manualOk = Number.isFinite(manual) && manual > 0;
+    const r = direct.apply({
+      appType, apiKey, model, tiers, port, confirmAck: !!confirmAck,
+      contextWindow: manualOk ? manual : selected && selected.contextLength,
+      contextWindowSource: manualOk ? "manual" : "catalog",
+      reasoningEffort,
+    });
     // 预检（needConfirm）不记日志——用户可能取消，不该留痕迹
     if (r && r.needConfirm) return r;
     oplog.log(r && r.ok === false ? "error" : "info", "生态接入",

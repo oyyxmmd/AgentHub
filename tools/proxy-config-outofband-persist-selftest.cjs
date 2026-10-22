@@ -44,10 +44,16 @@ if (!inSandbox) { console.error("拒绝运行：配置路径不在沙箱内"); p
 const FIELDS = config.OUT_OF_BAND_PROXY_FIELDS;
 console.log("");
 console.log("=== 前置：名单与接口存在 ===");
-ok("导出了 OUT_OF_BAND_PROXY_FIELDS", Array.isArray(FIELDS) && FIELDS.length === 4, JSON.stringify(FIELDS));
+// 名单长度不写死：新增成员是正常演进（如 preferProvider 进了名单），
+// 写死数字会让「加一个受保护字段」这种正当改动被误判成回归。
+ok("导出了 OUT_OF_BAND_PROXY_FIELDS", Array.isArray(FIELDS) && FIELDS.length >= 4, JSON.stringify(FIELDS));
 ok("名单含 channelEnabled / checkinAutoRules / enableAnthropic / enableResponses",
   ["channelEnabled", "checkinAutoRules", "enableAnthropic", "enableResponses"].every((f) => FIELDS.includes(f)) && !FIELDS.includes("restoreOnLaunch"),
   JSON.stringify(FIELDS));
+// preferProvider（模型路由优先级总闸）也在名单里：它的写入口有两处（主窗口页 + 托盘面板），
+// 两边各持配置快照，走整份提交会互相冲掉——与上面几个字段同性质。
+ok("名单含 preferProvider / preferBuiltin（托盘与主窗口共用的写入口）",
+  FIELDS.includes("preferProvider") && FIELDS.includes("preferBuiltin"), JSON.stringify(FIELDS));
 ok("导出了 saveConfigFromUI", typeof config.saveConfigFromUI === "function");
 
 // 磁盘上写入「用户通过各自 IPC 设置好的」状态
@@ -58,6 +64,8 @@ function writeDiskState() {
   cfg.proxy.restoreOnLaunch = true;
   cfg.proxy.enableAnthropic = false;                        // 手工改 config.json 关掉的新协议面
   cfg.proxy.enableResponses = false;
+  cfg.proxy.preferProvider = true;                          // 托盘/主窗口把模型路由优先级打开了
+  cfg.proxy.preferBuiltin = true;                           // 新语义：显式开启内置优先
   config.saveConfig(cfg);                                   // = 那几个 IPC 所用的路径
 }
 writeDiskState();
@@ -69,10 +77,14 @@ console.log("  checkinAutoRules = " + JSON.stringify(disk0.checkinAutoRules));
 console.log("  restoreOnLaunch  = " + JSON.stringify(disk0.restoreOnLaunch));
 console.log("  enableAnthropic  = " + JSON.stringify(disk0.enableAnthropic));
 console.log("  enableResponses  = " + JSON.stringify(disk0.enableResponses));
+console.log("  preferProvider   = " + JSON.stringify(disk0.preferProvider));
+  console.log("  preferBuiltin    = " + JSON.stringify(disk0.preferBuiltin));
 ok("磁盘已记录 channelEnabled.lobster=false", disk0.channelEnabled && disk0.channelEnabled.lobster === false);
 ok("磁盘已记录 checkinAutoRules.lobster", !!(disk0.checkinAutoRules && disk0.checkinAutoRules.lobster));
 ok("磁盘已记录 restoreOnLaunch=true", disk0.restoreOnLaunch === true);
 ok("磁盘已记录 enableAnthropic=false / enableResponses=false", disk0.enableAnthropic === false && disk0.enableResponses === false);
+ok("磁盘已记录 preferProvider=true", disk0.preferProvider === true);
+ok("磁盘已记录 preferBuiltin=true", disk0.preferBuiltin === true);
 
 // —— 契约 A：设置页整份提交（旧快照）不得冲掉 ——
 console.log("");
@@ -103,6 +115,11 @@ ok("A4 设置页真正拥有的字段照常生效（port 改成了 9600）", Num
 // 等于止血开关自己弹回来。故与上面两个字段同列，以磁盘为准。
 ok("A6 enableAnthropic 未被冲掉（仍是关闭）", after.enableAnthropic === false, JSON.stringify(after.enableAnthropic));
 ok("A7 enableResponses 未被冲掉（仍是关闭）", after.enableResponses === false, JSON.stringify(after.enableResponses));
+// A8：模型路由优先级总闸。它的写入口有两处（主窗口「自定义提供商」页 + 托盘面板），
+// 两边各持启动时的配置快照：托盘打开开关后，主窗口那份旧快照（false）若被整份提交回去，
+// 开关就「自己弹回来」。故它也必须以磁盘为准。
+ok("A8 preferProvider 未被冲掉（仍是开启）", after.preferProvider === true, JSON.stringify(after.preferProvider));
+ok("A8b preferBuiltin 未被冲掉（仍是开启）", after.preferBuiltin === true, JSON.stringify(after.preferBuiltin));
 
 // —— 契约 B：三个写入方自己的写入必须仍然生效 ——
 console.log("");
@@ -135,6 +152,26 @@ ok("B3 restoreOnLaunch 可改回 false", config.loadConfig().proxy.restoreOnLaun
   config.saveConfig(cfg);
 }
 ok("B4 checkinAutoRules 可清空", JSON.stringify(config.loadConfig().proxy.checkinAutoRules) === "{}");
+{
+  // B5：preferProvider 的写入方（proxy_prefer_provider_set 走的就是 saveConfig 读改写）
+  // 必须能正常写盘——若「磁盘优先」错写进 saveConfig，它会被自己刚读到的值覆盖，功能当场失效。
+  const cfg = config.loadConfig();
+  cfg.proxy.preferProvider = false;
+  config.saveConfig(cfg);
+}
+ok("B5 preferProvider 可改回 false（写入方不被自己的旧值覆盖）", config.loadConfig().proxy.preferProvider === false);
+{
+  const cfg = config.loadConfig();
+  cfg.proxy.preferProvider = true;
+  config.saveConfig(cfg);
+}
+ok("B6 preferProvider 可改回 true", config.loadConfig().proxy.preferProvider === true);
+{
+  const cfg = config.loadConfig();
+  cfg.proxy.preferBuiltin = false;
+  config.saveConfig(cfg);
+}
+ok("B7 preferBuiltin 可改回 false（写入方不被自己的旧值覆盖）", config.loadConfig().proxy.preferBuiltin === false);
 
 // —— 契约 C：读盘失败时不得让设置页整体保存失败 ——
 console.log("");

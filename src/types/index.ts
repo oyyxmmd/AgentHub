@@ -300,6 +300,13 @@ export interface ProxyConfig {
   fixedChannel: string;
   /** 渠道成本感知排序：score=按打分（现状）/ cost-first=按成本档升序（免费→低成本→普通，组内按打分） */
   routeOrder: "score" | "cost-first";
+  /** 自定义提供商优先：裸模型名唯一归属某启用中的自定义提供商时优先于内置渠道；
+   *  多家同名或未命中时不猜，继续按原路由 */
+  preferProvider: boolean;
+  /** 内置优先：仅 true 时允许内置渠道参与自动路由；false 时只走自定义提供商。 */
+  preferBuiltin: boolean;
+  /** 允许无内置归属的裸名兜底到唯一自定义提供商（手工配置兼容项） */
+  allowBareProviderModel: boolean;
   rateLimitPerMin: number;
   concurrency: number;
   creditsRefreshMin: number;
@@ -488,6 +495,20 @@ export interface DirectProbe {
   warn?: string;
 }
 
+/** 客户端上下文窗口的写入结果说明（只给面板展示，不写进客户端配置）。
+ *  三个客户端的机制不同，但面板只需要回答「写了多少 / 值可信吗」。 */
+export interface CodexContextInfo {
+  /** 实际生效的窗口值（Token） */
+  value: number;
+  /** declared = 用户声明/手填；template = 沿用 Codex 内置模板的 272K；
+   *  default = 未声明，客户端按默认 200K 运行 */
+  source: "declared" | "template" | "default";
+  /** 具体机制：catalog（Codex）/ claude-1m（[1m]+betas）/ supports1m（Desktop）/ default-200k */
+  mechanism: "catalog" | "claude-1m" | "supports1m" | "default-200k";
+  /** source=template 时，被克隆的那条内置模板模型的 slug */
+  templateModel?: string;
+}
+
 export interface DirectApplyResult {
   ok?: boolean;
   /** 需要用户确认（首调只做只读预检，带 confirmAck 重调才落盘） */
@@ -497,6 +518,12 @@ export interface DirectApplyResult {
   backupPath?: string;
   files?: string[];
   base?: string;
+  /** 本次写入的上下文窗口及来源（面板据此提示"沿用了模板值/未声明"） */
+  ctxInfo?: CodexContextInfo;
+  /** 实际写入的默认思考强度（空串 = 未指定，交给客户端推荐档） */
+  effort?: string;
+  /** Codex 专属的窗口细节（模板模型名等），与 ctxInfo 同时返回 */
+  codexCtx?: CodexContextInfo;
   message?: string;
 }
 
@@ -619,6 +646,9 @@ export type ProxyProviderModel = string | {
   upstream?: string;
   /** 额外的可请求名：原名与别名都命中同一上游模型，但别名不出现在 /v1/models */
   aliases?: string[];
+  /** 代理模型名：客户端用这个名字请求时优先路由到本提供商，并转发到本行的 upstream。
+   *  不进入 /v1/models；同一供应商内唯一，跨供应商同名按优先级消歧。 */
+  proxyModel?: string;
   /** 思考档位声明：supportedEfforts 决定客户端要的档位能否原样透传，不支持时按此降级 */
   reasoning?: { supportedEfforts?: string[]; defaultEffort?: string };
   name?: string;
@@ -655,6 +685,11 @@ export interface ProxyProvider {
   models: ProxyProviderModel[];
   extraHeaders: Record<string, string>;
   extraBody: Record<string, unknown>;
+  /** @deprecated 供应商级代理名已废弃；读取时迁移到 models[].proxyModel，保留字段仅为兼容旧数据。 */
+  proxyModel?: string;
+  /** 路由优先级，越大越优先（0 = 普通，后端归一到 0~999 整数）。
+   *  同名裸模型命中多家时，唯一最高优先的那家胜出；同级仍按「歧义不猜」回退内置路由。 */
+  priority: number;
   updatedAt: number;
   keyCount?: number;
   onlineCount?: number;

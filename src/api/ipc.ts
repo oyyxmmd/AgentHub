@@ -363,6 +363,12 @@ export const proxyPinnedAccountSet = (channel: ProxyChannelId, accountId: string
     "proxy_pinned_account_set",
     { channel, accountId } as unknown as Record<string, unknown>
   );
+/** @deprecated 旧「自定义优先」开关；新 UI 使用 proxyPreferBuiltinSet。 */
+export const proxyPreferProviderSet = (enabled: boolean) =>
+  call<{ ok: boolean; enabled: boolean; message?: string }>("proxy_prefer_provider_set", { enabled });
+/** 内置优先总闸：true 才允许内置渠道参与自动路由；false 时只走自定义提供商。 */
+export const proxyPreferBuiltinSet = (enabled: boolean) =>
+  call<{ ok: boolean; enabled: boolean; message?: string }>("proxy_prefer_builtin_set", { enabled });
 /** 扫描本机已装软件的登录态（凭据不出主进程，只回候选信息） */
 export const proxyScan = () => call<ProxyScanCandidate[]>("proxy_scan");
 /** 导入本机候选；file/uid 用于身份核对（两次扫描之间文件变化时不至于导错账号） */
@@ -414,6 +420,8 @@ export interface ProxyProviderInput {
   extraHeaders?: Record<string, string>;
   extraBody?: Record<string, unknown>;
   enabled?: boolean;
+  /** 路由优先级，0~999 整数，越大越优先；留空按 0（普通）处理 */
+  priority?: number;
   keys?: { name?: string; key: string }[];
 }
 
@@ -437,7 +445,22 @@ export const proxyProviderTest = (input: {
 }) => call<ProxyProviderTestResult>("proxy_provider_test", input as unknown as Record<string, unknown>);
 /** 拉上游 /v1/models：用该提供商号池里的 Key，因此必须先存过一次 Key */
 export const proxyProviderFetchModels = (id: string) =>
-  call<{ ok: boolean; models?: string[]; message?: string }>("proxy_provider_fetch_models", { id });
+  call<{
+    ok: boolean;
+    models?: string[];
+    metadata?: Record<string, { contextLength?: number; maxOutputTokens?: number; name?: string; capabilities?: Record<string, boolean> }>;
+    modelEntries?: Record<string, { model: string; upstream?: string; aliases?: string[]; name?: string; proxyModel?: string }>;
+    message?: string;
+  }>(
+    "proxy_provider_fetch_models",
+    { id },
+  );
+/** 查询一把 Key 的官方余额（当前支持 DeepSeek / Kimi；其余端点明确返回 unsupported） */
+export const proxyProviderBalance = (input: { id: string; accountId: string; baseUrl: string }) =>
+  call<{ ok: boolean; credits?: number; unit?: string; vendor?: string; unsupported?: boolean; status?: number; message?: string }>(
+    "proxy_provider_balance",
+    input,
+  );
 
 /** 切号预检事实（确认框展示用）：目标客户端是否在运行 / 安装路径 / 切完是否自动重启 */
 export interface IdeSwitchProbe {
@@ -550,16 +573,17 @@ export const proxyVaultStatus = () => call<{ encrypted: boolean; driver: string;
 
 // ===== 反代网关：生态接入（CC Switch / 直连） =====
 export const proxyCcSwitchStatus = () => call<CcSwitchStatus>("proxy_ccswitch_status");
-export const proxyCcSwitchRegister = (opts: { appType: CcSwitchAppType; apiKey: string; model: string; tiers?: { sonnet: string; opus: string; haiku: string; subagent: string }; port?: number }) =>
+export const proxyCcSwitchRegister = (opts: { appType: CcSwitchAppType; apiKey: string; model: string; tiers?: { sonnet: string; opus: string; haiku: string; subagent: string }; port?: number; contextWindow?: number; reasoningEffort?: string }) =>
   call<CcSwitchRegisterResult>("proxy_ccswitch_register", opts as unknown as Record<string, unknown>);
 /** 直连模式状态（读各客户端配置文件的实际指向） */
 export const proxyDirectStatus = (port?: number) =>
   call<DirectStatus>("proxy_direct_status", (port ? { port } : {}) as Record<string, unknown>);
-/** 直连写入：首调只预检（needConfirm + probe），带 confirmAck 重调才真正落盘 */
+/** 直连写入：首调只预检（needConfirm + probe），带 confirmAck 重调才真正落盘。
+ *  contextWindow 为 Codex 专用的手填窗口（支持面板解析 1M/128K 这类写法），留空则用模型目录声明的值。 */
 export const proxyDirectApply = (opts: {
   appType: DirectAppType; apiKey: string; model: string;
   tiers?: { sonnet: string; opus: string; haiku: string; subagent: string };
-  port?: number; confirmAck?: boolean;
+  port?: number; confirmAck?: boolean; contextWindow?: number; reasoningEffort?: string;
 }) => call<DirectApplyResult>("proxy_direct_apply", opts as unknown as Record<string, unknown>);
 /** 直连回滚：用最近一次备份恢复该应用的配置 */
 export const proxyDirectRestore = (appType: DirectAppType) =>

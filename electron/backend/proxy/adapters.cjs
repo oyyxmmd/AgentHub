@@ -438,8 +438,10 @@ const trae = {
   },
 
   /** 模型显示名 → (config_name, model_name)；映射表外置热加载。
-   *  宽松归一化匹配（上游 normalizeModelName）：下划线↔横线、大小写不敏感，
-   *  客户端传 deepseek_v4_pro / DeepSeek-V4-Pro 之类变体也能命中映射；未命中原样透传（上游接受裸 config_name） */
+   *  宽松归一化匹配（参考项目 normalizeModelName）：下划线↔横线、大小写不敏感，
+   *  客户端传 deepseek_v4_pro / DeepSeek-V4-Pro 之类变体也能命中映射；
+   *  映射未命中时回查官方目录取权威 id（上游 config_name 大小写敏感，显示名
+   *  `MiniMax-M3.1-Flash` 与 id `minimax-m3.1-flash` 不同，原样透传会被判参数非法） */
   mapModel(model) {
     const map = rules.get("model_map.json") || {};
     let hit = map[model];
@@ -451,6 +453,10 @@ const trae = {
       }
     }
     if (Array.isArray(hit) && hit.length >= 2) return { configName: String(hit[0]), modelName: String(hit[1]) };
+    const cat = catalogMap("trae");
+    const entry = cat.get(String(model).toLowerCase())
+      || cat.get(String(model).toLowerCase().replace(/_/g, "-"));
+    if (entry && entry.id) return { configName: String(entry.id), modelName: String(entry.id) };
     return { configName: model, modelName: model };
   },
 
@@ -4976,9 +4982,44 @@ function compatUrl(base, leaf) {
   return `${base}/v1/${leaf}`;
 }
 
+/** OpenCode Go 的 API 家族不是同一个根：
+ *  - Chat:   https://opencode.ai/inference/go/openai/v1/chat/completions
+ *  - Models: https://opencode.ai/inference/go/v1/models
+ *  旧版 `/zen/go` 只有 Models 可用，Chat 会 404，因此不能只靠 compatUrl 拼。 */
+function opencodeGoUrls(raw) {
+  try {
+    const u = new URL(String(raw || ""));
+    if (u.hostname.toLowerCase() !== "opencode.ai") return null;
+    const p = u.pathname.replace(/\/+$/, "").toLowerCase();
+    const go = p === "/inference/go/openai" || p === "/inference/go" || p === "/zen/go";
+    if (!go) return null;
+    return {
+      chat: "https://opencode.ai/inference/go/openai/v1/chat/completions",
+      models: "https://opencode.ai/inference/go/v1/models",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** OpenCode Go 的会话头：官方要求每个会话发送稳定的 x-opencode-session，
+ *  不发送会直接 400 MissingSessionID。优先用轮内稳定会话键，其次消息指纹，最后随机兜底。 */
+function opencodeSessionId(meta, body) {
+  const fromMeta = meta && typeof meta.conversationId === "string" ? meta.conversationId.trim() : "";
+  if (fromMeta) return fromMeta;
+  const fromBody = body && (body.conversation_id || body.conversationId);
+  if (typeof fromBody === "string" && fromBody.trim()) return fromBody.trim();
+  return util.stableConvId(body && body.messages) || util.uuid();
+}
+
 function makeOpenaiCompat(row, opts) {
   const entries = compatModelEntries(row);
-  const chatUrl = compatUrl(row.baseUrl, "chat/completions");
+  const goUrls = opencodeGoUrls(row.baseUrl);
+  const chatUrl = (goUrls && goUrls.chat) || compatUrl(row.baseUrl, "chat/completions");
+  const modelsUrl = (goUrls && goUrls.models) || compatUrl(row.baseUrl, "models");
+  // 会话头按提供商标识或官方主机/路径识别；标识分支让用户在面板里临时换到自建端点时
+  // 仍能拿到探测反馈，不会把“连接错误”误报成模型/地址问题。
+  const wantsOpencodeSession = row.id === "opencode" || !!goUrls;
   // 首字节预算函数可注入（opts.firstByteBudgetMs），只为自测能把 30s 缩短到秒级复现
   // 「首事件不解除预算 → 长回答被掐断」这条现场；生产路径一律用模块内那份口径。
   // 与 autoclawDeps 注入 firstByteBudgetMs 是同一个先例，不新造第二套预算算法
@@ -4990,6 +5031,11 @@ function makeOpenaiCompat(row, opts) {
   for (const e of entries) {
     upstreamByClient.set(e.client.toLowerCase(), e.upstream);
     entryByClient.set(e.client.toLowerCase(), e);
+    const proxyKey = String((e.entry && e.entry.proxyModel) || "").trim().toLowerCase();
+    if (proxyKey) {
+      upstreamByClient.set(proxyKey, e.upstream);
+      entryByClient.set(proxyKey, e);
+    }
     for (const a of (e.entry && Array.isArray(e.entry.aliases) ? e.entry.aliases : [])) {
       const k = String(a || "").toLowerCase();
       if (!k) continue;
@@ -5038,8 +5084,8 @@ function makeOpenaiCompat(row, opts) {
     /** 拉上游自己的清单（GET {base}/v1/models）：中转站大多支持，失败如实回错，
      *  由 UI 引导手填——真没有模型目录接口的站是少数，替上游预判会拒掉有能力的那批。
      *  形参沿用本文件所有适配器同一条 fetchModels(account, secrets) 调用面，不另立一套。 */
-    async fetchModels(account, secrets) {
-      const r = await httpJson(compatUrl(row.baseUrl, "models"), { method: "GET", headers: this.headers(secrets || {}) })
+    async fetchModels(account, secrets, overrideUrl) {
+      const r = await httpJson(overrideUrl || modelsUrl, { method: "GET", headers: this.headers(secrets || {}) })
         .catch((e) => ({ ok: false, status: 0, data: null, text: String((e && e.message) || e) }));
       if (!r.ok) {
         return {
@@ -5082,11 +5128,13 @@ function makeOpenaiCompat(row, opts) {
     },
 
     /** OpenAI 协议 1:1 透传 */
-    async chatOpenai({ secrets, model, body, emit }) {
+    async chatOpenai({ secrets, model, body, emit, meta }) {
       const payload = JSON.stringify(this.rewriteBody(model, body));
+      const headers = this.headers(secrets);
+      if (wantsOpencodeSession) headers["x-opencode-session"] = opencodeSessionId(meta, body);
       // 首字节预算按 prompt 规模给（与内置渠道同一条口径），不再吃 fetchStream 的固定 30s 缺省
       const { resp, cancelTimer } = await fetchStream(chatUrl, {
-        method: "POST", headers: this.headers(secrets), body: payload,
+        method: "POST", headers, body: payload,
         firstByteMs: budgetOf(payload),
       });
       const result = { status: 200, planLimit: false };
@@ -5515,7 +5563,7 @@ function consistencyReport() {
 
 module.exports = { get, ADAPTERS, channelModelIds, reverseAliasEntry, resolveModelTarget, mergedModels, listableModels, modelOwners, channelOn, httpJson, refreshTokenLocked, setPendingCaptcha, getPendingCaptcha,
   // 自定义提供商：动态实例化的通用 OpenAI 兼容适配器（provider.cjs 的探测与自测直用这一支）
-  makeOpenaiCompat, compatUrl, statusFromCompatError, compatModelEntries,
+  makeOpenaiCompat, compatUrl, opencodeGoUrls, statusFromCompatError, compatModelEntries,
   // 适配器契约（启动期校验 + 自测复验用）
   REQUIRED_ADAPTER_METHODS, assertAdapterContract, consistencyReport,
   // ModelScope 续期实现注入（避免 adapters ↔ discovery 循环依赖；由 index.cjs 启动时注入）

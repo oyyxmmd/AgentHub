@@ -45,6 +45,8 @@ console.log("① base_url 归一：写入侧就存成规范值");
     ["https://a.one/v1/chat/completions", "https://a.one"],
     ["https://a.one/api/openai/v1/v1", "https://a.one/api/openai"], // 剥到不动为止
     ["https://a.one/chat/completions", "https://a.one/chat/completions"], // 完整端点形态：不剥
+    ["https://opencode.ai/zen/go", "https://opencode.ai/inference/go/openai"], // 旧 Go 地址：Chat 404，写入侧迁移
+    ["https://opencode.ai/inference/go", "https://opencode.ai/inference/go/openai"],
   ];
   for (const [raw, want] of cases) {
     const r = provider.normalizeBaseUrl(raw);
@@ -57,6 +59,73 @@ console.log("① base_url 归一：写入侧就存成规范值");
   ok(provider.normalizeBaseUrl("https://a.one/v1?sk=1").ok === false, "带查询串被拒");
   ok(provider.normalizeBaseUrl("https://a.one/v1#x").ok === false, "带锚点被拒");
   ok(provider.normalizeBaseUrl("https://a.one/v1").domain === "a.one", "domain 取 hostname（号池展示要用）");
+  ok(JSON.stringify(adapters.opencodeGoUrls("https://opencode.ai/inference/go/openai")) ===
+    JSON.stringify({ chat: "https://opencode.ai/inference/go/openai/v1/chat/completions", models: "https://opencode.ai/inference/go/v1/models" }),
+    "OpenCode Go 的 Chat 与 Models 不是同一个根（旧 /zen/go 只有 Models，Chat 会 404）",
+    adapters.opencodeGoUrls("https://opencode.ai/inference/go/openai"));
+  ok(adapters.opencodeGoUrls("https://a.one/v1") === null, "非 OpenCode 主机不被特殊处理");
+
+  // ===== 公开元数据（models.dev）：上游只给 id，上下文/输出上限要自动补齐 =====
+  const idx = provider.buildModelsDevIndex({
+    "opencode-go": {
+      models: {
+        "minimax-m3.1-flash-free": { id: "minimax-m3.1-flash-free", name: "MiniMax M3.1 Flash Free", attachment: true, reasoning: true, tool_call: true, limit: { context: 1000000, output: 512000 } },
+        "gpt-5.5": { id: "gpt-5.5", name: "GPT-5.5", limit: { context: 1050000, output: 128000 } },
+      },
+    },
+    azure: {
+      models: {
+        "gpt-5.5": { id: "gpt-5.5", name: "GPT-5.5", limit: { context: 1050000, output: 128000 } },
+        "conflict-model": { id: "conflict-model", limit: { context: 1000000, output: 1000 } },
+      },
+    },
+    other: {
+      models: {
+        "conflict-model": { id: "conflict-model", limit: { context: 200000, output: 1000 } },
+      },
+    },
+  });
+  const hints = provider.modelsDevHintsFor("https://opencode.ai/inference/go/openai");
+  const mm = provider.resolveModelsDevMeta(idx, hints, "minimax-m3.1-flash-free");
+  ok(mm && mm.contextLength === 1000000 && mm.maxOutputTokens === 512000, "OpenCode Go 模型按指定提供商精确命中上下文/输出上限", mm);
+  ok(mm && mm.capabilities.images === true && mm.capabilities.reasoning === true && mm.capabilities.tools === true, "能力标记（视觉/思考/工具）一并带出", mm && mm.capabilities);
+  const gpt = provider.resolveModelsDevMeta(idx, hints, "gpt-5.5");
+  ok(gpt && gpt.contextLength === 1050000, "指定提供商没这条时回退到全网一致声明（同名窗口相同才采信）", gpt);
+  const freeVariant = provider.resolveModelsDevMeta(
+    provider.buildModelsDevIndex({ base: { models: { "some-model": { id: "some-model", limit: { context: 262144, output: 32768 } } } } }),
+    [],
+    "some-model-free",
+  );
+  ok(freeVariant && freeVariant.contextLength === 262144, "带 -free 后缀的免费变体回退到不带后缀的同名条目（OpenCode 免费模型命名规律）", freeVariant);
+  ok(provider.resolveModelsDevMeta(idx, [], "conflict-model") === null, "同名模型各家声明冲突时不猜（宁缺勿错，留未知让用户手填）");
+  ok(provider.resolveModelsDevMeta(idx, hints, "no-such-model") === null, "目录里没有的模型返回 null");
+
+  // ===== 主流厂商适配：同一能力在不同厂商的路径/字段不同 =====
+  ok(provider.vendorFor("https://api.deepseek.com")?.id === "deepseek", "识别 DeepSeek 官方端点");
+  ok(provider.vendorFor("https://api.moonshot.cn/v1")?.id === "kimi", "识别 Kimi 国内站端点");
+  ok(provider.vendorFor("https://api.moonshot.ai/v1")?.id === "kimi_intl", "识别 Kimi 国际站端点（Key 与国内站不通用）");
+  ok(provider.vendorFor("https://relay.example.com/v1") === null, "普通中转站不误判为官方厂商");
+  ok(provider.modelsUrlFor("https://api.deepseek.com") === "https://api.deepseek.com/models", "DeepSeek 模型列表在根路径 /models（不是 /v1/models）");
+  ok(provider.modelsUrlFor("https://api.moonshot.cn/v1") === "https://api.moonshot.cn/v1/models", "Kimi base_url 已含 /v1，模型列表不能再拼一次 /v1");
+  ok(provider.modelsUrlFor("https://api.moonshot.ai/v1") === "https://api.moonshot.ai/v1/models", "Kimi 国际站同规则");
+  ok(provider.modelsUrlFor("https://relay.example.com/v1") === "https://relay.example.com/v1/models",
+    "通用中转站 base_url 已带 /v1 时不重复拼成 /v1/v1/models");
+  ok(provider.modelsUrlFor("https://relay.example.com") === "https://relay.example.com/v1/models",
+    "通用中转站 base_url 不带 /v1 时补一次 /v1/models");
+  const ds = provider.VENDOR_PROFILES.find((v) => v.id === "deepseek");
+  ok(ds.balanceCredits({ balance_infos: [{ currency: "USD", total_balance: "1.00" }, { currency: "CNY", total_balance: "7.30" }] }) === 7.3,
+    "DeepSeek 余额优先取 CNY 的 total_balance（同时返回 USD 时不误取美元）");
+  const kimi = provider.VENDOR_PROFILES.find((v) => v.id === "kimi");
+  ok(kimi.balanceCredits({ code: 0, data: { available_balance: 42.5 } }) === 42.5, "Kimi 余额取 data.available_balance");
+  ok(ds.balanceCredits({ balance_infos: [] }) === null, "余额字段缺失时返回 null，不伪造 0");
+  ok(ds.fallbackModels[0].model === "deepseek-flash" && ds.fallbackModels[0].proxyModel === "deepseek-v4.1-flash",
+    "DeepSeek 官方模型名是 deepseek-flash，deepseek-v4.1-flash 作为该行的代理模型名");
+  ok(ds.fallbackModels[1] === "deepseek-v4-pro", "DeepSeek 第二个官方模型是 deepseek-v4-pro");
+  ok(JSON.stringify(kimi.fallbackModels) === '["kimi-k3","kimi-k2.7-code-highspeed","kimi-k2.6"]', "Kimi 无 Key 时给官方兜底模型清单");
+  const dsEntries = provider.vendorModelEntries(ds, ["deepseek-flash"]);
+  ok(dsEntries.modelEntries["deepseek-flash"].proxyModel === "deepseek-v4.1-flash",
+    "从上游拉取到 deepseek-flash 时带回模型级代理名（客户端可用旧名请求，上游收官方名）");
+  ok(!("deepseek-v4.1-flash" in dsEntries.modelEntries), "不会把旧名伪装成上游独立模型");
 }
 
 console.log("\n② 模型清单 / 别名 / 档位 / 自定义头与 body");
@@ -101,6 +170,8 @@ console.log("\n② 模型清单 / 别名 / 档位 / 自定义头与 body");
   const badKind = provider.create({ ...base, kind: "grpc" });
   ok(badKind.ok === false && /协议形态/.test(badKind.message || ""), "认不出的协议形态被拒（而不是静默按缺省存）", badKind);
   provider.remove("rel1");
+  const proxyDup = provider.create({ id: "pm-dup", baseUrl: `http://127.0.0.1:${UP}/v1`, models: [{ model: "a", proxyModel: "a" }] });
+  ok(proxyDup.ok === false && /代理模型名/.test(proxyDup.message || ""), "代理模型名不能与模型名/别名重复（同名解析歧义）", proxyDup);
 }
 
 console.log("\n③ 标识规矩与防遮蔽");
@@ -177,7 +248,7 @@ function fakeUpstream(port, opts) {
         return;
       }
       const b = JSON.parse(raw || "{}");
-      seen.push({ path: url, auth: String(req.headers.authorization || ""), xkey: String(req.headers["x-a"] || ""), model: b.model, stream: b.stream, body: b });
+      seen.push({ path: url, auth: String(req.headers.authorization || ""), xkey: String(req.headers["x-a"] || ""), session: String(req.headers["x-opencode-session"] || ""), model: b.model, stream: b.stream, body: b });
       const ch = (d, f, u) => `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: b.model, choices: [{ index: 0, delta: d, finish_reason: f || null }], ...(u ? { usage: u } : {}) })}\n\n`;
       // 整包回 JSON 的两种形态（正常应答 / 把欠费写成错误体）：内容类型必须在 writeHead 一次定下，
       // 先 writeHead 再 setHeader 会抛 ERR_HTTP_HEADERS_SENT 把假上游打穿
@@ -211,8 +282,9 @@ function parseSse(text) {
 }
 
 let GWKEY = { secret: "" };
-// 裸名兜底开关：settings 是每次请求重读的闭包，翻转这个变量即等价于用户在配置里改了一档
+// 裸名路由开关：settings 是每次请求重读的闭包，翻转变量即等价于用户在配置里改了一档
 let BARE_ON = true;
+let BUILTIN_ON = true;
 function chat(body, keyOrNone) {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -252,7 +324,7 @@ function listModels() {
   // ===== ⑤ 模型名解析（纯函数层） =====
   console.log("\n⑤ 模型名解析：前缀直达 / 裸名兜底");
   {
-    provider.create({ id: "p1", baseUrl: `http://127.0.0.1:${UP}/v1`, models: [{ model: "gpt-x", upstream: "glm-4.7", aliases: ["gpt-y"] }], extraHeaders: { "x-a": "relay-tag" } });
+    provider.create({ id: "p1", baseUrl: `http://127.0.0.1:${UP}/v1`, models: [{ model: "gpt-x", upstream: "glm-4.7", aliases: ["gpt-y"], proxyModel: "unified-entry" }], extraHeaders: { "x-a": "relay-tag" } });
     provider.addKey("p1", { key: "sk-aaa" });
     provider.create({ id: "p2", baseUrl: `http://127.0.0.1:${UP}/v1`, models: ["gpt-x"] });
     provider.addKey("p2", { key: "sk-aaa" });
@@ -262,6 +334,17 @@ function listModels() {
     ok(provider.parseModelRef("p1/") === null, "尾段为空不算前缀");
     ok(provider.parseModelRef("google/gemini-3") === null, "内置生态里带斜杠的模型 id 不被误判成提供商（判据是首段命中提供商）");
     ok(provider.parseModelRef("off/gpt-x") === null, "停用中的提供商不接受前缀路由");
+
+    // 代理统一模型名：供应商级固定入口，优先于内置归属；多家同名按优先级消歧，同级不猜
+    ok(provider.findByProxyModel("unified-entry") === "p1", "代理模型名唯一命中时直达该提供商");
+    ok(provider.findByProxyModel("p1/unified-entry") === null, "代理模型名不走前缀解析（它不是 slug）");
+    ok(provider.findByProxyModel("") === null, "空代理模型名不命中任何提供商");
+    provider.create({ id: "p-proxy2", baseUrl: `http://127.0.0.1:${UP}/v1`, models: [{ model: "x", proxyModel: "unified-entry" }] });
+    ok(provider.findByProxyModel("unified-entry") === null, "多家同名代理模型且同级时不猜");
+    provider.update("p-proxy2", { priority: 9 });
+    ok(provider.findByProxyModel("unified-entry") === "p-proxy2", "唯一最高优先的代理模型名胜出");
+    provider.update("p-proxy2", { priority: 0 });
+    provider.remove("p-proxy2");
     provider.create({ id: "off", baseUrl: `http://127.0.0.1:${UP}/v1`, models: ["z-model"] }).provider;
     provider.update("off", { enabled: false });
     ok(provider.parseModelRef("off/z-model") === null, "停用后前缀彻底失效（不能被选中）");
@@ -270,17 +353,68 @@ function listModels() {
     const builtinName = adapters.mergedModels().map((m) => m.id).find((id) => !id.includes("/") && adapters.modelOwners(id).length);
     ok(!!builtinName, "夹具前提：内置目录里确实有可被认领的裸名", builtinName);
     provider.create({ id: "p3", baseUrl: `http://127.0.0.1:${UP}/v1`, models: [builtinName] });
-    ok(provider.findUniqueByBareModel(builtinName) === null, "有内置归属的裸名绝不落到提供商（静默遮蔽就是这么来的）", builtinName);
+    const routeSettings = {
+      preferBuiltin: true, allowBareProviderModel: true, modelOverrides: {}, routeStrategy: "auto",
+      routeOrder: "score", channelEnabled: {},
+    };
+    const routeKey = { route: "auto" };
+    ok(provider.findUniqueByBareModel(builtinName) === null, "旧兜底口径仍保持内置优先", builtinName);
+    ok(provider.findUniqueByBareModel(builtinName, { includeBuiltinOwned: true }) === "p3", "优先档允许启用中的唯一自定义提供商认领内置同名裸名");
+    const normal = server.resolveChannel(routeKey, builtinName, routeSettings);
+    ok(normal.channel && normal.channel !== "p3", "内置优先开启时走内置归属", normal);
+    const customOnly = server.resolveChannel(routeKey, builtinName, { ...routeSettings, preferBuiltin: false });
+    ok(customOnly.channel === "p3", "内置优先关闭时唯一自定义提供商胜出", customOnly);
+    const noCustom = server.resolveChannel(routeKey, builtinName, { ...routeSettings, preferBuiltin: false, allowBareProviderModel: false });
+    ok(noCustom.channel == null && noCustom.unknownModel === true, "内置优先关闭且无自定义命中时绝不回落到内置渠道", noCustom);
+    ok(server.resolveChannel(routeKey, "p3/" + builtinName, routeSettings).channel === "p3", "显式 slug/model 不受优先开关影响");
     ok(provider.findUniqueByBareModel("gpt-x") === null, "两个提供商都有 gpt-x → 歧义不猜");
     ok(provider.findUniqueByBareModel("gpt-y") === "p1", "别名同等参与裸名兜底（唯一命中才给）");
     ok(provider.findUniqueByBareModel("p1/gpt-x") === null, "带前缀的写法不走兜底");
+
+    // 代理模型名优先于内置归属（即使内置渠道也拥有同名模型）；多家同名按优先级消歧
+    provider.create({ id: "p-proxy", baseUrl: `http://127.0.0.1:${UP}/v1`, models: [{ model: "not-the-same", proxyModel: builtinName }] });
+    const proxyOwned = server.resolveChannel(routeKey, builtinName, routeSettings);
+    ok(proxyOwned.channel === "p-proxy" && proxyOwned.proxyModel === true, "代理模型名优先于内置归属", proxyOwned);
+    provider.remove("p-proxy");
+
+    provider.create({ id: "p4", baseUrl: `http://127.0.0.1:${UP}/v1`, models: [builtinName] });
+    const ambiguous = server.resolveChannel(routeKey, builtinName, { ...routeSettings, preferBuiltin: false });
+    ok(ambiguous.channel == null && ambiguous.unknownModel === true, "两家自定义同名且内置关闭时也不猜，直接报未知模型", ambiguous);
+
+    // ===== per-provider 优先级：同名消歧的唯一手段 =====
+    // 判据用「谁胜出」而不是「内部怎么算」：优先级是显式消歧，同级必须仍然不猜。
+    ok(provider.findUniqueByBareModel("gpt-x") === null, "两家同级（都 0）时仍然歧义不猜——优先级不改变同级口径");
+    provider.update("p2", { priority: 9 });
+    ok(provider.findUniqueByBareModel("gpt-x") === "p2", "唯一最高优先的那家胜出", { p: provider.findUniqueByBareModel("gpt-x") });
+    provider.update("p1", { priority: 9 });
+    ok(provider.findUniqueByBareModel("gpt-x") === null, "两家并列最高 → 仍然不猜（不能靠遍历顺序静默选一家）");
+    provider.update("p1", { priority: 20 });
+    ok(provider.findUniqueByBareModel("gpt-x") === "p1", "数字分档：20 > 9 → 高者胜出");
+    provider.update("p4", { priority: 50 });
+    const prioWins = server.resolveChannel(routeKey, builtinName, { ...routeSettings, preferBuiltin: false });
+    ok(prioWins.channel === "p4", "内置关闭时唯一最高优先的同名提供商胜出", prioWins);
+    provider.update("p4", { priority: 50.7 });
+    ok((store.getProvider("p4") || {}).priority === 51, "非整数向上取整到 51（显示与存储同口径）");
+    provider.update("p4", { priority: -5 });
+    ok((store.getProvider("p4") || {}).priority === 0, "负数落回 0（普通），不变成「最优先」");
+    provider.update("p4", { priority: 99999 });
+    ok((store.getProvider("p4") || {}).priority === 999, "超上限夹到 999（优先级是量级差，999 以上纯手滑）");
+
+    provider.remove("p4");
+    provider.update("p1", { priority: 0 });
+    provider.update("p2", { priority: 0 });
     provider.remove("p3");
+
+    // OpenCode Go 的会话头是官方硬要求（缺 x-opencode-session 直接 400 MissingSessionID）。
+    // 这里用本地假上游验“真实转发路径确实带上”，端点映射由上面的纯函数断言守住。
+    provider.create({ id: "opencode", baseUrl: `http://127.0.0.1:${UP}/v1`, models: ["gpt-x"] });
+    provider.addKey("opencode", { key: "sk-opencode" });
   }
 
   const sr = await server.start(() => ({
     port: GW, bind: "127.0.0.1", rateLimitPerMin: 0, concurrency: 8, routeStrategy: "auto",
     fixedChannel: "trae", modelOverrides: {}, debugStatus: false, humanizeJitter: false,
-    allowBareProviderModel: BARE_ON,
+    allowBareProviderModel: BARE_ON, preferBuiltin: BUILTIN_ON,
   }));
   ok(sr.ok === true && sr.port === GW, "网关在测试端口起来", sr);
 
@@ -296,6 +430,29 @@ function listModels() {
     ok(up.seen[up.seen.length - 1].xkey === "relay-tag", "提供商自定义的额外请求头真的落到上游（丢了它就只是界面上一行字）", up.seen[up.seen.length - 1].xkey);
     ok(up.seen[up.seen.length - 1].body.stream === true && up.seen[up.seen.length - 1].body.stream_options.include_usage === true, "出站恒流式并索取 usage");
     ok(!("extraBody" in up.seen[up.seen.length - 1].body), "内部载体不外泄：上游收到的请求里没有字面 extraBody 键", Object.keys(up.seen[up.seen.length - 1].body));
+
+    const proxyReq = await chat({ model: "unified-entry", messages: [{ role: "user", content: "hi" }], stream: true });
+    ok(proxyReq.status === 200 && up.seen[up.seen.length - 1].model === "glm-4.7",
+      "代理模型名请求被改写成本商主模型上游真名（虚拟名不透传给上游）", up.seen[up.seen.length - 1]);
+
+    provider.create({ id: "pm-multi", baseUrl: `http://127.0.0.1:${UP}/v1`, models: [
+      { model: "m-one", upstream: "up-one", proxyModel: "virtual-one" },
+      { model: "m-two", upstream: "up-two", proxyModel: "virtual-two" },
+    ] });
+    provider.addKey("pm-multi", { key: "sk-pm-multi" });
+    const v1 = await chat({ model: "virtual-one", messages: [{ role: "user", content: "hi" }], stream: true });
+    ok(v1.status === 200 && up.seen[up.seen.length - 1].model === "up-one", "模型级代理名一映射到自己的 upstream", up.seen[up.seen.length - 1]);
+    const v2 = await chat({ model: "virtual-two", messages: [{ role: "user", content: "hi" }], stream: true });
+    ok(v2.status === 200 && up.seen[up.seen.length - 1].model === "up-two", "同一供应商的第二个模型有独立代理名，不共用", up.seen[up.seen.length - 1]);
+    provider.remove("pm-multi");
+
+    const oc1 = await chat({ model: "opencode/gpt-x", messages: [{ role: "user", content: "same-session" }], stream: true });
+    const ocSession1 = up.seen[up.seen.length - 1].session;
+    const oc2 = await chat({ model: "opencode/gpt-x", messages: [{ role: "user", content: "same-session" }], stream: true });
+    const ocSession2 = up.seen[up.seen.length - 1].session;
+    ok(oc1.status === 200 && oc2.status === 200 && ocSession1 && ocSession1 === ocSession2,
+      "OpenCode 提供商自动补稳定的 x-opencode-session（同一会话多轮复用）",
+      [oc1.status, oc2.status, ocSession1, ocSession2]);
 
     const al = await chat({ model: "p1/gpt-y", messages: [{ role: "user", content: "hi" }], stream: true });
     ok(al.status === 200 && up.seen[up.seen.length - 1].model === "glm-4.7", "别名入口同样映射到真名", up.seen[up.seen.length - 1]);
@@ -397,6 +554,39 @@ function listModels() {
     provider.remove("nomod");
   }
 
+  console.log("\n⑪b 主流厂商余额查询：路径与字段按厂商适配");
+  {
+    // 假上游同时扮演 DeepSeek（根路径 /user/balance）与 Kimi（/v1/users/me/balance）
+    const seen = [];
+    const vendorSrv = http.createServer((req, res) => {
+      seen.push(String(req.url || ""));
+      if (req.url === "/user/balance") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ is_available: true, balance_infos: [{ currency: "CNY", total_balance: "88.66", granted_balance: "0", topped_up_balance: "88.66" }] }));
+        return;
+      }
+      if (req.url === "/v1/users/me/balance") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ code: 0, data: { available_balance: 42.5, voucher_balance: 0, cash_balance: 42.5 } }));
+        return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise((r) => vendorSrv.listen(19585, "127.0.0.1", r));
+    // 不支持余额的端点必须直接拒绝，且一个请求都不发（避免拿 Key 去撞不存在的余额路径）
+    const unsupported = await provider.queryBalance({ id: "p1", accountId: store.accountRows("p1")[0].id, baseUrl: `http://127.0.0.1:19585` });
+    ok(unsupported.ok === false && unsupported.unsupported === true, "非 DeepSeek/Kimi 端点明确报不支持余额查询（不伪造 0）", unsupported);
+    ok(seen.length === 0, "不支持的端点根本不发请求（避免拿 Key 去撞不存在的余额路径）", seen);
+
+    // 真实请求路径 + 字段解析：DeepSeek 打 /user/balance，Kimi 打 /v1/users/me/balance
+    const dsBal = await provider.queryBalanceWithVendor({ vendorId: "deepseek", baseUrl: "http://127.0.0.1:19585", token: "sk-ds" });
+    ok(dsBal.ok === true && dsBal.credits === 88.66 && dsBal.unit === "CNY", "DeepSeek 余额请求打到 /user/balance 并取 total_balance", dsBal);
+    const kimiBal = await provider.queryBalanceWithVendor({ vendorId: "kimi", baseUrl: "http://127.0.0.1:19585", token: "sk-kimi" });
+    ok(kimiBal.ok === true && kimiBal.credits === 42.5, "Kimi 余额请求打到 /v1/users/me/balance 并取 available_balance", kimiBal);
+    ok(seen.includes("/user/balance") && seen.includes("/v1/users/me/balance"), "两条厂商余额路径都确实出网且路径正确", seen);
+    vendorSrv.close();
+  }
+
   console.log("\n⑫ 402（欠费）走既有的换号链路");
   {
     provider.create({ id: "owep", baseUrl: `http://127.0.0.1:${UP}/v1`, models: ["owe"] });
@@ -442,6 +632,7 @@ function listModels() {
 
   provider.remove("p1");
   provider.remove("p2");
+  provider.remove("opencode");
   provider.remove("off");
   provider.remove("rel2");
   provider.remove("nom");

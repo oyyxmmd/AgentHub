@@ -7,6 +7,7 @@ import { computed, onMounted, ref } from "vue";
 import * as api from "../../api/ipc";
 import type { CcSwitchStatus, CcSwitchRegisterResult, CcSwitchAppType, CcSwitchTiers, CcSwitchLiveRoute, DirectAppType, DirectStatus, DirectApplyResult, ProxyKeyRow, ProxyModel } from "../../types";
 import { useAppStore } from "../../stores/app";
+import { fmtCtx, parseCtxInput } from "./format";
 
 const app = useAppStore();
 /** 接入方式：ccswitch = 注册到 CC Switch；direct = 直接写客户端配置 */
@@ -50,6 +51,9 @@ const port = computed(() => app.config?.proxy?.port ?? 9527);
 const keyOpts = computed(() => keys.value.filter((k) => k.enabled));
 /** 模型占位：未选时用全局回退模型 */
 const fallback = computed(() => app.config?.proxy?.fallbackModel || "");
+/** 当前选中的模型条目（拿它的 contextLength / 能力标签）。目录里没有时为 undefined——
+ *  staleModel 会补一个占位项让下拉不空，但那条不该被当成"有声明"用。 */
+const selectedModel = computed(() => models.value.find((m) => m.id === model.value.trim()));
 
 /** 内部条目：模型目录里不对外的子代理 / 占位模板（归组置底，仍可选） */
 const INTERNAL_MODEL_RE = /sub_?agent|^summary$|^file_search|^computer_use|^browser_use|^custom_model_/i;
@@ -75,6 +79,14 @@ const TIER_META: { key: keyof CcSwitchTiers; label: string }[] = [
   { key: "haiku", label: "Haiku 档" },
   { key: "subagent", label: "子代理档（Desktop 第四档 Fable）" },
 ];
+
+/** 下拉里的模型标签：带上目录声明的窗口（1M / 208K），让"这个模型是 1M 档吗"在下拉里就能看出来，
+ *  而不是选完再去下面那一行读提示。未声明窗口的不加后缀——空格子比"未知"更不容易被误读成 0。 */
+function modelLabel(m: ProxyModel): string {
+  const ctx = Number(m.contextLength) || 0;
+  const tag = m.enabled ? "" : "（已禁用）";
+  return ctx ? `${m.id} · ${fmtCtx(ctx)}${tag}` : `${m.id}${tag}`;
+}
 
 function entry(appType: CcSwitchAppType) {
   return (st.value?.entries || []).find((x) => x.appType === appType);
@@ -152,6 +164,42 @@ async function switchMode(m: "ccswitch" | "direct") {
   await refresh();
 }
 
+/** 上下文窗口声明：留空 = 用模型目录里的声明（模型页列表可逐条改），手填则本次写入以它为准。
+ *
+ *  三端各有一套表达方式，且都**只有 200K / 1M 两档**，中间值表达不出来：
+ *    · Codex：写进 model catalog 的 context_window。目录是从客户端内置条目克隆的，
+ *      内置条目的 context_window 恒为 272000（≈256K，实测 2026-10-19），未声明时就沿用这个模板值。
+ *    · Claude Code：模型名加 `[1m]` 后缀 + ANTHROPIC_BETAS，两者缺一仍死在 200K。
+ *    · Claude Desktop：profile 的 supports1m。
+ *  所以这个输入框不是"填多少就传多少"，而是"声明的真实窗口是否够 1M"这一档判定的事实来源。 */
+const ctxOverride = ref("");
+/** 手填值 → 数字（支持 1M / 128K 写法）；留空或写不合法 → undefined，由后端回落目录声明 */
+function ctxOverrideNum(): number | undefined {
+  return parseCtxInput(ctxOverride.value);
+}
+/** 面板展示用的当前生效值：手填值优先，否则取模型目录里的声明（0 = 未声明） */
+const ctxEffective = computed(() => ctxOverrideNum() || Number(selectedModel.value?.contextLength) || 0);
+/** 客户端分档门槛：与后端 util.CTX_1M_THRESHOLD 同一个数 */
+const CTX_1M = 1000000;
+/** 是否够 1M 档 */
+const ctxIs1m = computed(() => ctxEffective.value >= CTX_1M);
+/** 没手填也没声明 → 客户端会落到各自的默认（Codex 模板 272K / Claude 200K），界面必须提前说 */
+const ctxWillUseDefault = computed(() => !ctxOverrideNum() && !Number(selectedModel.value?.contextLength));
+/** 声明了但不足 1M：客户端没有中间档，会按 200K 走。不说清楚的话，用户会以为填了 500K 就真按 500K 跑 */
+const ctxBelow1m = computed(() => !!ctxEffective.value && !ctxIs1m.value);
+
+/** 默认思考强度：留空 = 不指定，由客户端的推荐档决定。
+ *  词表取 Codex 与 Claude Code 的交集（后端 util.CLIENT_EFFORT_LEVELS 是唯一出处）——
+ *  `off`/`minimal`/`max` 不在交集里：off 是"关思考"的语义开关不是档位，
+ *  Codex 不认 minimal/max，选了只会被静默降档。 */
+const CLIENT_EFFORTS = ["low", "medium", "high", "xhigh"] as const;
+const effort = ref("");
+/** 提示文案按接入方式区分：两条路的落点不同，写一句笼统的"写入客户端"会让人以为三端都吃 */
+const effortNote = computed(() =>
+  mode.value === "direct"
+    ? "按目标端生效：Codex 写模型目录的 default_reasoning_level，Claude Code 写 CLAUDE_CODE_EFFORT_LEVEL；Claude Desktop 由管理端策略决定，无可用字段。"
+    : "写入 CC Switch 的 Codex 条目（model_reasoning_effort + 模型目录默认档）；Claude 系条目不受影响。");
+
 /** 直连写入第一步：预检（不落盘），成功后把 probe 交给确认卡片 */
 async function directPreview(appType: DirectAppType) {
   if (busy.value) return;
@@ -171,6 +219,8 @@ async function directPreview(appType: DirectAppType) {
       model: (model.value || fallback.value || "").trim(),
       tiers: { ...tiers.value },
       port: port.value,
+      contextWindow: ctxOverrideNum(),
+      reasoningEffort: effort.value || undefined,
     });
     if (r?.ok && r.needConfirm) directProbe.value = r;
     else directErr.value = r?.message || "预检失败";
@@ -207,6 +257,8 @@ async function directConfirm() {
       tiers: { ...tiers.value },
       port: port.value,
       confirmAck: true,
+      contextWindow: ctxOverrideNum(),
+      reasoningEffort: effort.value || undefined,
     });
     if (r?.ok) {
       directResult.value = r;
@@ -288,6 +340,9 @@ async function register(appType: CcSwitchAppType) {
       // Claude 系条目传四档独立模型（空档由后端回落默认）；Codex 忽略
       tiers: { ...tiers.value },
       port: port.value,
+      // Codex 的模型目录要声明窗口，否则客户端拿内置模板的 272000 当真（≈256K）
+      contextWindow: ctxOverrideNum(),
+      reasoningEffort: effort.value || undefined,
     });
     if (r?.ok) {
       result.value = r;
@@ -419,6 +474,25 @@ onMounted(() => {
         </div>
         <div v-if="directProbe.probe" class="set-desc" style="margin-top: 4px">{{ directProbe.probe.hint }}</div>
         <div v-if="directProbe.probe?.warn" class="set-desc err-text" style="margin-top: 8px">{{ directProbe.probe.warn }}</div>
+        <!-- 把「这次到底写了多少窗口、靠什么机制」摆到确认卡上。
+             Codex 的 source=template 意味着写进去的是模板的 272K（≈256K）；Claude 的 source=default
+             意味着根本没写、客户端用 200K 默认。两种症状都发生在写盘之后（长会话被提前压缩/截断），
+             只给一句 warn 而不给具体数值，用户对不上号。 -->
+        <div v-if="directProbe.ctxInfo" class="set-desc" style="margin-top: 8px">
+          上下文窗口：
+          <template v-if="directProbe.ctxInfo.source === 'template'">
+            <b class="mono">{{ fmtCtx(directProbe.ctxInfo.value) }}</b>
+            · <b class="err-text">沿用 Codex 内置模板的值，非所选模型真实窗口</b>
+          </template>
+          <template v-else-if="directProbe.ctxInfo.source === 'default'">
+            <b class="err-text">未声明，客户端按默认 200K 运行</b>
+          </template>
+          <template v-else>
+            <b class="mono">{{ fmtCtx(directProbe.ctxInfo.value) }}</b>
+            · 1M 档（{{ directProbe.ctxInfo.mechanism === "catalog" ? "model_catalog context_window"
+              : directProbe.ctxInfo.mechanism === "claude-1m" ? "[1m] 后缀 + ANTHROPIC_BETAS" : "supports1m" }}）
+          </template>
+        </div>
         <div class="p-actions" style="margin-top: 12px">
           <button class="btn" :disabled="!!busy" @click="directProbe = null">取消</button>
           <button class="btn btn-primary" :disabled="!!busy" @click="directConfirm">{{ busy ? "写入中…" : "确认写入（自动备份）" }}</button>
@@ -510,13 +584,54 @@ onMounted(() => {
             <!-- 当前值已不在目录：补项显示，避免下拉空白让人误以为没配置 -->
             <el-option v-if="staleModel" :key="staleModel" :value="staleModel" :label="`${staleModel}（已不在模型目录）`" />
             <el-option-group v-if="normalModels.length" label="对话模型">
-              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="m.enabled ? m.id : `${m.id}（已禁用）`" />
+              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="modelLabel(m)" />
             </el-option-group>
             <el-option-group v-if="internalModels.length" label="内部条目">
-              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="m.id" />
+              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="modelLabel(m)" />
             </el-option-group>
           </el-select>
           <span v-if="saved" class="tag tag-ok">已保存 · 重新注册后同步</span>
+        </div>
+        <!-- 上下文窗口声明：三端共用。客户端都只有 200K / 1M 两档，
+             所以这里声明的真实窗口决定"够不够 1M"，而不是直接当数值传下去。 -->
+        <div class="co-row" style="margin-top: 10px">
+          <span class="co-label">上下文窗口</span>
+          <input
+            v-model="ctxOverride"
+            class="input mono"
+            style="width: 180px"
+            :placeholder="selectedModel?.contextLength ? fmtCtx(selectedModel.contextLength) : '自动'"
+          />
+          <span class="set-desc" style="flex: 1">
+            <template v-if="ctxOverrideNum()">
+              手填 <b class="mono">{{ fmtCtx(ctxEffective) }}</b>：
+              <template v-if="ctxIs1m">按 <b>1M 档</b>写入（Codex 写 context_window；Claude 写 [1m] 后缀 + ANTHROPIC_BETAS / supports1m）。</template>
+              <template v-else><b class="err-text">未达 1M —— 客户端只有 200K / 1M 两档，将按默认 200K 运行。</b></template>
+            </template>
+            <template v-else-if="selectedModel?.contextLength">
+              模型目录声明为 <b class="mono">{{ fmtCtx(selectedModel.contextLength) }}</b>
+              <template v-if="ctxIs1m">，按 <b>1M 档</b>写入</template>
+              <template v-else>，<b class="err-text">不足 1M，将按 200K 运行</b></template>
+              ；手填可覆盖。
+            </template>
+            <template v-else>
+              <b class="err-text">该模型未声明窗口</b>，将落到客户端默认（Codex 沿用模板 272K / Claude 200K）。
+              若真实窗口更大（如 1M），请手填——也可到「模型目录」页按模型逐条声明。
+            </template>
+          </span>
+          <span v-if="ctxEffective" class="tag" :class="ctxIs1m ? 'tag-ok' : 'tag-warn'">
+            {{ ctxIs1m ? "1M 档" : "200K 档" }}
+          </span>
+        </div>
+        <!-- 默认思考强度：留空 = 不指定，客户端用自己对该模型的推荐档 -->
+        <div class="co-row" style="margin-top: 10px">
+          <span class="co-label">默认思考强度</span>
+          <el-select v-model="effort" class="f-el-select" popper-class="glass-popper" style="width: 180px" placeholder="不指定">
+            <el-option value="" label="不指定（客户端推荐档）" />
+            <el-option v-for="e in CLIENT_EFFORTS" :key="e" :value="e" :label="e" />
+          </el-select>
+          <span class="set-desc" style="flex: 1">{{ effortNote }}</span>
+          <span class="tag" :class="effort ? 'tag-ok' : 'tag-dim'">{{ effort || "默认" }}</span>
         </div>
         <!-- Claude 四档独立模型（Claude Code env 五组键 / Desktop 四档角色路由共用同一组值；Codex 不使用） -->
         <div v-for="t in TIER_META" :key="t.key" class="co-row" style="margin-top: 10px">
@@ -533,10 +648,10 @@ onMounted(() => {
             <el-option value="" :label="`跟随默认模型：${model || fallback || '—'}`" />
             <el-option v-if="staleTier(t.key)" :key="staleTier(t.key)" :value="staleTier(t.key)" :label="`${staleTier(t.key)}（已不在模型目录）`" />
             <el-option-group v-if="normalModels.length" label="对话模型">
-              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="m.enabled ? m.id : `${m.id}（已禁用）`" />
+              <el-option v-for="m in normalModels" :key="m.id" :value="m.id" :label="modelLabel(m)" />
             </el-option-group>
             <el-option-group v-if="internalModels.length" label="内部条目">
-              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="m.id" />
+              <el-option v-for="m in internalModels" :key="m.id" :value="m.id" :label="modelLabel(m)" />
             </el-option-group>
           </el-select>
         </div>

@@ -21,6 +21,7 @@ delete process.env.CODEX_HOME;
 
 // 注意：os.homedir() 在 Node 里会读 HOME（POSIX）/ USERPROFILE（Win），设完环境变量后 require 模块即可
 const direct = require("../electron/backend/proxy/direct.cjs");
+const util = require("../electron/backend/proxy/util.cjs");
 
 let pass = 0;
 function ok(name, cond, extra) {
@@ -86,6 +87,60 @@ console.log("2. Claude Code 合并写");
   // 状态：应识别为已指向网关
   const st = direct.status({ port: 9527 });
   ok("status 识别已直连网关", st.apps.claude.pointingGateway === true && st.apps.claude.pointingCcSwitch === false);
+}
+
+// ===== 2b. Claude Code 的 1M 档：后缀 + ANTHROPIC_BETAS 缺一不可 =====
+console.log("2b. Claude Code 1M 档信号");
+{
+  const f = direct.targetsOf("claude").files[0];
+  // 本段中途会直接覆盖 settings.json（模拟"用户已有别的 beta"），结束时必须还原成
+  // 第 2 段 apply 的产物——否则第 5 段的回滚断言会拿这段的残缺夹具去比对 enableWorkflows
+  const snapshot = fs.readFileSync(f, "utf8");
+  const tiers = { sonnet: "kimi-k3", opus: "", haiku: "", subagent: "" };
+
+  // 1M：模型名带 [1m]…（客户端内部按它判窗口）+ betas 里含 context-1m（让请求真的带 beta 头）
+  const r1 = direct.apply({ appType: "claude", apiKey: KEY, model: "glm-5.3", tiers, port: 9527, confirmAck: true, contextWindow: 1000000 });
+  ok("声明 1M 写入成功", r1.ok === true, r1.message);
+  const j1 = JSON.parse(fs.readFileSync(f, "utf8"));
+  ok("ANTHROPIC_MODEL 带 [1m] 后缀", j1.env.ANTHROPIC_MODEL === "glm-5.3[1m]", j1.env.ANTHROPIC_MODEL);
+  ok("四档 *_MODEL 也都带 [1m]", j1.env.ANTHROPIC_DEFAULT_SONNET_MODEL === "kimi-k3[1m]"
+    && j1.env.ANTHROPIC_DEFAULT_OPUS_MODEL === "glm-5.3[1m]", j1.env.ANTHROPIC_DEFAULT_OPUS_MODEL);
+  ok("ANTHROPIC_BETAS 含 context-1m-2025-08-07", String(j1.env.ANTHROPIC_BETAS || "").includes(direct.CLAUDE_1M_BETA), j1.env.ANTHROPIC_BETAS);
+  ok("*_MODEL_NAME 是展示名，不含 [1m]（否则菜单显示的名字对不上上游模型）",
+    !/\[1m\]/i.test(String(j1.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME || "")), j1.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME);
+  ok("1M 档的确认文案说明了机制", /\[1m\]|ANTHROPIC_BETAS/.test(String(r1.message || "")), r1.message);
+
+  // 切回 200K：必须摘掉后缀与 beta —— 留着会让真实的 200K 模型在 200K 之后直接 400
+  const r2 = direct.apply({ appType: "claude", apiKey: KEY, model: "glm-5.3", tiers, port: 9527, confirmAck: true, contextWindow: 200000 });
+  const j2 = JSON.parse(fs.readFileSync(f, "utf8"));
+  ok("降回 200K 时摘掉 [1m] 后缀", j2.env.ANTHROPIC_MODEL === "glm-5.3" && !/\[1m\]/i.test(JSON.stringify(j2.env)), j2.env.ANTHROPIC_MODEL);
+  ok("降回 200K 时摘掉 context-1m beta", r2.ok === true && !String(j2.env.ANTHROPIC_BETAS || "").includes(direct.CLAUDE_1M_BETA), j2.env.ANTHROPIC_BETAS);
+
+  // 用户自己的 beta 不能被我们覆盖掉（整串覆盖会静默关掉他已有的能力）
+  fs.writeFileSync(f, JSON.stringify({ env: { ANTHROPIC_BETAS: "interleaved-thinking" } }, null, 2));
+  direct.apply({ appType: "claude", apiKey: KEY, model: "glm-5.3", tiers, port: 9527, confirmAck: true, contextWindow: 1000000 });
+  const j3 = JSON.parse(fs.readFileSync(f, "utf8"));
+  ok("保留用户已有的其它 beta", String(j3.env.ANTHROPIC_BETAS).includes("interleaved-thinking"), j3.env.ANTHROPIC_BETAS);
+  ok("同时带上 context-1m", String(j3.env.ANTHROPIC_BETAS).includes(direct.CLAUDE_1M_BETA));
+  ok("betas 不重复（幂等）", String(j3.env.ANTHROPIC_BETAS).split(",").filter((x) => x.trim() === direct.CLAUDE_1M_BETA).length === 1, j3.env.ANTHROPIC_BETAS);
+
+  // [1m] 的网关别名：客户端万一本版本不剥后缀，网关也不能 400
+  const al = direct.buildClaude1mAliases({}, { model: "glm-5.3", tiers, contextWindow: 1000000 });
+  ok("1M 档登记 <model>[1m] → <model> 别名", al["glm-5.3[1m]"] === "glm-5.3", al);
+  ok("四档模型同样登记", al["kimi-k3[1m]"] === "kimi-k3", al);
+  const alOff = direct.buildClaude1mAliases({ ...al, "my-own": "x" }, { model: "glm-5.3", tiers, contextWindow: 200000 });
+  ok("降档时摘掉 [1m] 别名", !Object.keys(alOff).some((k) => /\[1m\]$/i.test(k)), alOff);
+  ok("降档不碰用户自己的别名", alOff["my-own"] === "x", alOff);
+
+  // 校验闸：写漏任一条都必须报出来，而不是"设了 1M 但仍在 200K 断开"
+  const bad = { env: { ANTHROPIC_BASE_URL: GATEWAY, ANTHROPIC_AUTH_TOKEN: KEY, ANTHROPIC_MODEL: "glm-5.3",
+    ANTHROPIC_DEFAULT_SONNET_MODEL: "a", ANTHROPIC_DEFAULT_OPUS_MODEL: "b", ANTHROPIC_DEFAULT_HAIKU_MODEL: "c", CLAUDE_CODE_SUBAGENT_MODEL: "d" } };
+  const probs = direct.verifyClaude({}, bad, { contextWindow: 1000000 });
+  ok("校验能抓出缺 [1m] 后缀", probs.some((p) => /\[1m\]/.test(p)), probs);
+  ok("校验能抓出缺 ANTHROPIC_BETAS", probs.some((p) => /ANTHROPIC_BETAS/.test(p)), probs);
+  ok("200K 档不要求这两个（不能误报）", direct.verifyClaude({}, bad, { contextWindow: 200000 }).length === 0);
+
+  fs.writeFileSync(f, snapshot);
 }
 
 // ===== 3. Codex：TOML 段替换不影响其它段 =====
@@ -173,6 +228,23 @@ console.log("3b. Codex 模型目录");
   ok("克隆后模型在列表可见", catalog.models[0].visibility === "list");
   ok("丢弃模板的内容哈希", !("comp_hash" in catalog.models[0]));
   ok("取不到模板时不出目录（调用方据此不写该键）", direct.buildCodexCatalog("glm-5.3", null) === null);
+  const wide = direct.buildCodexCatalog("deepseek-v4.1-flash", { slug: "gpt-5.5", context_window: 272000, max_context_window: 272000 }, 1000000);
+  ok("1M 模型不继承模板的 272K 窗口", wide.models[0].context_window === 1000000 && wide.models[0].max_context_window === 1000000);
+  const narrow = direct.buildCodexCatalog("small", { slug: "gpt-5.5", context_window: 272000, max_context_window: 272000 }, 128000);
+  ok("小窗口模型也不被模板抬高", narrow.models[0].context_window === 128000 && narrow.models[0].max_context_window === 128000);
+  const unknown = direct.buildCodexCatalog("unknown", { slug: "gpt-5.5", context_window: 272000, max_context_window: 272000 }, 0);
+  ok("未知窗口保留客户端模板值", unknown.models[0].context_window === 272000 && unknown.models[0].max_context_window === 272000);
+  // 来源标记：面板据此把"沿用模板 272K"这件事说清楚。少了它，症状（长会话被提前截断）
+  // 发生在写盘之后，用户没有任何线索指向这个字段。
+  ok("沿用模板时标记 source=template 并带出模板模型名",
+    unknown._ctx && unknown._ctx.source === "template" && unknown._ctx.value === 272000 && unknown._ctx.templateModel === "gpt-5.5",
+    unknown._ctx);
+  ok("声明窗口时标记 source=declared", wide._ctx && wide._ctx.source === "declared" && wide._ctx.value === 1000000, wide._ctx);
+  // 写盘前必须剥掉 _ctx：Codex 只认 models，顶层多一个键没意义且会被版本升级抱怨
+  const stripped = direct.stripCatalogMeta(wide);
+  ok("写盘前剥掉 _ctx，只留 models", !("_ctx" in stripped) && Array.isArray(stripped.models) && stripped.models.length === 1,
+    Object.keys(stripped));
+  ok("剥掉 _ctx 不影响 models 条目本身", stripped.models[0].context_window === 1000000);
 
   // 偏好列表优先，其次取指令最长的（信息最全）
   const picked = direct.pickCodexTemplate([
@@ -202,6 +274,54 @@ console.log("3b. Codex 模型目录");
   }
 }
 
+// ===== 3c. 默认思考强度：三端各自的落点 =====
+console.log("3c. 默认思考强度");
+{
+  const tpl = {
+    slug: "gpt-5.5", context_window: 272000, max_context_window: 272000,
+    default_reasoning_level: "medium",
+    supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }, { effort: "xhigh" }],
+    base_instructions: "x", model_messages: { instructions_template: "You are Codex." },
+  };
+  // 未指定：保留模板推荐档。这里必须"不写"，不能兜一个 high —— 那样等于静默改了所有用户的默认。
+  const dflt = direct.buildCodexCatalog("m", tpl, 0, "");
+  ok("未指定档位时保留模板推荐档（不覆盖成 high）", dflt.models[0].default_reasoning_level === "medium", dflt.models[0].default_reasoning_level);
+
+  const xh = direct.buildCodexCatalog("m", tpl, 0, "xhigh");
+  ok("指定 xhigh 时写入 default_reasoning_level", xh.models[0].default_reasoning_level === "xhigh");
+  ok("指定档位不改动 supported_reasoning_levels 的既有条目（那是客户端下发的权威能力表）",
+    xh.models[0].supported_reasoning_levels.map((x) => x.effort).join(",") === "low,medium,high,xhigh",
+    xh.models[0].supported_reasoning_levels);
+
+  const thin = direct.buildCodexCatalog("m", { ...tpl, supported_reasoning_levels: [{ effort: "low" }] }, 0, "xhigh");
+  ok("模板缺该档时补一条（不补会被客户端静默降到最近的更低档）",
+    thin.models[0].supported_reasoning_levels.some((x) => x.effort === "xhigh"), thin.models[0].supported_reasoning_levels);
+
+  const base = { base: "http://127.0.0.1:9527", apiKey: KEY, model: "glm-5.3", tiers: {} };
+  const cOn = direct.buildClaudeSettings({}, { ...base, contextWindow: 0, reasoningEffort: "high" });
+  ok("Claude Code 写 CLAUDE_CODE_EFFORT_LEVEL", cOn.env.CLAUDE_CODE_EFFORT_LEVEL === "high", cOn.env.CLAUDE_CODE_EFFORT_LEVEL);
+  const cOff = direct.buildClaudeSettings(cOn.data, { ...base, contextWindow: 0, reasoningEffort: "" });
+  ok("留空时删掉该键（空串是「已设置但无值」的档位，客户端按未知值处理）",
+    !("CLAUDE_CODE_EFFORT_LEVEL" in cOff.env), Object.keys(cOff.env));
+
+  // 词表：客户端默认档只认两边的交集，off/minimal/max 不在其中
+  ok("off 被拒绝（它是「关思考」的语义开关，不是档位）", util.normalizeClientEffort("off") === "");
+  ok("minimal 被拒绝（Codex 的档位表里没有它）", util.normalizeClientEffort("minimal") === "");
+  ok("max 被拒绝（只有 Claude 有，Codex 侧会被当非法档）", util.normalizeClientEffort("max") === "");
+  ok("合法档原样透传", util.normalizeClientEffort("xhigh") === "xhigh" && util.normalizeClientEffort("HIGH") === "high");
+
+  // 校验闸
+  const badEff = { env: { ANTHROPIC_BASE_URL: GATEWAY, ANTHROPIC_AUTH_TOKEN: KEY, ANTHROPIC_MODEL: "m",
+    ANTHROPIC_DEFAULT_SONNET_MODEL: "a", ANTHROPIC_DEFAULT_OPUS_MODEL: "b", ANTHROPIC_DEFAULT_HAIKU_MODEL: "c",
+    CLAUDE_CODE_SUBAGENT_MODEL: "d", CLAUDE_CODE_EFFORT_LEVEL: "low" } };
+  ok("校验能抓出档位没落位", direct.verifyClaude({}, badEff, { reasoningEffort: "high" }).some((x) => /EFFORT_LEVEL/.test(x)));
+  ok("未指定档位时不校验它（不能误报）", direct.verifyClaude({}, badEff, {}).length === 0);
+
+  const noEff = direct.stripCatalogMeta(direct.buildCodexCatalog("m", tpl, 0, ""));
+  const ck = direct.verifyCodex('model_provider = "agenthub"\nmodel_catalog_json = "x"\n[model_providers.agenthub]\nbase_url = "http://h/v1"\nwire_api = "responses"\n', { withCatalog: true, catalog: noEff, reasoningEffort: "high" });
+  ok("Codex 校验能抓出 default_reasoning_level 没写成指定档", ck.some((x) => /default_reasoning_level/.test(x)), ck);
+}
+
 // ===== 4. Claude Desktop：模型名必须符合客户端校验 =====
 console.log("4. Claude Desktop profile");
 {
@@ -227,6 +347,37 @@ console.log("4. Claude Desktop profile");
   const opus = prof.inferenceModels.find((m) => m.name.startsWith("opus"));
   ok("opus 档留空回落默认模型", opus.labelOverride === "glm-5.3");
   ok("fable 档存在（第四档）", prof.inferenceModels.some((m) => m.name.startsWith("fable")));
+  // supports1m 原先是无条件 false：所有 1M 上游都被压成 200K，与 Codex 的"模板 272K"同类。
+  // 现在跟随声明的窗口，且客户端只有两档 —— 低于 1M 一律 false（不能谎报）。
+  ok("未声明窗口时 supports1m=false（客户端按 200K）", prof.inferenceModels.every((m) => m.supports1m === false));
+  ok("未声明窗口时不写 prefer1m", prof.inferenceModels.every((m) => m.prefer1m === undefined));
+  {
+    const r1 = direct.apply({ appType: "claude-desktop", apiKey: KEY, model: "glm-5.3", tiers: { sonnet: "kimi-k3", opus: "", haiku: "", subagent: "" }, port: 9527, confirmAck: true, contextWindow: 1000000 });
+    ok("声明 1M 时写入成功", r1.ok === true, r1.message);
+    const p1 = JSON.parse(fs.readFileSync(profPath, "utf8"));
+    ok("声明 1M → 四档 supports1m 全为 true（漏一档就等于该档仍 200K）",
+      p1.inferenceModels.every((m) => m.supports1m === true));
+    // ★ 实测踩到的坑：只写 supports1m 时客户端只是"菜单里多一个 <id>[1m] 选项"，
+    //   不去手动选它跑的仍是 200K。prefer1m 才让该条目本身即以 1M 形态存在。
+    ok("声明 1M → 四档同时带 prefer1m（否则用户不选 [1m] 变体就仍是 200K）",
+      p1.inferenceModels.every((m) => m.prefer1m === true), p1.inferenceModels.map((m) => [m.name, m.supports1m, m.prefer1m]));
+    // prefer1m 之后客户端发的是 `<角色名>[1m]`，别名必须跟着登记，否则 400
+    const cfgA = direct.status({ port: 9527 });
+    ok("1M 档登记了 <角色名>[1m] 的网关别名", (() => {
+      const a = direct.buildDesktopAliases({}, { model: "glm-5.3", tiers: { sonnet: "kimi-k3", opus: "", haiku: "", subagent: "" }, contextWindow: 1000000 });
+      return a["sonnet-4-5[1m]"] === "kimi-k3" && a["sonnet-4-5"] === "kimi-k3";
+    })(), cfgA.apps["claude-desktop"].profileName);
+    const r2 = direct.apply({ appType: "claude-desktop", apiKey: KEY, model: "glm-5.3", tiers: { sonnet: "", opus: "", haiku: "", subagent: "" }, port: 9527, confirmAck: true, contextWindow: 400000 });
+    const p2 = JSON.parse(fs.readFileSync(profPath, "utf8"));
+    ok("声明 400K（中间档）→ 仍 false：客户端表达不了 400K，谎报会让它跳过压缩直接超限",
+      r2.ok === true && p2.inferenceModels.every((m) => m.supports1m === false), p2.inferenceModels.map((m) => m.supports1m));
+    // 校验闸：只写 supports1m 漏掉 prefer1m 必须被拦
+    const half = { inferenceProvider: "gateway", inferenceModels: p1.inferenceModels.map(({ prefer1m, ...m }) => m) };
+    ok("校验能抓出「有 supports1m 但缺 prefer1m」", direct.verifyDesktop(half, { contextWindow: 1000000 }).some((x) => /prefer1m/.test(x)));
+    ok("200K 档不要求 prefer1m（不能误报）", direct.verifyDesktop({ inferenceProvider: "gateway", inferenceModels: p2.inferenceModels }, { contextWindow: 200000 }).length === 0);
+    // 恢复成基准态，后面的回滚/校验断言按它比对
+    direct.apply({ appType: "claude-desktop", apiKey: KEY, model: "glm-5.3", tiers: { sonnet: "kimi-k3", opus: "", haiku: "", subagent: "" }, port: 9527, confirmAck: true });
+  }
 
   const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
   ok("_meta appliedId 指向 AgentHub profile", meta.appliedId !== "ccs-profile");

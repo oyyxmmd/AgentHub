@@ -563,6 +563,13 @@ onMounted(() => {
       app.refreshConfig();
       return;
     }
+    // 反代网关侧的配置直写（proxy_prefer_builtin_set 等独立 IPC 落盘后广播）：
+    // 同样要重拉快照——托盘改了模型路由优先级，主窗口的开关得跟着翻。
+    // 载荷形状：{ event: "proxy", type: "config-changed" }（platform 层的 proxy 事件信封）
+    if ((ev as { event?: string; type?: string }).event === "proxy" && (ev as { type?: string }).type === "config-changed") {
+      app.refreshConfig();
+      return;
+    }
     app.updateAvailable = ev.status === "available" || ev.status === "downloaded";
   });
   // 动效装配：此刻 config 仍是初始默认值（load 异步未回），先按 localStorage 镜像判定

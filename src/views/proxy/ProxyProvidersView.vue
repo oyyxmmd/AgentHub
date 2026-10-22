@@ -12,6 +12,34 @@ const app = useAppStore();
 const rows = ref<ProxyProvider[]>([]);
 const err = ref("");
 const busy = ref(false);
+const routing = ref({ saving: false, message: "" });
+
+/** 开关的无障碍标签放脚本里算。模板属性里写 `cond ? 'A' : 'B'` 的三元，
+ *  后面的 `:disabled="…"` 会被属性解析器吞进同一个表达式，报出的列号完全对不上原文。 */
+function preferBuiltinLabel(): string {
+  return app.config.proxy.preferBuiltin ? "关闭内置优先" : "开启内置优先";
+}
+
+/** 内置优先总闸：只有显式开启时才允许内置渠道参与自动路由；关闭时只走自定义提供商。
+ *  显式 slug/model 始终直达自定义，不受此开关影响。
+ *
+ *  走独立 IPC（proxy_prefer_builtin_set）而不是整份配置保存：这个字段的写入口有两处
+ *  （本页面与托盘面板），两边各持自己的配置快照。走整份提交时后保存的一方会用旧快照
+ *  把先保存的一方冲掉——开关「自己弹回来」。收口到后端读改写后，两边改的都是同一份磁盘值。 */
+async function setPreferBuiltin(on: boolean) {
+  if (routing.value.saving) return;
+  const old = app.config.proxy.preferBuiltin;
+  app.config.proxy.preferBuiltin = on;
+  routing.value = { saving: true, message: "" };
+  try {
+    const r = await api.proxyPreferBuiltinSet(on);
+    routing.value = { saving: false, message: r && r.ok === false ? r.message || "保存失败" : "已保存，立即生效" };
+    if (r && r.ok === false) app.config.proxy.preferBuiltin = old;
+  } catch (e) {
+    app.config.proxy.preferBuiltin = old;
+    routing.value = { saving: false, message: String((e as Error).message || e) };
+  }
+}
 
 // 系统级加密不可用时不阻断（与内置渠道凭据同一降级策略），但必须把「明文落盘」说清楚
 const vault = ref<{ encrypted: boolean; driver: string; dataDir: string } | null>(null);
@@ -44,6 +72,8 @@ const form = ref({
   extraHeadersText: "",
   extraBodyText: "",
   enabled: true,
+  /** 路由优先级：0 = 普通，越大越优先（同名裸模型多家命中时唯一最高者胜出） */
+  priority: 0,
 });
 const formErr = ref("");
 const testResult = ref<ProxyProviderTestResult | null>(null);
@@ -65,6 +95,7 @@ type ModelRow = {
   model: string;
   upstream: string;
   aliases: string[];
+  proxyModel: string;
   contextLength: string;
   maxOutputTokens: string;
   rate: string;
@@ -76,7 +107,7 @@ let rowSeq = 0;
 
 /** 空行：给"添加模型"用 */
 function blankRow(): ModelRow {
-  return { _rid: ++rowSeq, model: "", upstream: "", aliases: [], contextLength: "", maxOutputTokens: "", rate: "", caps: {}, efforts: [] };
+  return { _rid: ++rowSeq, model: "", upstream: "", aliases: [], proxyModel: "", contextLength: "", maxOutputTokens: "", rate: "", caps: {}, efforts: [] };
 }
 
 /** 存库形状 → 表格行（字符串简写与历史缺字段都在这一步补齐，写回时再统一收敛） */
@@ -87,6 +118,7 @@ function toRow(m: ProxyProviderModel): ModelRow {
     model: String(o.model || ""),
     upstream: String(o.upstream || ""),
     aliases: Array.isArray(o.aliases) ? o.aliases.map(String) : [],
+    proxyModel: String(o.proxyModel || ""),
     contextLength: o.contextLength ? String(o.contextLength) : "",
     maxOutputTokens: o.maxOutputTokens ? String(o.maxOutputTokens) : "",
     rate: o.rate != null ? String(o.rate) : "",
@@ -104,6 +136,7 @@ function rowToModel(r: ModelRow): ProxyProviderModel {
   if (upstream && upstream !== out.model) out.upstream = upstream;
   const aliases = (r.aliases || []).map((a) => String(a).trim()).filter((a) => a && a.toLowerCase() !== String(out.model).toLowerCase());
   if (aliases.length) out.aliases = [...new Set(aliases)];
+  if ((r.proxyModel || "").trim()) out.proxyModel = r.proxyModel.trim();
   if (Number(r.contextLength) > 0) out.contextLength = Number(r.contextLength);
   if (Number(r.maxOutputTokens) > 0) out.maxOutputTokens = Number(r.maxOutputTokens);
   if (r.rate !== "" && !Number.isNaN(Number(r.rate))) out.rate = Number(r.rate);
@@ -151,7 +184,7 @@ function keysFromText(): { key: string }[] {
 
 function openCreate() {
   editingId.value = "";
-  form.value = { id: "", display: "", baseUrl: "", keysText: "", extraHeadersText: "", extraBodyText: "", enabled: true };
+  form.value = { id: "", display: "", baseUrl: "", keysText: "", extraHeadersText: "", extraBodyText: "", enabled: true, priority: 0 };
   modelRows.value = [];
   rowTest.value = {};
   formErr.value = "";
@@ -169,6 +202,7 @@ function openEdit(row: ProxyProvider) {
     extraHeadersText: row.extraHeaders && Object.keys(row.extraHeaders).length ? JSON.stringify(row.extraHeaders, null, 2) : "",
     extraBodyText: row.extraBody && Object.keys(row.extraBody).length ? JSON.stringify(row.extraBody, null, 2) : "",
     enabled: row.enabled,
+    priority: Number(row.priority) || 0,
   };
   modelRows.value = (row.models || []).map(toRow);
   rowTest.value = {};
@@ -204,6 +238,7 @@ async function doSave() {
       extraHeaders: headers as Record<string, string>,
       extraBody: body,
       enabled: form.value.enabled,
+      priority: form.value.priority,
     };
     const keys = keysFromText();
     // 更新路径不回 keyIds（不做 Key 增删），标注成并集形状让下面那条去重提示对两条路径都成立
@@ -444,6 +479,10 @@ const importOpen = ref(false);
 const importState = ref<"loading" | "ready" | "error">("loading");
 const importErr = ref("");
 const upstreamIds = ref<string[]>([]);
+/** 拉取时从公开元数据目录（models.dev）补齐的模型元数据：模型 id → { contextLength, maxOutputTokens, ... } */
+const upstreamMeta = ref<Record<string, { contextLength?: number; maxOutputTokens?: number; name?: string; capabilities?: Record<string, boolean> }>>({});
+/** 厂商目录自带的映射（官方名 + 历史别名）：拉取时把 upstream/aliases 一并带进新行 */
+const upstreamEntries = ref<Record<string, { model: string; upstream?: string; aliases?: string[]; name?: string; proxyModel?: string }>>({});
 // 拉取时的地址签名：改过之后再结果就"过期"了，直接应用会拿旧清单配新地址
 const importSig = ref("");
 const selAdd = ref<Set<string>>(new Set());
@@ -485,6 +524,8 @@ async function doImport() {
       return;
     }
     upstreamIds.value = (r.models || []).map(String);
+    upstreamMeta.value = r.metadata || {};
+    upstreamEntries.value = r.modelEntries || {};
     const g = importGroups.value;
     // 新增默认不勾（用户可能只想看），已存在默认保持，下架默认保留——删除必须是显式动作
     selAdd.value = new Set();
@@ -516,12 +557,34 @@ function applyImport() {
     if (!selDrop.value.has(id)) keep.delete(id.toLowerCase());
   }
   const rows2 = modelRows.value.filter((r) => keep.has((r.model || "").trim().toLowerCase()));
+  // 已存在的行：只把「空缺」的上下文/输出上限补上，绝不覆盖用户手填过的值——
+  // 公开目录（models.dev）与上游真实能力可能有偏差，用户手填值优先。
+  for (const r of rows2) {
+    const key = (r.upstream || r.model || "").trim();
+    const meta = upstreamMeta.value[key] || upstreamMeta.value[(r.model || "").trim()] || {};
+    if (!Number(r.contextLength) && meta.contextLength) r.contextLength = String(meta.contextLength);
+    if (!Number(r.maxOutputTokens) && meta.maxOutputTokens) r.maxOutputTokens = String(meta.maxOutputTokens);
+  }
   for (const id of selAdd.value) {
     if (keep.has(id.toLowerCase())) continue;
     // 上游真名常带命名空间（Qwen/Qwen2.5-72B 这类），而客户端名不能含 /（那是 slug 分隔符）：
     // 拆成「末段当客户端名、完整 id 当上游真名」，拉下来即可保存；末段撞名交给上面的重复提示
     const slash = id.lastIndexOf("/");
-    rows2.push(slash > 0 ? { ...blankRow(), model: id.slice(slash + 1), upstream: id } : { ...blankRow(), model: id });
+    const meta = upstreamMeta.value[id] || {};
+    const vendorEntry = upstreamEntries.value[id] || {};
+    // 拉取时自动带上上下文/输出上限：上游 /v1/models 不给窗口，公开目录能补就补，补不到留空由用户手填
+    const row: ModelRow = {
+      ...blankRow(),
+      model: slash > 0 ? id.slice(slash + 1) : id,
+      ...(slash > 0 ? { upstream: id } : {}),
+      ...(vendorEntry.upstream ? { upstream: vendorEntry.upstream } : {}),
+      ...(Array.isArray(vendorEntry.aliases) && vendorEntry.aliases.length ? { aliases: [...vendorEntry.aliases] } : {}),
+      ...(vendorEntry.proxyModel ? { proxyModel: vendorEntry.proxyModel } : {}),
+      ...(meta.contextLength ? { contextLength: String(meta.contextLength) } : {}),
+      ...(meta.maxOutputTokens ? { maxOutputTokens: String(meta.maxOutputTokens) } : {}),
+      ...(meta.capabilities ? { caps: { ...meta.capabilities } } : {}),
+    };
+    rows2.push(row);
   }
   modelRows.value = rows2;
   rowSel.value = new Set();
@@ -534,16 +597,37 @@ const importStale = computed(() => importState.value === "ready" && importSig.va
 const keysOpen = ref(false);
 const keysRow = ref<ProxyProvider | null>(null);
 const keysList = ref<ProxyProviderKey[]>([]);
+/** 每把 Key 的余额查询结果：按账号 id 存，避免一个 Key 的查询结果串到另一把 */
+const keyBalances = ref<Record<string, { state: "loading" | "ok" | "fail"; text: string }>>({});
 const newKey = ref({ name: "", key: "" });
 const keyErr = ref("");
 const keyBusy = ref(false);
 async function openKeys(row: ProxyProvider) {
   keysRow.value = row;
+  keyBalances.value = {};
   newKey.value = { name: "", key: "" };
   keyErr.value = "";
   await refresh();
   keysList.value = rows.value.find((p) => p.id === row.id)?.keys || [];
   keysOpen.value = true;
+}
+/** 查一把 Key 的官方余额：只读取，不改冷却、不写流水。
+ *  DeepSeek / Kimi 有公开余额接口；其它端点会明确回 unsupported，界面如实显示。 */
+async function queryKeyBalance(acc: ProxyProviderKey) {
+  const row = keysRow.value;
+  if (!row || keyBalances.value[acc.id]?.state === "loading") return;
+  keyBalances.value = { ...keyBalances.value, [acc.id]: { state: "loading", text: "查询中…" } };
+  try {
+    const r = await api.proxyProviderBalance({ id: row.id, accountId: acc.id, baseUrl: row.baseUrl });
+    keyBalances.value = {
+      ...keyBalances.value,
+      [acc.id]: r.ok
+        ? { state: "ok", text: `${r.credits ?? 0} ${r.unit || ""}`.trim() }
+        : { state: "fail", text: r.unsupported ? "该端点不支持余额查询" : (r.message || "查询失败") },
+    };
+  } catch (e) {
+    keyBalances.value = { ...keyBalances.value, [acc.id]: { state: "fail", text: String((e as Error).message || e) } };
+  }
 }
 async function reloadKeys(id: string) {
   await refresh();
@@ -596,6 +680,26 @@ async function toggleEnabled(row: ProxyProvider) {
   }
 }
 
+/** 一键切换「优先」：0 ↔ 9。用固定档 9 而不是 1，是为了让"多台都被手滑点过优先"
+ *  时彼此同级 → 落回「歧义不猜」，而不是靠 1/2/3 的先后顺序静默选出一家。
+ * 需要更细的档位时去编辑弹窗手填数字。 */
+const PRIORITY_TOGGLE = 9;
+/** 「优先」按钮的提示文案放脚本里算：写在模板属性里要跨行拼三元，Vue 的模板→TS 变换
+ *  会在换行处把表达式截断，报一个指向别处的语法错（列号完全对不上原文）。 */
+function priorityTip(p: ProxyProvider): string {
+  return Number(p.priority) > 0
+    ? "取消优先：同名裸模型命中多家时将不再由此家胜出"
+    : "设为优先：与别家声明同一个裸模型名时优先走这家（多台同为最高优先仍不猜）";
+}
+async function togglePriority(row: ProxyProvider) {
+  try {
+    await api.proxyProviderUpdate({ id: row.id, priority: Number(row.priority) > 0 ? 0 : PRIORITY_TOGGLE });
+    await refresh();
+  } catch (e) {
+    err.value = String((e as Error).message || e);
+  }
+}
+
 // ===== 删除确认 =====
 const delOpen = ref(false);
 const delRow = ref<ProxyProvider | null>(null);
@@ -625,6 +729,20 @@ watch(
   <section class="page">
     <div class="page-body">
       <div v-if="err" class="card err-card"><div class="set-desc err-text">{{ err }}</div></div>
+      <div class="routing-card card">
+        <div class="routing-info">
+          <div class="card-title">内置渠道启用</div>
+          <div class="set-desc">只有开启「内置优先」时才允许内置渠道参与自动路由；关闭时只走自定义提供商。显式 <span class="mono">标识/模型名</span> 始终直达自定义。</div>
+          <div class="set-desc">
+            自定义提供商声明同一个裸模型名时，由各家的<b>优先</b>标记消歧——只有<b>唯一最高</b>的那家胜出；同级不猜。
+          </div>
+          <div v-if="routing.message" class="set-desc routing-msg" :class="{ 'err-text': /失败|错误|超时/.test(routing.message) }" role="status">{{ routing.message }}</div>
+        </div>
+        <div class="routing-control">
+          <span class="routing-state">{{ app.config.proxy.preferBuiltin ? "内置优先" : "仅自定义" }}</span>
+          <button class="switch" :class="{ on: app.config.proxy.preferBuiltin }" role="switch" :aria-checked="app.config.proxy.preferBuiltin" :aria-label="preferBuiltinLabel()" :disabled="routing.saving" @click="setPreferBuiltin(!app.config.proxy.preferBuiltin)"></button>
+        </div>
+      </div>
       <div class="toolbar">
         <button class="btn btn-primary" @click="openCreate()">添加自定义提供商</button>
       </div>
@@ -643,11 +761,15 @@ watch(
               <td>
                 <span class="tag" :class="p.enabled ? 'tag-ok' : 'tag-dim'">{{ p.enabled ? "启用" : "已停用" }}</span>
                 <span v-if="p.enabled && !(p.keyCount ?? 0)" class="tag tag-warn">无 Key</span>
+                <span v-if="p.priority > 0" class="tag tag-info">优先 {{ p.priority }}</span>
               </td>
               <td class="mono">{{ fmtAgo(p.updatedAt) }}</td>
               <td>
                 <button class="btn-link btn-sm" @click="openKeys(p)">Key 管理</button>
                 <button class="btn-link btn-sm" @click="openEdit(p)">编辑</button>
+                <el-tooltip :content="priorityTip(p)" placement="top">
+                  <button class="btn-link btn-sm" @click="togglePriority(p)">{{ p.priority > 0 ? "取消优先" : "优先" }}</button>
+                </el-tooltip>
                 <button class="btn-link btn-sm" @click="toggleEnabled(p)">{{ p.enabled ? "停用" : "启用" }}</button>
                 <button class="btn-link btn-sm danger" @click="delRow = p; delOpen = true">删除</button>
               </td>
@@ -665,7 +787,8 @@ watch(
         <div class="card-title">接入约定</div>
         <div class="code">
           客户端把 base_url 指向本网关、填一把网关 Key，模型名写 <b>标识/模型名</b>（如 myrelay/gpt-4o）即可直达该提供商。<br />
-          不带前缀的裸模型名一律先归内置渠道，只有内置目录里没有、且只有一家提供商拥有时才会落到提供商——自建条目不会悄悄顶掉生态渠道。<br />
+          默认只走自定义提供商；只有显式开启「内置优先」后才允许内置渠道参与自动路由。
+          多家自定义声明同名时看优先数字：唯一最高者胜出，同级不猜。<br />
           模型清单里的别名同样能请求（<span class="mono">标识/别名</span>），但不出现在 /v1/models。
         </div>
       </div>
@@ -676,36 +799,95 @@ watch(
       <div v-if="formOpen" class="p-mask" @click.self="formOpen = false">
         <div class="p-dlg glass form-dlg">
           <div class="form-head">
-            <div class="p-title">{{ isEdit ? "编辑自定义提供商" : "添加自定义提供商" }}</div>
-            <div v-if="formErr" class="set-desc err-text">{{ formErr }}</div>
+            <div class="form-head-main">
+              <div class="form-head-icon"><i class="ph ph-plugs-connected"></i></div>
+              <div class="form-head-copy">
+                <div class="form-kicker">CUSTOM PROVIDER</div>
+                <div class="p-title">{{ isEdit ? "编辑自定义提供商" : "添加自定义提供商" }}</div>
+                <div class="form-subtitle">连接兼容 OpenAI Chat Completions 的第三方端点或自建网关</div>
+              </div>
+            </div>
+            <div class="form-head-actions">
+              <span class="form-state" :class="{ muted: !form.enabled }">
+                <i class="ph" :class="form.enabled ? 'ph-check-circle' : 'ph-x-circle'"></i>
+                {{ form.enabled ? "启用中" : "已停用" }}
+              </span>
+              <button class="icon-btn form-close" aria-label="关闭" @click="formOpen = false">
+                <i class="ph ph-x"></i>
+              </button>
+            </div>
           </div>
           <div class="form-body">
-            <div class="f-grid">
-              <div class="f-row">
-                <div class="set-name">标识</div>
-                <input v-model="form.id" class="input mono f-input" :disabled="isEdit" placeholder="myslug" />
-                <div class="set-desc">模型名前缀（{{ form.id || "myslug" }}/gpt-4o），创建后不可改</div>
-              </div>
-              <div class="f-row">
-                <div class="set-name">显示名</div>
-                <input v-model="form.display" class="input f-input" placeholder="我的中转站" />
-                <div class="set-desc">只影响界面展示，留空则用标识</div>
-              </div>
+            <div v-if="formErr" class="form-alert" role="alert">
+              <i class="ph ph-warning-circle"></i>
+              <span>{{ formErr }}</span>
             </div>
-            <div class="f-row">
-              <div class="set-name">上游地址</div>
-              <input v-model="form.baseUrl" class="input mono f-input" placeholder="https://relay.example.com/v1" />
-              <div class="set-desc">填到 <span class="mono">/v1</span> 为止，端点由网关按 OpenAI Chat Completions 补</div>
-            </div>
-            <div class="f-row f-models">
-              <div class="set-name">模型清单<span class="f-count">{{ modelRows.filter((r) => r.model).length }} 个</span></div>
-              <div class="models-bar">
-                <button class="btn btn-sm" @click="openImport">从上游拉取</button>
-                <button class="btn btn-sm" @click="addModelRow">添加模型</button>
-                <label v-if="modelRows.length" class="m-selall">
-                  <input type="checkbox" :checked="allSelected" @change="toggleAll" /> 全选
+
+            <section class="form-section">
+              <div class="form-section-head">
+                <div class="form-section-icon"><i class="ph ph-fingerprint"></i></div>
+                <div>
+                  <h3>基础信息</h3>
+                  <p>定义调用前缀与列表中的展示名称</p>
+                </div>
+              </div>
+              <div class="f-grid">
+                <label class="f-row">
+                  <span class="f-label">标识 <span class="f-required">必填</span></span>
+                  <input v-model="form.id" class="input mono f-input" :disabled="isEdit" placeholder="myslug" />
+                  <span class="set-desc">模型名前缀（{{ form.id || "myslug" }}/gpt-4o），创建后不可改</span>
                 </label>
-                <span v-if="dupModels.length" class="set-desc err-text">模型名重复：{{ dupModels.join("、") }}</span>
+                <label class="f-row">
+                  <span class="f-label">显示名</span>
+                  <input v-model="form.display" class="input f-input" placeholder="我的中转站" />
+                  <span class="set-desc">只影响界面展示，留空则使用标识</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="form-section">
+              <div class="form-section-head">
+                <div class="form-section-icon"><i class="ph ph-link"></i></div>
+                <div>
+                  <h3>上游端点</h3>
+                  <p>网关会将请求发送到此地址</p>
+                </div>
+              </div>
+              <label class="f-row endpoint-field">
+                <span class="f-label">Base URL <span class="f-required">必填</span></span>
+                <div class="f-control-icon">
+                  <i class="ph ph-link"></i>
+                  <input v-model="form.baseUrl" class="input mono f-input" placeholder="https://relay.example.com/v1" />
+                </div>
+                <span class="set-desc">填写到 <span class="mono">/v1</span> 为止，网关会自动补全 Chat Completions 路径</span>
+              </label>
+            </section>
+
+            <section class="form-section model-section">
+              <div class="form-section-head model-section-head">
+                <div class="form-section-icon"><i class="ph ph-package"></i></div>
+                <div>
+                  <h3>模型清单 <span class="section-count">{{ modelRows.filter((r) => r.model).length }}</span></h3>
+                  <p>配置可用模型、上游真名和推理能力</p>
+                </div>
+                <div class="models-bar">
+                  <button class="btn btn-sm" @click="openImport">
+                    <i class="ph ph-cloud-arrow-down"></i>
+                    从上游拉取
+                  </button>
+                  <button class="btn btn-sm btn-primary-soft" @click="addModelRow">
+                    <i class="ph ph-plus"></i>
+                    添加模型
+                  </button>
+                  <label v-if="modelRows.length" class="m-selall">
+                    <input type="checkbox" :checked="allSelected" @change="toggleAll" />
+                    全选
+                  </label>
+                </div>
+              </div>
+              <div v-if="dupModels.length" class="inline-warning">
+                <i class="ph ph-warning"></i>
+                模型名重复：{{ dupModels.join("、") }}
               </div>
 
               <!-- 批量条紧贴工具条而不是压在列表末尾：它是「勾选之后的下一步」，
@@ -730,70 +912,133 @@ watch(
               </div>
 
               <div v-if="!modelRows.length" class="models-empty set-desc">
+                <i class="ph ph-cube"></i>
                 还没有模型 —— 点「添加模型」手填，或「从上游拉取」后勾选导入；留空也能用，带前缀的模型名原样透传给上游
               </div>
 
-              <div v-for="m in modelRows" :key="m._rid" class="m-row" :class="{ on: rowSel.has(rowId(m)) }">
+              <div v-for="(m, index) in modelRows" :key="m._rid" class="m-row" :class="{ on: rowSel.has(rowId(m)) }">
+                <div class="m-row-head">
+                  <label class="m-check-wrap">
+                    <input type="checkbox" class="m-check" :checked="rowSel.has(rowId(m))" @change="toggleRow(m)" />
+                    <span>模型 {{ index + 1 }}</span>
+                  </label>
+                  <span class="m-display-name mono">{{ m.model || "未命名模型" }}</span>
+                  <span v-if="m.model" class="m-ready"><i class="ph ph-check"></i> 已配置</span>
+                  <div class="m-row-actions">
+                    <el-tooltip v-if="rowTest[rowId(m)]?.state === 'ok'" :content="rowOkTip(m)" :disabled="!rowOkTip(m)" placement="top">
+                      <span class="tag tag-ok">可用 {{ rowTest[rowId(m)]?.ms }}ms</span>
+                    </el-tooltip>
+                    <el-tooltip v-else-if="rowTest[rowId(m)]?.state === 'fail'" :content="rowFailTip(m)" :disabled="!rowFailTip(m)" placement="top">
+                      <span class="tag tag-warn m-fail">{{ (rowTest[rowId(m)]?.message || "").slice(0, 40) }}</span>
+                    </el-tooltip>
+                    <button class="icon-btn m-test-icon" :disabled="!m.model || rowTest[rowId(m)]?.state === 'testing'" aria-label="测试模型" @click="testOne(m)">
+                      <i class="ph ph-lightning"></i>
+                    </button>
+                    <el-tooltip content="移除模型" placement="top">
+                      <button class="icon-btn m-del" aria-label="移除模型" @click="removeModelRow(m)">
+                        <i class="ph ph-trash"></i>
+                      </button>
+                    </el-tooltip>
+                  </div>
+                </div>
                 <div class="m-line">
-                  <input type="checkbox" class="m-check" :checked="rowSel.has(rowId(m))" @change="toggleRow(m)" />
-                  <input v-model="m.model" class="input mono m-name" placeholder="gpt-4o" />
-                  <input :value="m.aliases.join(', ')" class="input mono m-alias" placeholder="别名，逗号分隔"
-                         @input="setAliases(m, ($event.target as HTMLInputElement).value)" />
-                  <input v-model="m.upstream" class="input mono m-up" placeholder="上游真名（缺省同模型名）" />
+                  <label class="m-field m-name">
+                    <span>模型名</span>
+                    <input v-model="m.model" class="input mono" placeholder="gpt-4o" />
+                  </label>
+                  <label class="m-field m-up">
+                    <span>上游真名</span>
+                    <input v-model="m.upstream" class="input mono" placeholder="缺省同模型名" />
+                  </label>
+                  <label class="m-field m-alias">
+                    <span>别名</span>
+                    <input :value="m.aliases.join(', ')" class="input mono" placeholder="逗号分隔"
+                           @input="setAliases(m, ($event.target as HTMLInputElement).value)" />
+                  </label>
+                  <label class="m-field m-proxy">
+                    <span>代理模型名</span>
+                    <input v-model="m.proxyModel" class="input mono" placeholder="覆盖平台名" />
+                  </label>
                 </div>
                 <div class="m-line m-sub">
                   <label class="m-num">上下文<input v-model="m.contextLength" class="input mono" type="number" placeholder="128000" /></label>
                   <label class="m-num">最大输出<input v-model="m.maxOutputTokens" class="input mono" type="number" placeholder="4096" /></label>
                   <label class="m-num">倍率<input v-model="m.rate" class="input mono" type="number" step="0.1" placeholder="-" /></label>
                   <label v-for="c in CAPS" :key="c.key" class="m-cap">
-                    <input type="checkbox" :checked="!!m.caps[c.key]" @change="setCap(m, c.key, ($event.target as HTMLInputElement).checked)" /> {{ c.label }}
+                    <input type="checkbox" :checked="!!m.caps[c.key]" @change="setCap(m, c.key, ($event.target as HTMLInputElement).checked)" />
+                    <span>{{ c.label }}</span>
                   </label>
-                  <el-select v-model="m.efforts" multiple collapse-tags collapse-tags-tooltip size="small"
-                             popper-class="glass-popper" class="m-efforts" placeholder="思考档位">
-                    <el-option v-for="e in EFFORT_LEVELS" :key="e" :value="e" :label="e" />
-                  </el-select>
-                  <button class="btn btn-sm m-test" :disabled="!m.model || rowTest[rowId(m)]?.state === 'testing'" @click="testOne(m)">
-                    {{ rowTest[rowId(m)]?.state === "testing" ? "测试中…" : "测试" }}
-                  </button>
-                  <el-tooltip v-if="rowTest[rowId(m)]?.state === 'ok'" :content="rowOkTip(m)" :disabled="!rowOkTip(m)" placement="top">
-                    <span class="tag tag-ok">可用 {{ rowTest[rowId(m)]?.ms }}ms</span>
-                  </el-tooltip>
-                  <el-tooltip v-else-if="rowTest[rowId(m)]?.state === 'fail'" :content="rowFailTip(m)" :disabled="!rowFailTip(m)" placement="top">
-                    <span class="tag tag-warn m-fail">{{ (rowTest[rowId(m)]?.message || "").slice(0, 40) }}</span>
-                  </el-tooltip>
-                  <button class="btn-link btn-sm m-del danger" @click="removeModelRow(m)">移除</button>
+                  <label class="m-efforts-wrap">
+                    <span>思考档位</span>
+                    <el-select v-model="m.efforts" multiple collapse-tags collapse-tags-tooltip size="small"
+                               popper-class="glass-popper" class="m-efforts" placeholder="未限制">
+                      <el-option v-for="e in EFFORT_LEVELS" :key="e" :value="e" :label="e" />
+                    </el-select>
+                  </label>
                 </div>
               </div>
-            </div>
+            </section>
+
             <div v-if="!isEdit" class="f-row">
-              <div class="set-name">API Key</div>
+              <div class="set-name"><i class="ph ph-key"></i> API Key</div>
               <textarea v-model="form.keysText" class="input mono f-input" rows="3" placeholder="sk-..."></textarea>
               <div class="set-desc">一行一把；多把自动轮转，被限流的那把单独冷却。可留空，之后在「Key 管理」里加</div>
             </div>
-            <div class="f-grid">
-              <div class="f-row">
-                <div class="set-name">自定义请求头</div>
-                <textarea v-model="form.extraHeadersText" class="input mono f-input" rows="2" placeholder='{ "X-Channel": "agenthub" }'></textarea>
-                <div class="set-desc">JSON 对象，选填；鉴权头由网关按 Key 生成，不能在这里覆盖</div>
+
+            <section class="form-section">
+              <div class="form-section-head">
+                <div class="form-section-icon"><i class="ph ph-sliders-horizontal"></i></div>
+                <div>
+                  <h3>高级请求配置</h3>
+                  <p>按需追加请求头与请求体字段</p>
+                </div>
               </div>
-              <div class="f-row">
-                <div class="set-name">附加请求体字段</div>
-                <textarea v-model="form.extraBodyText" class="input mono f-input" rows="2" placeholder='{ "reasoning": { "effort": "high" } }'></textarea>
-                <div class="set-desc">JSON 对象，选填，深合并进上游请求体；不能覆盖 model / messages / prompt / stream</div>
+              <div class="f-grid advanced-grid">
+                <label class="f-row">
+                  <span class="f-label">自定义请求头</span>
+                  <textarea v-model="form.extraHeadersText" class="input mono f-input" rows="3" placeholder='{ "X-Channel": "agenthub" }'></textarea>
+                  <span class="set-desc">JSON 对象，选填；鉴权头由网关按 Key 生成，不能在这里覆盖</span>
+                </label>
+                <label class="f-row">
+                  <span class="f-label">附加请求体字段</span>
+                  <textarea v-model="form.extraBodyText" class="input mono f-input" rows="3" placeholder='{ "reasoning": { "effort": "high" } }'></textarea>
+                  <span class="set-desc">JSON 对象，选填，深合并进上游请求体；不能覆盖 model / messages / prompt / stream</span>
+                </label>
               </div>
-            </div>
-            <div class="f-inline">
-              <div class="f-inline-info">
-                <div class="set-name">启用</div>
-                <div class="set-desc">停用即从路由视图消失，带该前缀的请求会报「模型不在目录中」</div>
+            </section>
+
+            <div class="routing-grid">
+              <div class="f-inline">
+                <div class="f-inline-info">
+                  <div class="set-name"><i class="ph ph-check-circle"></i> 启用</div>
+                  <div class="set-desc">停用后不再参与路由，带此前缀的请求会报模型不存在</div>
+                </div>
+                <el-switch v-model="form.enabled" />
               </div>
-              <el-switch v-model="form.enabled" />
+              <div class="f-inline priority-control">
+                <div class="f-inline-info">
+                  <div class="set-name"><i class="ph ph-sliders"></i> 路由优先级</div>
+                  <div class="set-desc">
+                    同名裸模型由唯一最高优先者胜出，同级不猜；列表中的「优先」按钮一键设为 {{ PRIORITY_TOGGLE }}。
+                  </div>
+                </div>
+                <input
+                  v-model.number="form.priority"
+                  type="number"
+                  min="0"
+                  max="999"
+                  step="1"
+                  class="input mono priority-input"
+                  placeholder="0"
+                />
+              </div>
             </div>
           </div>
           <!-- 操作条固定在弹窗底部：表单比视口高，按钮跟着滚走的话每次保存都要先滚到底 -->
           <div class="form-foot">
             <el-tooltip content="向上游发一次 max_tokens=16 的真实最小请求：会计费，但不改动号池 Key 的冷却状态" placement="top">
-              <button class="btn" :disabled="testing" @click="doTest">
+              <button class="btn form-test-btn" :disabled="testing" @click="doTest">
+                <i class="ph ph-lightning"></i>
                 {{ testing ? "测试中…" : "测试连接" }}
               </button>
             </el-tooltip>
@@ -805,8 +1050,13 @@ watch(
                 <template v-else>失败：{{ testResult.message }}<template v-if="testResult.status">（HTTP {{ testResult.status }}）</template></template>
               </span>
             </el-tooltip>
-            <button class="btn f-foot-push" @click="formOpen = false">取消</button>
-            <button class="btn btn-primary" :disabled="busy" @click="doSave">{{ busy ? "保存中…" : "保存" }}</button>
+            <div class="form-foot-actions">
+              <button class="btn" @click="formOpen = false">取消</button>
+              <button class="btn btn-primary" :disabled="busy" @click="doSave">
+                <i class="ph ph-check"></i>
+                {{ busy ? "保存中…" : (isEdit ? "保存更改" : "创建提供商") }}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -825,18 +1075,27 @@ watch(
           <div class="tbl-wrap">
             <table class="tbl">
               <tbody>
-                <tr><th>名称</th><th>状态</th><th>今日</th><th>最近使用</th><th>操作</th></tr>
+                <tr><th>名称</th><th>状态</th><th>余额</th><th>今日</th><th>最近使用</th><th>操作</th></tr>
                 <tr v-for="acc in keysList" :key="acc.id">
                   <td>{{ acc.name }}</td>
                   <td>
                     <span class="tag" :class="acc.status === 'online' ? 'tag-ok' : 'tag-dim'">{{ ACCOUNT_STATUS[acc.status]?.text || acc.status }}</span>
                     <span v-if="acc.coolReason" class="set-desc"> · {{ acc.coolReason }}</span>
                   </td>
+                  <td class="mono num">
+                    <span v-if="keyBalances[acc.id]?.state === 'ok'" class="tag tag-ok">{{ keyBalances[acc.id].text }}</span>
+                    <span v-else-if="keyBalances[acc.id]?.state === 'fail'" class="set-desc err-text">{{ keyBalances[acc.id].text }}</span>
+                    <span v-else-if="keyBalances[acc.id]?.state === 'loading'" class="set-desc">查询中…</span>
+                    <span v-else class="set-desc">-</span>
+                  </td>
                   <td class="mono num">{{ acc.todayReq }} 次</td>
                   <td class="mono">{{ fmtAgo(acc.lastUsed) }}</td>
-                  <td><button class="btn-link btn-sm danger" @click="askRemoveKey(acc)">移出</button></td>
+                  <td>
+                    <button class="btn-link btn-sm" :disabled="keyBalances[acc.id]?.state === 'loading'" @click="queryKeyBalance(acc)">查余额</button>
+                    <button class="btn-link btn-sm danger" @click="askRemoveKey(acc)">移出</button>
+                  </td>
                 </tr>
-                <tr v-if="!keysList.length"><td colspan="5" class="empty-row">还没有 Key —— 在下方填一把。没有可用 Key 的提供商不会被调度</td></tr>
+                <tr v-if="!keysList.length"><td colspan="6" class="empty-row">还没有 Key —— 在下方填一把。没有可用 Key 的提供商不会被调度</td></tr>
               </tbody>
             </table>
           </div>
@@ -913,7 +1172,7 @@ watch(
             </div>
 
             <div v-if="importGroups.existing.length" class="imp-group">
-              <div class="imp-head"><b>已存在</b><span class="set-desc">保留现有配置（别名、上下文、档位都不动）</span></div>
+              <div class="imp-head"><b>已存在</b><span class="set-desc">保留现有配置（别名、档位与已填上下文都不动；空缺的上下文/输出上限自动补齐）</span></div>
               <div class="imp-item set-desc">共 {{ importGroups.existing.length }} 个：{{ importGroups.existing.join("、") }}</div>
             </div>
 
@@ -971,6 +1230,32 @@ watch(
 .err-text {
   color: var(--err, #e05555);
 }
+.routing-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+.routing-card .card-title {
+  margin-bottom: 5px;
+}
+.routing-info {
+  min-width: 0;
+}
+.routing-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.routing-state {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+.routing-msg {
+  margin-top: 6px;
+}
 .danger {
   color: var(--err, #e05555);
 }
@@ -984,51 +1269,217 @@ watch(
    整窗一起滚的话「保存」会在填到一半时滚出视口，每次提交都得先滚到底。
    .p-dlg 自带 padding 与 overflow:hidden，这里改成三段式布局，内边距下放到各段。 */
 .form-dlg {
-  width: 780px;
-  max-height: 88vh;
+  width: min(980px, calc(100vw - 32px));
+  max-height: min(92vh, 940px);
   display: flex;
   flex-direction: column;
   padding: 0;
 }
 .form-head {
   flex: none;
-  padding: 16px 18px 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 22px 24px 18px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-2) 58%, transparent);
+}
+.form-head-main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+.form-head-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  flex: none;
+  border: 1px solid var(--accent-line);
+  border-radius: 12px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 20px;
+}
+.form-head-copy {
+  min-width: 0;
+}
+.form-kicker {
+  margin-bottom: 3px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.form-head .p-title {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.25;
+}
+.form-subtitle {
+  margin-top: 5px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.form-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.form-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.form-state.muted {
+  border-color: var(--line);
+  background: var(--bg-soft);
+  color: var(--text-3);
+}
+.form-close {
+  width: 30px;
+  height: 30px;
+  font-size: 16px;
 }
 .form-body {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 2px 18px;
+  padding: 16px 24px 22px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
+  background: color-mix(in srgb, var(--bg) 18%, transparent);
+}
+.form-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--err, #e05555) 34%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--err, #e05555) 8%, transparent);
+  color: var(--err, #e05555);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.form-alert i {
+  margin-top: 1px;
+  font-size: 15px;
+}
+.form-section {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 58%, transparent);
+}
+.form-section-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.form-section-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text-2);
+  font-size: 15px;
+}
+.form-section-head h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.form-section-head p {
+  margin: 3px 0 0;
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.section-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+.model-section-head {
+  align-items: center;
+}
+.model-section-head .models-bar {
+  margin-left: auto;
 }
 .form-foot {
   flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 18px 14px;
+  min-height: 62px;
+  padding: 11px 24px 13px;
   border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-2) 68%, transparent);
+}
+.form-test-btn {
+  flex: none;
+}
+.form-foot-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 /* 测试结果挤在按钮排里：长了就截断，完整内容在 el-tooltip 浮层上 */
 .f-foot-msg {
-  max-width: 330px;
+  max-width: min(390px, 34vw);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.f-foot-push {
-  margin-left: auto;
-}
-/* 字段一律「标签在上、控件吃满宽度」。老的左标签 + 右窄控件写法把 URL 和 JSON 挤断，
-   而省下来的说明只能塞进左列那条缝——说明越长，布局越歪。 */
 .f-row {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
   min-width: 0;
+}
+.f-label {
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.f-required {
+  margin-left: 4px;
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 500;
 }
 .f-models {
   gap: 6px;
@@ -1037,6 +1488,25 @@ watch(
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
+}
+.advanced-grid {
+  align-items: start;
+}
+.f-control-icon {
+  position: relative;
+}
+.f-control-icon > i {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  z-index: 1;
+  color: var(--text-3);
+  font-size: 14px;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+.f-control-icon .f-input {
+  padding-left: 34px;
 }
 .f-warn {
   color: var(--warn, #d9a13b);
@@ -1054,10 +1524,35 @@ watch(
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
+  gap: 18px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 48%, transparent);
 }
 .f-inline-info {
   min-width: 0;
+}
+.f-inline .set-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+}
+.f-inline .set-name i {
+  color: var(--accent);
+  font-size: 14px;
+}
+.routing-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  gap: 12px;
+}
+.priority-input {
+  width: 86px;
+  flex: none;
+  text-align: center;
 }
 /* ===== 模型清单：工具条 + 逐行两行式 ===== */
 .models-bar {
@@ -1070,67 +1565,187 @@ watch(
   display: flex;
   align-items: center;
   gap: 4px;
+  min-height: 30px;
+  padding: 0 6px;
   font-size: 12px;
   color: var(--text-2);
 }
+.btn-primary-soft {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
+.inline-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: var(--warn, #d9a13b);
+  font-size: 11.5px;
+}
 .models-empty {
-  padding: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 78px;
+  padding: 16px;
   border: 1px dashed var(--line);
-  border-radius: 8px;
+  border-radius: 10px;
   text-align: center;
+}
+.models-empty i {
+  color: var(--text-3);
+  font-size: 18px;
 }
 .m-row {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 8px;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--bg-2, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-2) 40%, transparent);
+  transition: border-color 0.18s ease, background 0.18s ease;
 }
 .m-row.on {
-  border-color: var(--accent, #4a9eff);
+  border-color: var(--accent-line);
+  background: color-mix(in srgb, var(--accent-dim) 45%, var(--panel-2));
 }
-.m-line {
+.m-row-head {
   display: flex;
   align-items: center;
+  gap: 9px;
+  min-height: 42px;
+  padding: 8px 10px 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-2) 76%, transparent);
+}
+.m-check-wrap {
+  display: inline-flex;
+  align-items: center;
   gap: 6px;
+  flex: none;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 650;
+}
+.m-display-name {
   min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.m-ready {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  color: var(--accent-strong);
+  font-size: 10px;
+}
+.m-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.m-test-icon,
+.m-del {
+  width: 28px;
+  height: 28px;
+  font-size: 14px;
+}
+.m-del {
+  color: var(--text-3);
+}
+.m-del:hover {
+  color: var(--err, #e05555);
+  border-color: color-mix(in srgb, var(--err, #e05555) 34%, transparent);
+}
+.m-line {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
 }
 .m-check {
   flex: none;
 }
+.m-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.m-field > span,
+.m-efforts-wrap > span {
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+}
 .m-name {
-  flex: 1 1 150px;
   min-width: 0;
 }
 .m-alias {
-  flex: 1 1 130px;
   min-width: 0;
 }
 .m-up {
-  flex: 1 1 150px;
+  min-width: 0;
+}
+.m-proxy {
   min-width: 0;
 }
 .m-sub {
+  display: flex;
+  align-items: flex-end;
   flex-wrap: wrap;
   gap: 8px;
-  padding-left: 22px;
+  padding: 0 12px 12px;
   font-size: 11.5px;
   color: var(--text-2);
 }
 .m-num {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
+  flex-direction: column;
   gap: 4px;
 }
 .m-num .input {
-  width: 84px;
+  width: 104px;
 }
 .m-cap {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg-soft);
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 11px;
+  transition: border-color 0.18s ease, background 0.18s ease, color 0.18s ease;
+}
+.m-cap:has(input:checked) {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
+.m-cap input {
+  width: 13px;
+  height: 13px;
+}
+.m-efforts-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 150px;
 }
 /* 选择控件跟全站同观感：原生 checkbox 补强调色与手型（与 Key 页选择列同款） */
 .m-selall input[type="checkbox"],
@@ -1144,11 +1759,7 @@ watch(
   width: 104px;
 }
 .m-efforts {
-  width: 150px;
-}
-.m-test,
-.m-del {
-  flex: none;
+  width: 100%;
 }
 .m-fail {
   max-width: 190px;
@@ -1161,10 +1772,121 @@ watch(
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 8px;
-  border: 1px solid var(--accent, #4a9eff);
-  border-radius: 8px;
-  background: var(--bg-2, transparent);
+  margin-bottom: 8px;
+  padding: 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent-dim) 48%, var(--panel-2));
+}
+
+@media (max-width: 760px) {
+  .p-mask {
+    padding: 8px;
+  }
+  .form-dlg {
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+  }
+  .form-head {
+    padding: 16px;
+  }
+  .form-head-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    font-size: 18px;
+  }
+  .form-head .p-title {
+    font-size: 16px;
+  }
+  .form-subtitle {
+    display: none;
+  }
+  .form-state {
+    display: none;
+  }
+  .form-body {
+    padding: 12px 16px 18px;
+  }
+  .form-section {
+    padding: 13px;
+  }
+  .model-section-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .model-section-head .models-bar {
+    width: 100%;
+    margin-left: 40px;
+  }
+  .f-grid,
+  .routing-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .m-line {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .form-foot {
+    flex-wrap: wrap;
+    padding: 10px 16px;
+  }
+  .f-foot-msg {
+    order: 3;
+    width: 100%;
+    max-width: none;
+  }
+  .form-foot-actions {
+    margin-left: auto;
+  }
+}
+
+@media (max-width: 520px) {
+  .form-head-main {
+    gap: 9px;
+  }
+  .form-kicker {
+    display: none;
+  }
+  .form-close {
+    width: 28px;
+    height: 28px;
+  }
+  .models-bar {
+    gap: 6px;
+  }
+  .model-section-head .models-bar {
+    margin-left: 0;
+  }
+  .m-row-head {
+    flex-wrap: wrap;
+  }
+  .m-display-name {
+    max-width: calc(100% - 130px);
+  }
+  .m-line {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .m-sub {
+    align-items: flex-start;
+  }
+  .m-num {
+    width: calc(50% - 4px);
+  }
+  .m-num .input {
+    width: 100%;
+  }
+  .f-inline {
+    align-items: flex-start;
+  }
+  .priority-input {
+    width: 74px;
+  }
+  .form-foot-actions {
+    width: 100%;
+  }
+  .form-foot-actions .btn {
+    flex: 1;
+  }
 }
 /* ===== 拉取合并弹窗 ===== */
 .imp-dlg {

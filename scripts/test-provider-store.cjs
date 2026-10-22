@@ -78,6 +78,30 @@ console.log("\n④ updated_at：动态适配器实例缓存的键");
   ok(b.display === "第二版" && b.baseUrl === PROVIDER.baseUrl, "整体覆盖语义：未改的字段照原样留着", b);
 }
 
+console.log("\n④b priority：路由优先级的存取与归一");
+{
+  // 写入侧与读取侧必须同一个口径。分成两处各归一一次的话，面板显示 5 而库里存 0，
+  // 症状是「我标了优先但没生效」——用户没有任何线索指向归一函数。
+  ok(store.providerPriority(undefined) === 0, "缺省 = 0（普通）");
+  ok(store.providerPriority(null) === 0 && store.providerPriority("") === 0, "null / 空串都落回 0");
+  ok(store.providerPriority("abc") === 0 && store.providerPriority(NaN) === 0, "非法值落回 0，不变成最高优先");
+  ok(store.providerPriority(-5) === 0, "负数落回 0");
+  ok(store.providerPriority(50.7) === 51, "非整数四舍五入（面板显示与存储一致）");
+  ok(store.providerPriority(99999) === 999, "超上限夹到 999");
+  ok(store.providerPriority(0) === 0 && store.providerPriority(20) === 20, "合法区间原样透传");
+
+  const def = store.saveProvider(Object.assign({}, PROVIDER, { display: "默认档" }));
+  ok(def.priority === 0, "未给 priority 时存 0", def.priority);
+  const hi = store.saveProvider(Object.assign({}, def, { priority: 20 }));
+  ok(hi.priority === 20, "优先级存得住并回读一致", hi.priority);
+  ok(store.channelList().find((c) => c.id === "rel").priority === 20, "路由视图也带上 priority（消歧要读它）");
+  const dirty = store.saveProvider(Object.assign({}, hi, { priority: "12" }));
+  ok(dirty.priority === 12, "纯数字字符串按 Number 解析（表单 v-model 会给字符串）", dirty.priority);
+  // "12abc" 这类半截数字必须落回 0 而不是被截成 12：截断会把一个手滑值变成一个看似合法的优先级
+  ok(store.saveProvider(Object.assign({}, dirty, { priority: "12abc" })).priority === 0, "半截数字字符串落回 0，不截断成 12");
+  store.saveProvider(Object.assign({}, dirty, { priority: 0, display: "默认档" }));
+}
+
 console.log("\n⑤ 非法输入按空折叠（存进去的必须是读得出的）");
 {
   const p = store.saveProvider({
@@ -89,6 +113,23 @@ console.log("\n⑤ 非法输入按空折叠（存进去的必须是读得出的�
   ok(p.extraHeaders && typeof p.extraHeaders === "object" && !Array.isArray(p.extraHeaders) && Object.keys(p.extraHeaders).length === 0, "extraBody/extraHeaders 非对象 → 空对象", p.extraHeaders);
   ok(p.enabled === true, "enabled 缺省视为启用（新建条目不该静默停用）", p.enabled);
   ok(p.display.length <= 64, `display 截到 64 以内（实际 ${p.display.length}）`, p.display.length);
+}
+
+console.log("\n⑤c 旧供应商级 proxy_model → 模型级 proxyModel 迁移");
+{
+  store.saveProvider({
+    id: "legacyproxy", display: "旧代理名", domain: "127.0.0.1", kind: "openai_compat",
+    baseUrl: "http://127.0.0.1:7/v1", models: [{ model: "official-model" }],
+  });
+  const Driver = store.driver() === "better-sqlite3" ? require("better-sqlite3") : require("node:sqlite").DatabaseSync;
+  const raw = new Driver(path.join(store.proxyDir(), "stats.db"));
+  raw.prepare("UPDATE agents SET proxy_model = ? WHERE id = ?").run("virtual-model", "legacyproxy");
+  raw.close();
+  store.close();
+  store.open();
+  const p = store.getProvider("legacyproxy");
+  ok(p.proxyModel === "" && p.models[0].proxyModel === "virtual-model",
+    "旧供应商级代理名迁到第一行模型并清空旧列", p);
 }
 
 console.log("\n⑥ 坏 JSON 按空处理但必须留痕");

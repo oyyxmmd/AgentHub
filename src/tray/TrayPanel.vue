@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { proxyGrowthLog, proxyPinnedAccountSet, proxyPool, proxyStatsOverview } from "../api/ipc";
+import { loadConfig, proxyGrowthLog, proxyPinnedAccountSet, proxyPool, proxyPreferBuiltinSet, proxyStatsOverview } from "../api/ipc";
 import type { ProxyAccount, ProxyChannelView, ProxyGrowthLogEntry } from "../types";
 
 /** 托盘弹出面板（iStat Menus 风格）：今日用量 / 任务状态 / 网关调度账号 / 账号积分。
@@ -13,6 +13,40 @@ const usage = ref<{ req: number; tokens: number } | null>(null);
 const todayTasks = ref<Record<string, { ok: number; total: number; at: string }>>({});
 /** 正在写回的账号 id（行内转圈防重复点击） */
 const switchingId = ref("");
+
+/** 内置优先总闸（proxy.preferBuiltin）：只有开启时才允许内置渠道参与自动路由。
+ *  走独立 IPC（proxy_prefer_builtin_set）而不是整份配置保存——托盘与主窗口各持配置快照，
+ *  整份提交会互相冲掉（后保存的一方用旧快照覆盖先保存的一方）。 */
+const preferBuiltin = ref(false);
+const preferBusy = ref(false);
+const preferErr = ref("");
+
+/** 开关的无障碍标签 */
+function preferLabel(): string {
+  return preferBuiltin.value ? "关闭内置优先" : "开启内置优先";
+}
+
+/** 切换内置优先：失败时回滚，不留下假的已开启状态 */
+async function togglePreferBuiltin() {
+  if (preferBusy.value) return;
+  const old = preferBuiltin.value;
+  const next = !old;
+  preferBuiltin.value = next;
+  preferBusy.value = true;
+  preferErr.value = "";
+  try {
+    const r = await proxyPreferBuiltinSet(next);
+    if (r && r.ok === false) {
+      preferBuiltin.value = old;
+      preferErr.value = r.message || "保存失败";
+    }
+  } catch (e) {
+    preferBuiltin.value = old;
+    preferErr.value = String((e as Error).message || e);
+  } finally {
+    preferBusy.value = false;
+  }
+}
 
 const TASK_META: { key: string; label: string }[] = [
   { key: "checkin", label: "签到" },
@@ -84,12 +118,16 @@ async function refresh() {
     d.setHours(0, 0, 0, 0);
     return d.getTime();
   })();
-  const [pool, log, stats] = await Promise.all([
+  const [pool, log, stats, cfg] = await Promise.all([
     proxyPool().catch(() => null),
     proxyGrowthLog().catch(() => null),
     proxyStatsOverview({ from: dayStart, to: Date.now() }).catch(() => null),
+    loadConfig().catch(() => null),
   ]);
   channels.value = pool || [];
+  // 内置优先总闸：读配置里的 proxy.preferBuiltin（maskConfig 只脱敏 webdav 密码，
+  // proxy 段完整返回）。读不到就保持当前值不动。
+  if (cfg && cfg.proxy) preferBuiltin.value = cfg.proxy.preferBuiltin === true;
   usage.value = stats
     ? { req: Number(stats.summary?.req) || 0, tokens: Number(stats.summary?.totalTokens) || 0 }
     : null;
@@ -151,6 +189,26 @@ onBeforeUnmount(() => {
           {{ m.label }} {{ todayTasks[m.key] ? `${todayTasks[m.key].ok}/${todayTasks[m.key].total}` : "—" }}
         </span>
       </div>
+    </section>
+
+    <section class="card routing">
+      <div class="card-title">
+        内置渠道启用
+        <span class="title-side" :class="preferBuiltin ? 'on' : ''">{{ preferBuiltin ? "内置优先" : "仅自定义" }}</span>
+      </div>
+      <div class="routing-body">
+        <span class="routing-desc">只有开启时才允许内置渠道参与自动路由；关闭时只走自定义提供商。</span>
+        <button
+          class="switch"
+          :class="{ on: preferBuiltin }"
+          role="switch"
+          :aria-checked="preferBuiltin"
+          :aria-label="preferLabel()"
+          :disabled="preferBusy"
+          @click="togglePreferBuiltin"
+        ></button>
+      </div>
+      <div v-if="preferErr" class="routing-err">{{ preferErr }}</div>
     </section>
 
     <section class="card grow">
@@ -247,6 +305,40 @@ header { display: flex; align-items: center; justify-content: space-between; }
 .pill.ok { color: #34c759; border-color: rgba(52, 199, 89, 0.4); }
 .pill.partial { color: #ff9f0a; border-color: rgba(255, 159, 10, 0.4); }
 .pill.fail { color: #ff453a; border-color: rgba(255, 69, 58, 0.4); }
+
+/* 模型路由优先级开关：托盘是独立 HTML 入口，不加载主窗口的 global.css，
+   故此处自带一份与主窗口 .switch 同形的样式（40×22 胶囊 + 16px 圆钮） */
+.routing .title-side.on { color: #34c759; font-weight: 600; }
+.routing-body { display: flex; align-items: center; gap: 10px; }
+.routing-desc { flex: 1; min-width: 0; font-size: 11px; line-height: 1.45; color: var(--sub); }
+.routing-err { margin-top: 6px; font-size: 10.5px; color: #ff453a; }
+.switch {
+  width: 40px;
+  height: 22px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  position: relative;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  transition: transform 0.2s ease;
+}
+.switch.on { background: #34c759; border-color: #34c759; }
+.switch.on::after { transform: translateX(18px); }
+.switch:disabled { opacity: 0.55; cursor: default; }
 
 .grow { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .accounts { flex: 1; overflow-y: auto; min-height: 0; }

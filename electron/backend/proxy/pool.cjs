@@ -157,12 +157,14 @@ function pickAccount(channel, strategy, excludeIds, maxInFlight, pinnedId) {
   // 渠道指定账号（托盘「指定账号」写 proxy.pinnedAccount）：在候选集里则直接用它（绕过策略排序）。
   // pinned 不在 pool2 = 被候选过滤（冷却/耗尽/停用/排除）或租约滤掉——自然回落策略选号，无需单独回退分支
   let picked = pool2[0];
+  let pinnedPicked = false;
   if (pinnedId) {
     const p = pool2.find((a) => a.id === pinnedId);
-    if (p) picked = p;
+    if (p) { picked = p; pinnedPicked = true; }
   }
-  // 防惊群：100ms 内刚选中过同一账号且还有其他候选 → 让位重选（并发突发不再集中打一个号）
-  if (pool2.length > 1 && now - (lastPickAt.get(picked.id) || 0) < 100) {
+  // 防惊群：100ms 内刚选中过同一账号且还有其他候选 → 让位重选（并发突发不再集中打一个号）。
+  // 显式指定账号不参与让位：让位语义是「策略选号时别扎堆」，把用户点名的号换掉会让指定看起来无效
+  if (!pinnedPicked && pool2.length > 1 && now - (lastPickAt.get(picked.id) || 0) < 100) {
     const alt = pool2.find((a) => now - (lastPickAt.get(a.id) || 0) >= 100);
     if (alt) picked = alt;
   }

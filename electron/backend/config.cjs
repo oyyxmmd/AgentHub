@@ -217,6 +217,12 @@ function defaultConfig() {
       fixedChannel: "trae",     // fixed 策略下的优先渠道
       routeOrder: "score",      // 渠道成本感知排序：score=按打分（现状）/ cost-first=按成本档升序
                                 // （免费→低成本→普通，组内仍按打分）；Key 可单独覆盖
+      preferProvider: false,    // 自定义提供商优先：裸模型名唯一归属某启用中的自定义提供商时，
+                                // 优先于内置渠道；多家同名或未命中时不猜，继续按原路由
+      preferBuiltin: false,     // 内置优先：只有显式开启时才允许内置渠道参与自动路由；
+                                // 关闭时只走自定义提供商（显式 slug/model 仍直达自定义）
+      allowBareProviderModel: true, // 允许无内置归属的裸名兜底到唯一自定义提供商；
+                                // 手工配置兼容项，UI 的「自定义提供商优先」是 preferProvider
       rateLimitPerMin: 120,     // 单 Key 令牌桶限速（次/分钟，Key 可单独覆盖）
       concurrency: 8,           // 单渠道在途并发上限（满则跳备选渠道，不做全局 429，issue #106）
       creditsRefreshMin: 30,    // 额度自动刷新周期（分钟）
@@ -558,7 +564,8 @@ function loadConfig() {
   if (!merged.webdav.deviceId || !merged.webdav.deviceName) {
     if (!merged.webdav.deviceId) merged.webdav.deviceId = crypto.randomUUID();
     if (!merged.webdav.deviceName) merged.webdav.deviceName = os.hostname();
-    try { saveConfig(merged); } catch { /* 写不回去下次再补 */ }
+    // silent：这是初始化写回，不是用户改配置，不该触发「配置已变更」通知
+    try { saveConfig(merged, { silent: true }); } catch { /* 写不回去下次再补 */ }
   }
   return merged;
 }
@@ -589,7 +596,10 @@ function validateToolConfig(cfg) {
 
 /** 保存配置（先写临时文件再原子替换，写一半断电不留半个 JSON）。
  *  opts.forceClearSharedSecrets：显式清除意图（clearSharedWebdav / 表单清空加密口令）——
- *  绕过下述解密失败保留规则；后台读改写保存绝不传它 */
+ *  绕过下述解密失败保留规则；后台读改写保存绝不传它
+ *  opts.silent：落盘但不通知「配置已变更」订阅者。仅供 loadConfig 内部的 deviceId/deviceName
+ *  惰性补全使用——那是一次初始化写回，不是用户改配置；通知它会让订阅者无谓地作废快照，
+ *  也会让「订阅者在回调里读配置」这种写法多绕一圈。 */
 function saveConfig(cfg, opts = {}) {
   const errors = validateToolConfig(cfg);
   if (errors.length) {
@@ -630,6 +640,10 @@ function saveConfig(cfg, opts = {}) {
   const tmp = `${p}.tmp.${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(disk, null, 2), "utf8");
   fs.renameSync(tmp, p);
+  // 落盘即通知：持有内存快照的上层（ipc.cjs 的 load_config 缓存）据此作废快照，
+  // 否则「后端直写配置后前端仍读到旧值」。订阅方在 config.cjs 下方定义（函数声明会提升，
+  // 运行时早已就位）。silent 模式跳过——见 saveConfig 的 opts.silent 说明。
+  if (!(opts && opts.silent)) notifyConfigChanged();
   return { ok: true, message: "设置保存成功" };
 }
 
@@ -641,10 +655,14 @@ function saveConfig(cfg, opts = {}) {
  *    用户按注释提示手工改 config.json；而「手工改完要重启才进内存快照」这件事不能当约束——
  *    应用在跑的时候改盘，之后任何一次无关的整份保存（切主题、拖模块顺序）都会把这个
  *    刚写下的 false 抹掉，等于止血开关自己会弹回来。故与上面两个字段同列，以磁盘为准。
- *  注意：只应在这两个字段**各自的写入 IPC** 里绕过本名单；它们调的是 saveConfig。
+ *  · preferProvider   ← proxy_prefer_provider_set（模型路由优先级总闸）。托盘面板与主窗口
+ *    「自定义提供商」页都能改它，而两边都持有自己的配置快照：若都走整份提交，后提交的一方
+ *    会用旧快照把先提交的一方冲掉（开关「自己弹回来」）。收口到独立 IPC 读改写后，
+ *    整份保存一律以磁盘为准，改动方靠 config-changed 广播重拉快照对齐。
+ *  注意：只应在这几个字段**各自的写入 IPC** 里绕过本名单；它们调的是 saveConfig。
  *  restoreOnLaunch 刻意不进名单：设置页「记住网关开关」就是经整份保存写盘的，
  *  磁盘优先会架空那个开关；渲染层快照由总览页每次启停同步（ProxyHomeView），不会过期。 */
-const OUT_OF_BAND_PROXY_FIELDS = ["channelEnabled", "checkinAutoRules", "enableAnthropic", "enableResponses"];
+const OUT_OF_BAND_PROXY_FIELDS = ["channelEnabled", "checkinAutoRules", "enableAnthropic", "enableResponses", "preferProvider", "preferBuiltin"];
 
 /** 设置页保存路径专用：先把 out-of-band 字段以**磁盘值**为准，再落盘。
  *
@@ -708,10 +726,37 @@ function applyAutoStart(cfg) {
   } catch { /* 注册失败不拦保存 */ }
 }
 
+// ===== 配置变更订阅 =====
+//
+// 为什么需要：ipc.cjs 有一份 load_config 的内存快照（避免每帧读盘），而 proxy 等模块
+// 会**直接调 saveConfig 落盘**（不经 save_config IPC），那份快照不会自己失效——
+// 于是「后端刚改完配置，前端 load_config 仍读到旧值」。
+//
+// 方向说明：让 config.cjs（最底层）publish，ipc.cjs（上层）subscribe，
+// 而不是反过来让 proxy/index.cjs require ipc.cjs——那会形成
+// ipc.cjs → proxy/index.cjs → ipc.cjs 的循环依赖。
+const configChangedHooks = [];
+/** 订阅配置落盘事件（返回退订函数）。订阅方一般是持有内存快照的上层模块。 */
+function onConfigChanged(fn) {
+  if (typeof fn !== "function") return () => {};
+  configChangedHooks.push(fn);
+  return () => {
+    const i = configChangedHooks.indexOf(fn);
+    if (i >= 0) configChangedHooks.splice(i, 1);
+  };
+}
+/** 通知订阅方：配置已落盘，内存快照该作废了 */
+function notifyConfigChanged() {
+  for (const fn of configChangedHooks.slice()) {
+    try { fn(); } catch { /* 单个订阅者失败不影响其它 */ }
+  }
+}
+
 module.exports = {
   dataDir, configPath, hubDir, ensureHub, loadConfig, saveConfig, defaultConfig, ENC_PREFIX,
   getUpdateNotified, setUpdateNotified, isPortable, encryptSecret, decryptSecret, isEncrypted, applyAutoStart,
   loadSharedWebdav, saveSharedWebdav, clearSharedWebdav, maskedSharedWebdav, moduleWebdav, sharedEncryptionPassphrase, PASSWORD_MASK,
   normalizeHm, normalizeJitter,
   saveConfigFromUI, OUT_OF_BAND_PROXY_FIELDS,
+  onConfigChanged, notifyConfigChanged,
 };
